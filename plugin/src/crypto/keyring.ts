@@ -1,4 +1,4 @@
-import { unlockVaultKey, VaultKeyDoc } from "./crypto";
+import { importVmk, unlockVaultKey, VaultKeyDoc } from "./crypto";
 
 /** 同步遇到密文但密钥未解锁时抛出；同步暂停，本地编辑不受影响。 */
 export class E2eeLockedError extends Error {
@@ -55,6 +55,11 @@ export class Keyring {
 		if (!key) return false;
 		this.vmk = key;
 		return true;
+	}
+
+	/** 用 Trusted Device 恢复的原始 VMK 解锁（raw 由调用方负责清零）。 */
+	async unlockWithRaw(raw: Uint8Array): Promise<void> {
+		this.vmk = await importVmk(raw);
 	}
 
 	lock(): void {

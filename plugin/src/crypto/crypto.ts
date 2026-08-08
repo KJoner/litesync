@@ -69,12 +69,17 @@ async function deriveKek(password: string, salt: Uint8Array, iterations: number)
 	);
 }
 
-async function importVmk(raw: Uint8Array): Promise<CryptoKey> {
-	// 不可导出：解锁后 VMK 只存在于 CryptoKey 句柄中
-	return crypto.subtle.importKey("raw", raw as BufferSource, { name: "AES-GCM" }, false, [
+export async function importVmk(raw: Uint8Array): Promise<CryptoKey> {
+	// extractable：Trusted Device 需要在解锁状态下导出 VMK 做设备包装
+	return crypto.subtle.importKey("raw", raw as BufferSource, { name: "AES-GCM" }, true, [
 		"encrypt",
 		"decrypt",
 	]);
+}
+
+/** 导出 VMK 原始字节（仅用于 Trusted Device 包装，用完必须清零）。 */
+export async function exportVmkRaw(key: CryptoKey): Promise<Uint8Array> {
+	return new Uint8Array(await crypto.subtle.exportKey("raw", key));
 }
 
 /** 首次启用：生成随机 VMK 并用密码派生的 KEK 包裹。 */

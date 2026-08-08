@@ -1,13 +1,14 @@
 import { App, Modal, Notice } from "obsidian";
 import { MigrationProgress } from "./migration";
 
-/** 解锁弹窗：输入 E2EE 密码。onSubmit 返回错误信息或 null（成功）。 */
+/** 解锁弹窗：输入 E2EE 密码 + 是否信任此设备。onSubmit 返回错误信息或 null（成功）。 */
 export class UnlockModal extends Modal {
 	private busy = false;
 
 	constructor(
 		app: App,
-		private onSubmit: (password: string) => Promise<string | null>,
+		private defaultTrust: boolean,
+		private onSubmit: (password: string, trustDevice: boolean) => Promise<string | null>,
 	) {
 		super(app);
 	}
@@ -15,10 +16,18 @@ export class UnlockModal extends Modal {
 	onOpen(): void {
 		this.titleEl.setText("解锁端到端加密");
 		const { contentEl } = this;
-		contentEl.createDiv({ text: "输入 E2EE 密码以解锁同步。" });
+		contentEl.createDiv({ text: "输入 E2EE 密码以解锁同步（密码只在内存中使用，不会被保存）。" });
 		const input = contentEl.createEl("input", { type: "password" });
 		input.style.width = "100%";
 		input.style.margin = "10px 0";
+
+		const trustLabel = contentEl.createEl("label");
+		trustLabel.style.display = "block";
+		trustLabel.style.margin = "4px 0 10px";
+		const trustBox = trustLabel.createEl("input", { type: "checkbox" });
+		trustBox.checked = this.defaultTrust;
+		trustLabel.appendText(" 信任此设备（之后启动自动解锁）");
+
 		const errorEl = contentEl.createDiv({ cls: "litesync-history-meta" });
 		const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
 		const btn = footer.createEl("button", { text: "解锁", cls: "mod-cta" });
@@ -29,7 +38,7 @@ export class UnlockModal extends Modal {
 			btn.setText("解锁中…");
 			btn.disabled = true;
 			try {
-				const err = await this.onSubmit(input.value);
+				const err = await this.onSubmit(input.value, trustBox.checked);
 				if (err === null) {
 					this.close();
 					return;
@@ -49,14 +58,16 @@ export class UnlockModal extends Modal {
 	}
 }
 
-/** 启用 E2EE 弹窗：设置密码 + 执行迁移。 */
+/** 启用 E2EE 弹窗：设置密码 + 是否信任此设备 + 执行迁移。 */
 export class EnableE2eeModal extends Modal {
 	private busy = false;
 
 	constructor(
 		app: App,
+		private defaultTrust: boolean,
 		private onEnable: (
 			password: string,
+			trustDevice: boolean,
 			onProgress: (p: MigrationProgress) => void,
 		) => Promise<number>,
 	) {
@@ -87,6 +98,13 @@ export class EnableE2eeModal extends Modal {
 		pw2.style.width = "100%";
 		pw2.style.margin = "6px 0";
 
+		const trustLabel = contentEl.createEl("label");
+		trustLabel.style.display = "block";
+		trustLabel.style.margin = "4px 0 10px";
+		const trustBox = trustLabel.createEl("input", { type: "checkbox" });
+		trustBox.checked = this.defaultTrust;
+		trustLabel.appendText(" 信任此设备（之后启动自动解锁）");
+
 		const progressEl = contentEl.createDiv({ cls: "litesync-history-meta" });
 		const errorEl = contentEl.createDiv({ cls: "litesync-history-meta" });
 
@@ -109,7 +127,7 @@ export class EnableE2eeModal extends Modal {
 			btn.disabled = true;
 			btn.setText("迁移中…");
 			try {
-				const migrated = await this.onEnable(pw1.value, (p) => {
+				const migrated = await this.onEnable(pw1.value, trustBox.checked, (p) => {
 					progressEl.setText(`加密迁移中 ${p.done}/${p.total}：${p.current}`);
 				});
 				new Notice(`端到端加密已启用，共迁移 ${migrated} 个文件 ✓`, 10000);

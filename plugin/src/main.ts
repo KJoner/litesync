@@ -1,6 +1,13 @@
 import { Notice, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
 import { ApiClient } from "./api/client";
 import { ConflictListModal } from "./conflict-ui/conflict-view";
+import {
+	API_TOKEN_SECRET_ID,
+	forgetTrustedDevice,
+	loadTrustedVmk,
+	persistTrustedDevice,
+	secretStorageOf,
+} from "./crypto/device-trust";
 import { EnableE2eeModal, UnlockModal } from "./crypto/e2ee-modals";
 import { Keyring } from "./crypto/keyring";
 import { enableE2ee } from "./crypto/migration";
@@ -29,6 +36,10 @@ export default class PrivateSyncPlugin extends Plugin {
 	private intervalId: number | null = null;
 	private lastStatus: SyncStatus = "idle";
 	private keyring = new Keyring();
+	/** API Token 运行时值（真实存储在 SecretStorage；无 SecretStorage 时降级到 data.json） */
+	private apiTokenValue = "";
+	/** v3.1 迁移：旧版本明文保存的 E2EE 密码，仅在首次启动时用一次后即抹除 */
+	private legacyE2eePassword = "";
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -94,18 +105,35 @@ export default class PrivateSyncPlugin extends Plugin {
 		this.store = new StateStore(this.app.vault.adapter, `${pluginDir}/state.json`);
 		await this.store.load();
 
-		// E2EE：加载缓存的 vault key 文档；配置了记住密码则自动解锁
+		// API Token：迁移到 SecretStorage（无 SecretStorage 时保留 data.json 降级）
+		await this.loadOrMigrateApiToken();
+
+		// E2EE：加载缓存的 vault key 文档
 		this.keyring.setDoc(this.store.state.e2ee);
-		if (this.keyring.needsUnlock && this.settings.rememberE2eePassword && this.settings.e2eePassword) {
-			if (!(await this.keyring.unlock(this.settings.e2eePassword))) {
-				new Notice("E2EE 自动解锁失败（保存的密码可能已失效），请手动解锁");
+		if (this.keyring.needsUnlock) {
+			// ① Trusted Device 自动解锁（设备密钥 + SecretStorage 中的包装 VMK）
+			if (this.settings.trustDevice && this.settings.deviceKeyB64 && this.keyring.doc) {
+				const raw = await loadTrustedVmk(this.app, this.settings.deviceKeyB64, this.keyring.doc);
+				if (raw) {
+					await this.keyring.unlockWithRaw(raw);
+					raw.fill(0);
+				}
 			}
+			// ② v3.1 迁移：旧版明文密码解锁一次 → 转为 Trusted Device → 从磁盘抹除
+			if (this.keyring.needsUnlock && this.legacyE2eePassword) {
+				if (await this.keyring.unlock(this.legacyE2eePassword)) {
+					this.settings.trustDevice = true;
+					await this.persistTrust();
+					new Notice("已把旧的「记住密码」迁移为「信任此设备」，明文密码已从磁盘移除");
+				}
+			}
+			this.legacyE2eePassword = "";
 		}
 
 		this.rebuildIgnoreMatcher();
 		this.client = new ApiClient(() => ({
 			serverUrl: this.settings.serverUrl,
-			apiToken: this.settings.apiToken,
+			apiToken: this.getApiToken(),
 			deviceId: this.store?.state.deviceId ?? "",
 		}));
 
@@ -183,7 +211,52 @@ export default class PrivateSyncPlugin extends Plugin {
 	}
 
 	private isConfigured(): boolean {
-		return this.settings.serverUrl !== "" && this.settings.apiToken !== "";
+		return this.settings.serverUrl !== "" && this.getApiToken() !== "";
+	}
+
+	// ---------- API Token（SecretStorage） ----------
+
+	getApiToken(): string {
+		return this.apiTokenValue || this.settings.apiToken;
+	}
+
+	async setApiToken(value: string): Promise<void> {
+		this.apiTokenValue = value;
+		const ss = secretStorageOf(this.app);
+		if (ss) {
+			ss.setSecret(API_TOKEN_SECRET_ID, value);
+			if (this.settings.apiToken !== "") {
+				this.settings.apiToken = "";
+				await this.saveSettings();
+			}
+		} else {
+			// 无 SecretStorage（Obsidian < 1.11.4）：降级保存在 data.json
+			this.settings.apiToken = value;
+			await this.saveSettings();
+		}
+	}
+
+	/** 启动时读取 Token；data.json 中的旧值迁移进 SecretStorage 并抹除。 */
+	private async loadOrMigrateApiToken(): Promise<void> {
+		const ss = secretStorageOf(this.app);
+		if (!ss) {
+			this.apiTokenValue = this.settings.apiToken;
+			return;
+		}
+		const stored = ss.getSecret(API_TOKEN_SECRET_ID);
+		if (stored) {
+			this.apiTokenValue = stored;
+			if (this.settings.apiToken !== "") {
+				this.settings.apiToken = "";
+				await this.saveSettings();
+			}
+		} else if (this.settings.apiToken) {
+			ss.setSecret(API_TOKEN_SECRET_ID, this.settings.apiToken);
+			this.apiTokenValue = this.settings.apiToken;
+			this.settings.apiToken = "";
+			await this.saveSettings();
+			new Notice("API Token 已迁移到 Obsidian SecretStorage");
+		}
 	}
 
 	private rebuildIgnoreMatcher(): void {
@@ -313,7 +386,7 @@ export default class PrivateSyncPlugin extends Plugin {
 	}
 
 	openUnlockModal(): void {
-		new UnlockModal(this.app, async (password) => {
+		new UnlockModal(this.app, this.settings.trustDevice, async (password, trustDevice) => {
 			// 新设备可能还没有缓存 vault key 文档，先从服务器获取
 			if (!this.keyring.doc) {
 				if (!this.client) return "插件尚未初始化完成";
@@ -330,10 +403,7 @@ export default class PrivateSyncPlugin extends Plugin {
 				}
 			}
 			if (!(await this.keyring.unlock(password))) return "密码错误";
-			if (this.settings.rememberE2eePassword) {
-				this.settings.e2eePassword = password;
-				await this.saveSettings();
-			}
+			await this.setTrustDevice(trustDevice);
 			new Notice("E2EE 已解锁 ✓");
 			this.updateStatus("idle");
 			void this.manager?.sync("unlock");
@@ -346,7 +416,7 @@ export default class PrivateSyncPlugin extends Plugin {
 			new Notice("插件尚未初始化完成，请稍候");
 			return;
 		}
-		new EnableE2eeModal(this.app, async (password, onProgress) => {
+		new EnableE2eeModal(this.app, this.settings.trustDevice, async (password, trustDevice, onProgress) => {
 			const migrated = await enableE2ee(
 				this.ctx!,
 				password,
@@ -355,17 +425,72 @@ export default class PrivateSyncPlugin extends Plugin {
 				},
 				onProgress,
 			);
-			if (this.settings.rememberE2eePassword) {
-				this.settings.e2eePassword = password;
-				await this.saveSettings();
-			}
+			await this.setTrustDevice(trustDevice);
 			this.updateStatus("synced");
 			return migrated;
 		}).open();
 	}
 
+	// ---------- Trusted Device ----------
+
+	/** 是否存在可用的设备信任（用于设置页显示「忘记此设备」）。 */
+	hasTrustedDevice(): boolean {
+		return this.settings.trustDevice && this.settings.deviceKeyB64 !== "";
+	}
+
+	/** 把当前已解锁的 VMK 持久化为设备信任。 */
+	private async persistTrust(): Promise<void> {
+		if (!this.keyring.unlocked) return;
+		const deviceKeyB64 = await persistTrustedDevice(this.app, this.settings.deviceKeyB64, this.keyring);
+		if (deviceKeyB64 === null) {
+			new Notice("此 Obsidian 版本没有 SecretStorage（需要 1.11.4+），无法信任此设备");
+			return;
+		}
+		if (this.settings.deviceKeyB64 !== deviceKeyB64) {
+			this.settings.deviceKeyB64 = deviceKeyB64;
+		}
+		await this.saveSettings();
+	}
+
+	/** 开关「信任此设备」：开 → 立即持久化（若已解锁）；关 → 删除本地信任。 */
+	async setTrustDevice(value: boolean): Promise<void> {
+		this.settings.trustDevice = value;
+		if (value) {
+			await this.saveSettings();
+			await this.persistTrust();
+		} else {
+			forgetTrustedDevice(this.app);
+			this.settings.deviceKeyB64 = "";
+			await this.saveSettings();
+		}
+	}
+
+	/** 忘记此设备：删除设备信任并立即锁定。 */
+	async forgetThisDevice(): Promise<void> {
+		forgetTrustedDevice(this.app);
+		this.settings.trustDevice = false;
+		this.settings.deviceKeyB64 = "";
+		await this.saveSettings();
+		this.keyring.lock();
+		this.updateStatus("locked");
+		new Notice("已忘记此设备并锁定；下次需要重新输入 E2EE 密码");
+	}
+
 	async loadSettings(): Promise<void> {
-		this.settings = { ...DEFAULT_SETTINGS, ...((await this.loadData()) as Partial<PluginSettings>) };
+		const raw = ((await this.loadData()) ?? {}) as Record<string, unknown>;
+
+		// v3.1 迁移：明文 E2EE 密码绝不再持久化——取出旧值后立即从磁盘抹除
+		this.legacyE2eePassword = typeof raw.e2eePassword === "string" ? raw.e2eePassword : "";
+		const hadLegacyRemember = raw.rememberE2eePassword === true;
+		delete raw.e2eePassword;
+		delete raw.rememberE2eePassword;
+
+		this.settings = { ...DEFAULT_SETTINGS, ...raw } as PluginSettings;
+		if (hadLegacyRemember) this.settings.trustDevice = true; // 语义等价迁移
+
+		if (this.legacyE2eePassword !== "" || hadLegacyRemember) {
+			await this.saveSettings(); // 立刻回写，把明文密码从 data.json 抹掉
+		}
 	}
 
 	async saveSettings(): Promise<void> {

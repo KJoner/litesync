@@ -12,22 +12,26 @@ export interface PluginSettings {
 	/** 每行一个 Glob 模式 */
 	ignorePatterns: string;
 	debug: boolean;
-	/** 在本设备明文保存 E2EE 密码（便利性换取本地安全，默认关闭） */
-	rememberE2eePassword: boolean;
-	e2eePassword: string;
+	/**
+	 * 信任此设备：解锁后把 VMK 用随机设备密钥包装存入 SecretStorage，
+	 * 之后启动自动解锁。E2EE 密码本身永远不持久化。
+	 */
+	trustDevice: boolean;
+	/** 设备密钥（base64，拆分包装的一半；另一半在 SecretStorage） */
+	deviceKeyB64: string;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
 	serverUrl: "",
-	apiToken: "",
+	apiToken: "", // 仅作为无 SecretStorage 时的降级存储；正常情况下为空，真实值在 SecretStorage
 	deviceName: "",
 	autoSync: true,
 	syncIntervalSeconds: 30,
 	syncObsidian: false,
 	ignorePatterns: ".trash/**\n.DS_Store\nThumbs.db",
 	debug: false,
-	rememberE2eePassword: false,
-	e2eePassword: "",
+	trustDevice: true,
+	deviceKeyB64: "",
 };
 
 export class SyncSettingTab extends PluginSettingTab {
@@ -59,15 +63,14 @@ export class SyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("API Token")
-			.setDesc("与服务器 OBSYNC_TOKEN 一致")
+			.setDesc("与服务器 OBSYNC_TOKEN 一致（保存在 Obsidian SecretStorage，不进入 data.json）")
 			.addText((text) => {
 				text.inputEl.type = "password";
 				text
 					.setPlaceholder("token")
-					.setValue(this.plugin.settings.apiToken)
+					.setValue(this.plugin.getApiToken())
 					.onChange(async (value) => {
-						this.plugin.settings.apiToken = value.trim();
-						await this.plugin.saveSettings();
+						await this.plugin.setApiToken(value.trim());
 					});
 			});
 
@@ -177,15 +180,29 @@ export class SyncSettingTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
-			.setName("在本设备记住密码")
-			.setDesc("E2EE 密码明文保存在本设备插件配置中，启动时自动解锁（有本地泄露风险，请自行权衡）")
+			.setName("信任此设备（保持解锁）")
+			.setDesc(
+				"解锁后将 Vault Master Key 用随机设备密钥包装存入 Obsidian SecretStorage，" +
+					"之后启动自动解锁。E2EE 密码本身永远不会被保存。",
+			)
 			.addToggle((toggle) =>
-				toggle.setValue(this.plugin.settings.rememberE2eePassword).onChange(async (value) => {
-					this.plugin.settings.rememberE2eePassword = value;
-					if (!value) this.plugin.settings.e2eePassword = "";
-					await this.plugin.saveSettings();
+				toggle.setValue(this.plugin.settings.trustDevice).onChange(async (value) => {
+					await this.plugin.setTrustDevice(value);
+					this.display();
 				}),
 			);
+
+		if (this.plugin.hasTrustedDevice()) {
+			new Setting(containerEl)
+				.setName("忘记此设备")
+				.setDesc("删除本设备保存的密钥包装并锁定；下次必须重新输入 E2EE 密码")
+				.addButton((btn) =>
+					btn.setButtonText("🗑 忘记此设备").onClick(async () => {
+						await this.plugin.forgetThisDevice();
+						this.display();
+					}),
+				);
+		}
 
 		new Setting(containerEl).setName("调试").setHeading();
 
