@@ -1,12 +1,12 @@
 {
   "name": "obsidian-private-sync",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Sync this vault with your own private obsync server.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "test": "esbuild tests/unit.test.ts --bundle --platform=node --format=cjs --outfile=.test-build/unit.test.cjs && node --test .test-build/unit.test.cjs"
+    "test": "esbuild tests/unit.test.ts tests/merge.test.ts --bundle --platform=node --format=cjs --outdir=.test-build && node --test .test-build/unit.test.js .test-build/merge.test.js"
   },
   "keywords": ["obsidian", "sync"],
   "license": "MIT",

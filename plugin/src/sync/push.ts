@@ -1,6 +1,7 @@
 import { ApiError, ConflictError, NotFoundError } from "../api/client";
 import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
+import { attemptAutoMerge } from "./auto-merge";
 import { keepBothVersions } from "./conflict";
 import { SyncContext } from "./context";
 
@@ -93,6 +94,8 @@ export async function pushPendingChanges(ctx: SyncContext): Promise<PushResult> 
 type Outcome = "pushed" | "skipped" | "conflict";
 
 async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
+	// 文件处于 unresolved conflict：不继续自动 Push（计划书 Pending Conflict 规则）
+	if (ctx.store.getConflict(path)) return "skipped";
 	const adapter = ctx.app.vault.adapter;
 	const stat = await adapter.stat(path);
 	if (!stat || stat.type === "folder") return "skipped"; // 入队后又被删除，交给 delete 流程
@@ -126,7 +129,14 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 				ctx.store.set(path, { hash, revision: server.revision, mtime: stat.mtime, size: stat.size });
 				return "skipped";
 			}
-			// 真实冲突 → 保留两个版本
+			// 真实冲突 → 先尝试三方自动合并（仅 Markdown 文本）
+			const merged = await attemptAutoMerge(ctx, path, data, tracked);
+			if (merged === "merged") return "pushed";
+			if (merged === "pending") {
+				ctx.notify(`同步冲突: ${path}\n请运行 "Resolve conflicts" 处理`);
+				return "conflict";
+			}
+			// 无法自动合并 → 最后安全兜底：保留两个版本
 			const kept = await keepBothVersions(ctx, path, data);
 			return kept === null ? "skipped" : "conflict";
 		}
@@ -139,6 +149,7 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 }
 
 async function pushDelete(ctx: SyncContext, path: string): Promise<Outcome> {
+	if (ctx.store.getConflict(path)) return "skipped"; // 冲突处理中不做自动删除
 	const tracked = ctx.store.get(path);
 	if (!tracked) return "skipped"; // 从未同步过，服务器上不存在
 

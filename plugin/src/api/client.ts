@@ -44,6 +44,19 @@ export interface DownloadResult {
 	mtime: number;
 }
 
+/** 历史版本元数据（GET /api/v1/history）。 */
+export interface VersionEntry {
+	revision: number;
+	action: "upsert" | "delete" | "restore" | "merge";
+	size: number;
+	mtime: number;
+	hash?: string;
+	deviceId?: string;
+	createdAt: number;
+}
+
+export type UploadAction = "upsert" | "merge" | "restore";
+
 export class ApiError extends Error {
 	constructor(
 		public status: number,
@@ -148,6 +161,7 @@ export class ApiClient {
 		hash: string,
 		data: ArrayBuffer,
 		mtime: number,
+		action: UploadAction = "upsert",
 	): Promise<UploadOk> {
 		const res = await requestUrl({
 			url: `${this.base()}/api/v1/file`,
@@ -158,6 +172,7 @@ export class ApiClient {
 				"X-Base-Revision": String(baseRevision),
 				"X-Content-Hash": hash,
 				"X-File-Mtime": String(Math.round(mtime)),
+				"X-Action": action,
 			}),
 			body: data,
 			throw: false,
@@ -165,6 +180,39 @@ export class ApiClient {
 		if (res.status === 409) throw new ConflictError(parseConflict(res.text, path));
 		if (res.status !== 200) throw new ApiError(res.status, `upload ${path} failed: HTTP ${res.status}`);
 		return res.json as UploadOk;
+	}
+
+	/** 获取文件的历史版本列表（revision 降序）。 */
+	async history(path: string): Promise<VersionEntry[]> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/history?path=${encodeURIComponent(path)}`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200) throw new ApiError(res.status, `history ${path} failed: HTTP ${res.status}`);
+		const body = res.json as { versions: VersionEntry[] };
+		return body.versions ?? [];
+	}
+
+	/** 下载某历史版本的内容。版本不存在或已被 GC 时抛 NotFoundError。 */
+	async version(path: string, revision: number): Promise<DownloadResult> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/version?path=${encodeURIComponent(path)}&revision=${revision}`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status === 404) throw new NotFoundError();
+		if (res.status !== 200)
+			throw new ApiError(res.status, `version ${path}@${revision} failed: HTTP ${res.status}`);
+		return {
+			data: res.arrayBuffer,
+			revision: num(header(res.headers, "x-revision")),
+			hash: header(res.headers, "x-content-hash") ?? "",
+			size: num(header(res.headers, "x-file-size")),
+			mtime: num(header(res.headers, "x-file-mtime")),
+		};
 	}
 
 	async remove(path: string, baseRevision: number): Promise<void> {

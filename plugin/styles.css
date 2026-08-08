@@ -1,0 +1,169 @@
+/* ===== Private Sync：版本历史 ===== */
+.litesync-history-list {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	max-height: 60vh;
+	overflow-y: auto;
+}
+.litesync-history-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	padding: 8px 10px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+}
+.litesync-rev {
+	font-weight: 600;
+	margin-right: 8px;
+}
+.litesync-badge {
+	font-size: 11px;
+	padding: 1px 6px;
+	border-radius: 8px;
+	margin-right: 6px;
+	background: var(--background-modifier-hover);
+	color: var(--text-muted);
+}
+.litesync-badge-delete {
+	color: var(--text-error);
+}
+.litesync-badge-merge,
+.litesync-badge-restore {
+	color: var(--text-accent);
+}
+.litesync-badge-current {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+.litesync-history-meta {
+	font-size: 12px;
+	color: var(--text-muted);
+	margin-top: 2px;
+}
+.litesync-history-actions {
+	display: flex;
+	gap: 6px;
+	flex-shrink: 0;
+}
+
+/* ===== 版本对比 ===== */
+.litesync-diff-box {
+	max-height: 65vh;
+	overflow: auto;
+	font-size: 12px;
+	line-height: 1.5;
+	padding: 8px;
+	background: var(--background-secondary);
+	border-radius: 6px;
+}
+.litesync-diff-line {
+	white-space: pre-wrap;
+	word-break: break-all;
+}
+.litesync-diff-add {
+	background: rgba(0, 160, 0, 0.15);
+}
+.litesync-diff-del {
+	background: rgba(200, 0, 0, 0.15);
+	text-decoration: line-through;
+	opacity: 0.85;
+}
+
+/* ===== 冲突 Resolver ===== */
+.litesync-conflict-list {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+.litesync-conflict-item {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	padding: 8px 10px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	cursor: pointer;
+}
+.litesync-conflict-item:hover {
+	background: var(--background-modifier-hover);
+}
+.litesync-resolver {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+.litesync-resolver-panes {
+	display: flex;
+	gap: 8px;
+}
+.litesync-resolver-pane {
+	flex: 1;
+	min-width: 0;
+}
+.litesync-resolver-pane h4 {
+	margin: 0 0 4px 0;
+	font-size: 12px;
+	color: var(--text-muted);
+}
+.litesync-resolver-pre {
+	max-height: 22vh;
+	overflow: auto;
+	font-size: 12px;
+	padding: 6px;
+	background: var(--background-secondary);
+	border-radius: 6px;
+	white-space: pre-wrap;
+	word-break: break-all;
+}
+.litesync-hunk {
+	border: 1px solid var(--background-modifier-border);
+	border-left: 3px solid var(--text-error);
+	border-radius: 6px;
+	padding: 6px 8px;
+	margin: 6px 0;
+}
+.litesync-hunk-resolved {
+	border-left-color: var(--text-success, #4caf50);
+}
+.litesync-hunk-label {
+	font-size: 11px;
+	color: var(--text-muted);
+	margin-bottom: 2px;
+}
+.litesync-hunk-text {
+	font-size: 12px;
+	white-space: pre-wrap;
+	word-break: break-all;
+	background: var(--background-secondary);
+	border-radius: 4px;
+	padding: 4px 6px;
+	margin-bottom: 4px;
+}
+.litesync-hunk-local {
+	border-left: 2px solid var(--color-blue, #2196f3);
+}
+.litesync-hunk-remote {
+	border-left: 2px solid var(--color-orange, #ff9800);
+}
+.litesync-hunk-buttons {
+	display: flex;
+	gap: 6px;
+}
+.litesync-hunk-buttons button.litesync-chosen {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+.litesync-resolver-merged textarea {
+	width: 100%;
+	min-height: 18vh;
+	font-family: var(--font-monospace);
+	font-size: 12px;
+}
+.litesync-resolver-footer {
+	display: flex;
+	gap: 8px;
+	justify-content: flex-end;
+}

@@ -15,6 +15,8 @@ export interface SyncContext {
 	deviceName(): string;
 	log(msg: string): void;
 	notify(msg: string): void;
+	/** pending conflicts 集合变化后调用（刷新状态栏等） */
+	onConflictsChanged(): void;
 }
 
 export interface SyncCounters {

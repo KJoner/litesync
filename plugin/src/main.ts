@@ -1,5 +1,7 @@
 import { Notice, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
 import { ApiClient } from "./api/client";
+import { ConflictListModal } from "./conflict-ui/conflict-view";
+import { HistoryModal } from "./history/history-view";
 import { DEFAULT_SETTINGS, PluginSettings, SyncSettingTab } from "./settings";
 import { StateStore } from "./state/store";
 import { SyncContext } from "./sync/context";
@@ -17,10 +19,12 @@ export default class PrivateSyncPlugin extends Plugin {
 	private queue = new PendingQueue();
 	private client: ApiClient | null = null;
 	private manager: SyncManager | null = null;
+	private ctx: SyncContext | null = null;
 	private ignoreMatcher: IgnoreMatcher | null = null;
 	private statusEl: HTMLElement | null = null;
 	private debounceTimer: number | null = null;
 	private intervalId: number | null = null;
+	private lastStatus: SyncStatus = "idle";
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -34,7 +38,36 @@ export default class PrivateSyncPlugin extends Plugin {
 			name: "立即同步 (Sync now)",
 			callback: () => void this.syncNow(),
 		});
+		this.addCommand({
+			id: "file-history",
+			name: "文件版本历史 (File history)",
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file || !this.ctx) return false;
+				if (!checking) new HistoryModal(this.ctx, file.path).open();
+				return true;
+			},
+		});
+		this.addCommand({
+			id: "resolve-conflicts",
+			name: "解决同步冲突 (Resolve conflicts)",
+			callback: () => {
+				if (this.ctx) new ConflictListModal(this.ctx).open();
+			},
+		});
 		this.addRibbonIcon("refresh-cw", "Private Sync: 立即同步", () => void this.syncNow());
+
+		this.registerEvent(
+			this.app.workspace.on("file-menu", (menu, file) => {
+				if (!(file instanceof TFile) || !this.ctx) return;
+				menu.addItem((item) =>
+					item
+						.setTitle("Private Sync: 版本历史")
+						.setIcon("history")
+						.onClick(() => new HistoryModal(this.ctx!, file.path).open()),
+				);
+			}),
+		);
 
 		// 等待 vault 索引就绪后再初始化，避免启动时的 create 事件风暴
 		this.app.workspace.onLayoutReady(() => void this.initialize());
@@ -72,7 +105,9 @@ export default class PrivateSyncPlugin extends Plugin {
 				if (this.settings.debug) console.log(`[private-sync] ${msg}`);
 			},
 			notify: (msg) => new Notice(msg, 8000),
+			onConflictsChanged: () => this.updateStatus(this.lastStatus),
 		};
+		this.ctx = ctx;
 		this.manager = new SyncManager(ctx);
 		this.manager.onStatus = (status, detail) => this.updateStatus(status, detail);
 
@@ -199,15 +234,23 @@ export default class PrivateSyncPlugin extends Plugin {
 
 	private updateStatus(status: SyncStatus, detail?: string): void {
 		if (!this.statusEl) return;
-		const text = {
+		this.lastStatus = status;
+		let text = {
 			idle: "Private Sync",
 			syncing: "↻ Syncing",
 			synced: "✓ Synced",
 			conflict: "! Conflict",
 			offline: "× Offline",
 		}[status];
+		// 有未解决冲突时优先显示计数，点击状态栏打开冲突列表
+		const pending = this.store?.conflictPaths().length ?? 0;
+		if (pending > 0 && status !== "syncing") {
+			text = `! ${pending} Conflict${pending > 1 ? "s" : ""}`;
+		}
 		this.statusEl.setText(text);
 		this.statusEl.setAttribute("aria-label", detail ?? text);
+		this.statusEl.style.cursor = pending > 0 ? "pointer" : "default";
+		this.statusEl.onclick = pending > 0 && this.ctx ? () => new ConflictListModal(this.ctx!).open() : null;
 	}
 
 	async loadSettings(): Promise<void> {

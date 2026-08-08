@@ -15,12 +15,13 @@ npm run dev      # watch 模式，开发用
 
 ## 安装到 Obsidian
 
-把以下两个文件复制到 Vault 的插件目录：
+把以下三个文件复制到 Vault 的插件目录：
 
 ```text
 <你的Vault>/.obsidian/plugins/obsidian-private-sync/
 ├── main.js
-└── manifest.json
+├── manifest.json
+└── styles.css
 ```
 
 然后在 Obsidian 设置 → 第三方插件中启用 Private Sync。
@@ -44,14 +45,33 @@ npm run dev      # watch 模式，开发用
 
 一次完整同步：**拉取远端变更 → 扫描本地变化 → 推送队列 → 对齐游标**。
 
-- 状态栏显示 `✓ Synced` / `↻ Syncing` / `! Conflict` / `× Offline`
+- 状态栏显示 `✓ Synced` / `↻ Syncing` / `! N Conflicts` / `× Offline`
 - 离线时所有修改进入待同步队列，Obsidian 本地编辑完全不受影响；
   网络恢复后按 5s → 15s → 30s → 60s → 2min → 5min 退避自动重试
-- 冲突时**永远保留两个版本**：服务器版本写回原路径，本地版本另存为
-  `xxx.conflict-设备名-时间戳.md` 并同步到服务器，绝不静默丢弃任何内容
 - 远端删除本地文件时移入回收站（system trash），不做永久删除
-- 同步状态（deviceId、lastSequence、文件 hash 缓存）保存在本插件目录的
-  `state.json`，与设置分离，且永远不会被同步出去
+- 同步状态（deviceId、lastSequence、文件 hash 缓存、未解决冲突）保存在
+  本插件目录的 `state.json`，与设置分离，且永远不会被同步出去
+
+## 冲突处理（v0.2：三方自动合并）
+
+两端同时修改同一个 `.md` 文件时：
+
+1. **自动三方合并**：以双方共同祖先版本（服务器历史）为 Base 做 diff3，
+   修改不重叠时自动合并上传（`action=merge`），无需任何弹窗
+2. **结构化冲突 → Resolver**：同一区域两边都改时，文件进入 pending conflict
+   （暂停该文件的自动推送/拉取），状态栏显示 `! N Conflicts`，点击或运行命令
+   `Resolve conflicts` 打开界面：LOCAL / REMOTE 双栏对比，每个冲突段
+   `Use Local / Use Remote / Use Both`，合并结果可直接编辑后 Save Merge；
+   保存时若远端又发生变化（409），会重新加载最新版本再合并，绝不绕过 revision 校验
+3. **keepBoth 兜底永远保留**：二进制文件、`.canvas`、Base 已被服务器清理、
+   合并引擎任何异常 → 回退「保留两个版本」（`xxx.conflict-设备名-时间戳.md`），
+   任何情况下不丢任何一方内容
+
+## 版本历史（v0.2）
+
+- 命令 `File history` 或右键文件 →「Private Sync: 版本历史」
+- 每个版本可 **对比**（与当前内容逐行 diff）、**恢复**（旧内容作为新版本上传，
+  历史线性可追踪）、**另存副本**（`xxx.rev-N.md`）
 
 ## 手动多设备验收（对应计划书 Phase 7）
 

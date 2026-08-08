@@ -2,6 +2,7 @@ import { App } from "obsidian";
 import { NotFoundError, RemoteChange } from "../api/client";
 import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
+import { attemptAutoMerge } from "./auto-merge";
 import { keepBothVersions } from "./conflict";
 import { SyncContext } from "./context";
 
@@ -46,6 +47,8 @@ type Outcome = "applied" | "skipped" | "conflict";
 async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promise<Outcome> {
 	const path = change.path;
 	if (ctx.ignores(path)) return "skipped";
+	// 文件正在冲突处理中：冻结远端应用，避免来回覆盖；Resolver 解决时会重新取远端 HEAD
+	if (ctx.store.getConflict(path)) return "skipped";
 
 	const adapter = ctx.app.vault.adapter;
 	const stat = await adapter.stat(path);
@@ -124,7 +127,14 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 		return "applied";
 	}
 
-	// 本地与远端都改了 → 保留两个版本
+	// 本地与远端都改了 → 先尝试三方自动合并（仅 Markdown 文本）
+	const merged = await attemptAutoMerge(ctx, path, localData!, tracked);
+	if (merged === "merged") return "applied";
+	if (merged === "pending") {
+		ctx.notify(`同步冲突: ${path}\n请运行 "Resolve conflicts" 处理`);
+		return "conflict";
+	}
+	// 无法自动合并（二进制 / 无 Base / 引擎异常）→ 最后安全兜底：保留两个版本
 	const kept = await keepBothVersions(ctx, path, localData!);
 	return kept === null ? "skipped" : "conflict";
 }

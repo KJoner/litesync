@@ -8,10 +8,18 @@ export interface FileState {
 	size: number;
 }
 
+/** 未解决冲突的登记信息（计划书 Phase 15：Pending Conflict）。 */
+export interface PendingConflict {
+	baseRevision: number;
+	remoteRevision: number;
+	createdAt: number;
+}
+
 export interface PersistedState {
 	deviceId: string;
 	lastSequence: number;
 	files: Record<string, FileState>;
+	conflicts: Record<string, PendingConflict>;
 }
 
 /**
@@ -19,7 +27,7 @@ export interface PersistedState {
  * （与 data.json 的设置分离，避免设置文件无限增大）。
  */
 export class StateStore {
-	state: PersistedState = { deviceId: "", lastSequence: 0, files: {} };
+	state: PersistedState = { deviceId: "", lastSequence: 0, files: {}, conflicts: {} };
 
 	constructor(
 		private adapter: DataAdapter,
@@ -34,11 +42,12 @@ export class StateStore {
 					deviceId: typeof raw.deviceId === "string" ? raw.deviceId : "",
 					lastSequence: typeof raw.lastSequence === "number" ? raw.lastSequence : 0,
 					files: raw.files && typeof raw.files === "object" ? raw.files : {},
+					conflicts: raw.conflicts && typeof raw.conflicts === "object" ? raw.conflicts : {},
 				};
 			}
 		} catch (e) {
 			console.error("[private-sync] failed to load state.json, starting fresh", e);
-			this.state = { deviceId: "", lastSequence: 0, files: {} };
+			this.state = { deviceId: "", lastSequence: 0, files: {}, conflicts: {} };
 		}
 		if (!this.state.deviceId) {
 			this.state.deviceId = crypto.randomUUID();
@@ -64,5 +73,21 @@ export class StateStore {
 
 	paths(): string[] {
 		return Object.keys(this.state.files);
+	}
+
+	getConflict(path: string): PendingConflict | undefined {
+		return this.state.conflicts[path];
+	}
+
+	setConflict(path: string, c: PendingConflict): void {
+		this.state.conflicts[path] = c;
+	}
+
+	clearConflict(path: string): void {
+		delete this.state.conflicts[path];
+	}
+
+	conflictPaths(): string[] {
+		return Object.keys(this.state.conflicts);
 	}
 }
