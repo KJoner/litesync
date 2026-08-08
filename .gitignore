@@ -10,6 +10,9 @@ plugin/main.js
 plugin/*.map
 plugin/.test-build/
 
+# 本地文档（不提交）
+docs/开发计划/
+
 # 系统文件
 .DS_Store
 Thumbs.db
