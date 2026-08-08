@@ -19,7 +19,17 @@ litesync/
 
 ## 快速开始
 
-服务器（详见 [server/README.md](server/README.md)）：
+服务器一键部署（在服务器上希望存放代码的目录下执行）：
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/KJoner/litesync/master/scripts/litesync-install.sh)
+```
+
+自动完成：克隆/更新代码 → 生成 `.env`（随机 Token、自动选择空闲端口）→
+Docker Compose 构建并启动 → 健康检查 → 输出关键配置信息。
+再次执行同一命令即可**更新到最新版本**（Token 与数据完整保留）。
+
+手动部署（详见 [server/README.md](server/README.md)）：
 
 ```bash
 cd server
