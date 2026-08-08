@@ -1,0 +1,15 @@
+# Go
+server/data/
+server/obsync
+server/obsync.exe
+server/.env
+
+# Node / 插件构建产物
+plugin/node_modules/
+plugin/main.js
+plugin/*.map
+plugin/.test-build/
+
+# 系统文件
+.DS_Store
+Thumbs.db
