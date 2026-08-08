@@ -1,6 +1,9 @@
 import { Notice, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
 import { ApiClient } from "./api/client";
 import { ConflictListModal } from "./conflict-ui/conflict-view";
+import { EnableE2eeModal, UnlockModal } from "./crypto/e2ee-modals";
+import { Keyring } from "./crypto/keyring";
+import { enableE2ee } from "./crypto/migration";
 import { HistoryModal } from "./history/history-view";
 import { DEFAULT_SETTINGS, PluginSettings, SyncSettingTab } from "./settings";
 import { StateStore } from "./state/store";
@@ -25,6 +28,7 @@ export default class PrivateSyncPlugin extends Plugin {
 	private debounceTimer: number | null = null;
 	private intervalId: number | null = null;
 	private lastStatus: SyncStatus = "idle";
+	private keyring = new Keyring();
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -54,6 +58,11 @@ export default class PrivateSyncPlugin extends Plugin {
 			callback: () => {
 				if (this.ctx) new ConflictListModal(this.ctx).open();
 			},
+		});
+		this.addCommand({
+			id: "unlock-e2ee",
+			name: "解锁端到端加密 (Unlock E2EE)",
+			callback: () => this.openUnlockModal(),
 		});
 		this.addRibbonIcon("refresh-cw", "Private Sync: 立即同步", () => void this.syncNow());
 
@@ -85,6 +94,14 @@ export default class PrivateSyncPlugin extends Plugin {
 		this.store = new StateStore(this.app.vault.adapter, `${pluginDir}/state.json`);
 		await this.store.load();
 
+		// E2EE：加载缓存的 vault key 文档；配置了记住密码则自动解锁
+		this.keyring.setDoc(this.store.state.e2ee);
+		if (this.keyring.needsUnlock && this.settings.rememberE2eePassword && this.settings.e2eePassword) {
+			if (!(await this.keyring.unlock(this.settings.e2eePassword))) {
+				new Notice("E2EE 自动解锁失败（保存的密码可能已失效），请手动解锁");
+			}
+		}
+
 		this.rebuildIgnoreMatcher();
 		this.client = new ApiClient(() => ({
 			serverUrl: this.settings.serverUrl,
@@ -106,6 +123,12 @@ export default class PrivateSyncPlugin extends Plugin {
 			},
 			notify: (msg) => new Notice(msg, 8000),
 			onConflictsChanged: () => this.updateStatus(this.lastStatus),
+			e2ee: this.keyring,
+			refreshE2ee: async () => {
+				const doc = await this.client!.getVaultKey();
+				this.keyring.setDoc(doc);
+				if (this.store) this.store.state.e2ee = doc;
+			},
 		};
 		this.ctx = ctx;
 		this.manager = new SyncManager(ctx);
@@ -235,22 +258,110 @@ export default class PrivateSyncPlugin extends Plugin {
 	private updateStatus(status: SyncStatus, detail?: string): void {
 		if (!this.statusEl) return;
 		this.lastStatus = status;
-		let text = {
+		const texts: Record<SyncStatus, string> = {
 			idle: "Private Sync",
 			syncing: "↻ Syncing",
 			synced: "✓ Synced",
 			conflict: "! Conflict",
 			offline: "× Offline",
-		}[status];
+			locked: "🔒 Locked",
+		};
+		let text = texts[status];
 		// 有未解决冲突时优先显示计数，点击状态栏打开冲突列表
 		const pending = this.store?.conflictPaths().length ?? 0;
-		if (pending > 0 && status !== "syncing") {
+		if (pending > 0 && status !== "syncing" && status !== "locked") {
 			text = `! ${pending} Conflict${pending > 1 ? "s" : ""}`;
 		}
 		this.statusEl.setText(text);
 		this.statusEl.setAttribute("aria-label", detail ?? text);
-		this.statusEl.style.cursor = pending > 0 ? "pointer" : "default";
-		this.statusEl.onclick = pending > 0 && this.ctx ? () => new ConflictListModal(this.ctx!).open() : null;
+		const clickable = pending > 0 || status === "locked";
+		this.statusEl.style.cursor = clickable ? "pointer" : "default";
+		this.statusEl.onclick = !clickable
+			? null
+			: status === "locked"
+				? () => this.openUnlockModal()
+				: this.ctx
+					? () => new ConflictListModal(this.ctx!).open()
+					: null;
+	}
+
+	// ---------- E2EE ----------
+
+	/** 设置页的 E2EE 状态与按钮文案。 */
+	e2eeStatusText(): { desc: string; action: string } {
+		if (!this.keyring.enabled) {
+			return { desc: "未启用：服务器保存明文（仅 HTTPS 传输加密）", action: "启用端到端加密…" };
+		}
+		if (this.keyring.needsUnlock) {
+			return { desc: "已启用 · 🔒 未解锁（同步已暂停）", action: "解锁…" };
+		}
+		return { desc: "已启用 · 🔓 已解锁", action: "锁定本设备" };
+	}
+
+	async e2eeAction(): Promise<void> {
+		if (!this.keyring.enabled) {
+			this.openEnableModal();
+			return;
+		}
+		if (this.keyring.needsUnlock) {
+			this.openUnlockModal();
+			return;
+		}
+		this.keyring.lock();
+		this.updateStatus("locked");
+		new Notice("已锁定，本设备同步暂停");
+	}
+
+	openUnlockModal(): void {
+		new UnlockModal(this.app, async (password) => {
+			// 新设备可能还没有缓存 vault key 文档，先从服务器获取
+			if (!this.keyring.doc) {
+				if (!this.client) return "插件尚未初始化完成";
+				try {
+					const doc = await this.client.getVaultKey();
+					if (!doc) return "服务器未启用端到端加密";
+					this.keyring.setDoc(doc);
+					if (this.store) {
+						this.store.state.e2ee = doc;
+						await this.store.save();
+					}
+				} catch (e) {
+					return `无法连接服务器：${e instanceof Error ? e.message : String(e)}`;
+				}
+			}
+			if (!(await this.keyring.unlock(password))) return "密码错误";
+			if (this.settings.rememberE2eePassword) {
+				this.settings.e2eePassword = password;
+				await this.saveSettings();
+			}
+			new Notice("E2EE 已解锁 ✓");
+			this.updateStatus("idle");
+			void this.manager?.sync("unlock");
+			return null;
+		}).open();
+	}
+
+	openEnableModal(): void {
+		if (!this.ctx || !this.manager) {
+			new Notice("插件尚未初始化完成，请稍候");
+			return;
+		}
+		new EnableE2eeModal(this.app, async (password, onProgress) => {
+			const migrated = await enableE2ee(
+				this.ctx!,
+				password,
+				async () => {
+					await this.manager!.sync("pre-migration");
+				},
+				onProgress,
+			);
+			if (this.settings.rememberE2eePassword) {
+				this.settings.e2eePassword = password;
+				await this.saveSettings();
+			}
+			this.updateStatus("synced");
+			return migrated;
+		}).open();
 	}
 
 	async loadSettings(): Promise<void> {

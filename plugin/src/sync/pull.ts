@@ -5,6 +5,7 @@ import { ensureParentFolder } from "../utils/path";
 import { attemptAutoMerge } from "./auto-merge";
 import { keepBothVersions } from "./conflict";
 import { SyncContext } from "./context";
+import { downloadPlain } from "./transfer";
 
 export interface PullResult {
 	applied: number;
@@ -80,6 +81,12 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 	}
 
 	// upsert
+	// 服务器该内容本设备已知（例如自己刚推送的变更）→ 只推进 revision
+	if (tracked && change.hash && change.hash === tracked.serverHash) {
+		ctx.store.set(path, { ...tracked, revision: change.revision });
+		return "skipped";
+	}
+
 	let localHash: string | null = null;
 	let localData: ArrayBuffer | null = null;
 	if (stat) {
@@ -88,10 +95,11 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 		localHash = await sha256Hex(data);
 	}
 
-	// 本地内容与远端一致（例如自己刚推送的变更）→ 只更新状态
+	// 本地明文与远端内容一致（明文模式的快速路径）→ 只更新状态
 	if (localHash !== null && change.hash && localHash === change.hash) {
 		ctx.store.set(path, {
 			hash: localHash,
+			serverHash: change.hash,
 			revision: change.revision,
 			mtime: stat?.mtime ?? Date.now(),
 			size: stat?.size ?? localData!.byteLength,
@@ -105,23 +113,20 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 		// 本地不存在，或本地自上次同步后未修改 → 直接采用远端版本
 		let dl;
 		try {
-			dl = await ctx.client.download(path);
+			dl = await downloadPlain(ctx, path);
 		} catch (e) {
 			if (e instanceof NotFoundError) return "skipped"; // 已被后续 change 删除
 			throw e;
 		}
-		const gotHash = await sha256Hex(dl.data);
-		if (dl.hash && gotHash !== dl.hash) {
-			throw new Error(`downloaded content hash mismatch for ${path}`);
-		}
 		await ensureParentFolder(adapter, path);
-		await adapter.writeBinary(path, dl.data, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
+		await adapter.writeBinary(path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
 		const st = await adapter.stat(path);
 		ctx.store.set(path, {
-			hash: gotHash,
+			hash: dl.plainHash,
+			serverHash: dl.cipherHash,
 			revision: dl.revision,
 			mtime: st?.mtime ?? Date.now(),
-			size: dl.size,
+			size: dl.plain.byteLength,
 		});
 		ctx.log(`pull: downloaded ${path} (rev ${dl.revision})`);
 		return "applied";

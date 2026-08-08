@@ -2,7 +2,7 @@ import { Modal, Notice } from "obsidian";
 import { ConflictError, NotFoundError, VersionEntry } from "../api/client";
 import { DiffTooLargeError, diffLinesView } from "../merge/diff";
 import { SyncContext } from "../sync/context";
-import { sha256Hex } from "../utils/hash";
+import { uploadFromPlain, versionPlain } from "../sync/transfer";
 import { ensureParentFolder } from "../utils/path";
 import { decodeUtf8Strict } from "../utils/text";
 
@@ -83,8 +83,8 @@ export class HistoryModal extends Modal {
 
 	private async compare(v: VersionEntry): Promise<void> {
 		try {
-			const dl = await this.ctx.client.version(this.path, v.revision);
-			const old = decodeUtf8Strict(dl.data);
+			const dl = await versionPlain(this.ctx, this.path, v.revision);
+			const old = decodeUtf8Strict(dl.plain);
 			if (old === null) {
 				new Notice("二进制文件不支持文本对比");
 				return;
@@ -113,35 +113,35 @@ export class HistoryModal extends Modal {
 	 */
 	private async restore(v: VersionEntry): Promise<void> {
 		try {
-			const dl = await this.ctx.client.version(this.path, v.revision);
-			const hash = await sha256Hex(dl.data);
-			if (dl.hash && hash !== dl.hash) throw new Error("版本内容 hash 校验失败");
+			const dl = await versionPlain(this.ctx, this.path, v.revision);
 
 			const tracked = this.ctx.store.get(this.path);
-			const res = await this.ctx.client.upload(
+			// 该版本内容与当前一致 → 无需产生新 revision（E2EE 下服务器无法自行判断）
+			if (tracked && tracked.hash === dl.plainHash) {
+				new Notice("该版本内容与当前一致，无需恢复");
+				return;
+			}
+			const out = await uploadFromPlain(
+				this.ctx,
 				this.path,
+				dl.plain,
 				tracked?.revision ?? 0,
-				hash,
-				dl.data,
 				dl.mtime || Date.now(),
 				"restore",
 			);
 			const adapter = this.ctx.app.vault.adapter;
 			await ensureParentFolder(adapter, this.path);
-			await adapter.writeBinary(this.path, dl.data, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
+			await adapter.writeBinary(this.path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
 			const stat = await adapter.stat(this.path);
 			this.ctx.store.set(this.path, {
-				hash,
-				revision: res.revision,
+				hash: dl.plainHash,
+				serverHash: out.cipherHash,
+				revision: out.revision,
 				mtime: stat?.mtime ?? Date.now(),
-				size: dl.size,
+				size: dl.plain.byteLength,
 			});
 			await this.ctx.store.save();
-			if (res.revision === tracked?.revision) {
-				new Notice(`该版本内容与当前一致，无需恢复`);
-			} else {
-				new Notice(`已恢复 Revision ${v.revision} → 新版本 Revision ${res.revision}`);
-			}
+			new Notice(`已恢复 Revision ${v.revision} → 新版本 Revision ${out.revision}`);
 			this.close();
 		} catch (e) {
 			if (e instanceof ConflictError) {
@@ -156,7 +156,7 @@ export class HistoryModal extends Modal {
 
 	private async saveCopy(v: VersionEntry): Promise<void> {
 		try {
-			const dl = await this.ctx.client.version(this.path, v.revision);
+			const dl = await versionPlain(this.ctx, this.path, v.revision);
 			const slash = this.path.lastIndexOf("/");
 			const dot = this.path.lastIndexOf(".");
 			const hasExt = dot > slash + 1;
@@ -165,7 +165,7 @@ export class HistoryModal extends Modal {
 			const copyPath = `${stem}.rev-${v.revision}${ext}`;
 			const adapter = this.ctx.app.vault.adapter;
 			await ensureParentFolder(adapter, copyPath);
-			await adapter.writeBinary(copyPath, dl.data);
+			await adapter.writeBinary(copyPath, dl.plain);
 			new Notice(`已另存为 ${copyPath}`);
 		} catch (e) {
 			if (e instanceof NotFoundError) new Notice("该版本内容已被服务器清理");

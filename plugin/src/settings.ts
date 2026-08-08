@@ -12,6 +12,9 @@ export interface PluginSettings {
 	/** 每行一个 Glob 模式 */
 	ignorePatterns: string;
 	debug: boolean;
+	/** 在本设备明文保存 E2EE 密码（便利性换取本地安全，默认关闭） */
+	rememberE2eePassword: boolean;
+	e2eePassword: string;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -23,6 +26,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	syncObsidian: false,
 	ignorePatterns: ".trash/**\n.DS_Store\nThumbs.db",
 	debug: false,
+	rememberE2eePassword: false,
+	e2eePassword: "",
 };
 
 export class SyncSettingTab extends PluginSettingTab {
@@ -156,6 +161,30 @@ export class SyncSettingTab extends PluginSettingTab {
 					.setButtonText("Sync Now")
 					.setCta()
 					.onClick(() => void this.plugin.syncNow()),
+			);
+
+		new Setting(containerEl).setName("端到端加密 (E2EE)").setHeading();
+
+		const e2eeStatus = this.plugin.e2eeStatusText();
+		new Setting(containerEl)
+			.setName("状态")
+			.setDesc(e2eeStatus.desc)
+			.addButton((btn) => {
+				btn.setButtonText(e2eeStatus.action).onClick(async () => {
+					await this.plugin.e2eeAction();
+					this.display(); // 刷新状态显示
+				});
+			});
+
+		new Setting(containerEl)
+			.setName("在本设备记住密码")
+			.setDesc("E2EE 密码明文保存在本设备插件配置中，启动时自动解锁（有本地泄露风险，请自行权衡）")
+			.addToggle((toggle) =>
+				toggle.setValue(this.plugin.settings.rememberE2eePassword).onChange(async (value) => {
+					this.plugin.settings.rememberE2eePassword = value;
+					if (!value) this.plugin.settings.e2eePassword = "";
+					await this.plugin.saveSettings();
+				}),
 			);
 
 		new Setting(containerEl).setName("调试").setHeading();

@@ -2,6 +2,7 @@ import { NotFoundError } from "../api/client";
 import { threeWayMerge } from "../merge/three-way";
 import { keepBothVersions } from "../sync/conflict";
 import { SyncContext } from "../sync/context";
+import { downloadPlain, uploadFromPlain, versionPlain } from "../sync/transfer";
 import { sha256Hex } from "../utils/hash";
 import { decodeUtf8Strict, encodeUtf8 } from "../utils/text";
 import { LoadedConflict } from "./conflict-state";
@@ -16,7 +17,7 @@ export async function loadConflict(ctx: SyncContext, path: string): Promise<Load
 
 	let remote;
 	try {
-		remote = await ctx.client.download(path);
+		remote = await downloadPlain(ctx, path);
 	} catch (e) {
 		if (e instanceof NotFoundError) {
 			// 远端文件已被删除：本地内容即最新，解除冲突并按新文件重新上传
@@ -28,9 +29,7 @@ export async function loadConflict(ctx: SyncContext, path: string): Promise<Load
 		}
 		throw e;
 	}
-	const remoteHash = await sha256Hex(remote.data);
-	if (remote.hash && remoteHash !== remote.hash) throw new Error("远端内容 hash 校验失败");
-	const remoteText = decodeUtf8Strict(remote.data);
+	const remoteText = decodeUtf8Strict(remote.plain);
 	if (remoteText === null) throw new Error("远端内容不是 UTF-8 文本");
 
 	const adapter = ctx.app.vault.adapter;
@@ -43,8 +42,8 @@ export async function loadConflict(ctx: SyncContext, path: string): Promise<Load
 
 	let baseText: string | null = null;
 	try {
-		const baseDl = await ctx.client.version(path, pending.baseRevision);
-		baseText = decodeUtf8Strict(baseDl.data);
+		const baseDl = await versionPlain(ctx, path, pending.baseRevision);
+		baseText = decodeUtf8Strict(baseDl.plain);
 	} catch {
 		baseText = null; // base 已被 GC → 两方对比模式
 	}
@@ -79,21 +78,22 @@ export async function saveResolution(
 ): Promise<number> {
 	const data = encodeUtf8(finalText);
 	const hash = await sha256Hex(data);
-	const res = await ctx.client.upload(path, remoteRevision, hash, data, Date.now(), "merge");
+	const out = await uploadFromPlain(ctx, path, data, remoteRevision, Date.now(), "merge");
 
 	const adapter = ctx.app.vault.adapter;
 	await adapter.writeBinary(path, data);
 	const stat = await adapter.stat(path);
 	ctx.store.set(path, {
 		hash,
-		revision: res.revision,
+		serverHash: out.cipherHash,
+		revision: out.revision,
 		mtime: stat?.mtime ?? Date.now(),
 		size: data.byteLength,
 	});
 	ctx.store.clearConflict(path);
 	await ctx.store.save();
-	ctx.log(`resolver: merged ${path} → rev ${res.revision}`);
-	return res.revision;
+	ctx.log(`resolver: merged ${path} → rev ${out.revision}`);
+	return out.revision;
 }
 
 /** 放弃合并，退回“保留两个版本”兜底，随后解除冲突状态。 */

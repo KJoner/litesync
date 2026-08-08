@@ -1,9 +1,11 @@
 import { ApiError, ConflictError, NotFoundError } from "../api/client";
+import { E2eeLockedError } from "../crypto/keyring";
 import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
 import { attemptAutoMerge } from "./auto-merge";
 import { keepBothVersions } from "./conflict";
 import { SyncContext } from "./context";
+import { downloadPlain, uploadFromPlain } from "./transfer";
 
 export interface PushResult {
 	pushed: number;
@@ -111,23 +113,58 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 
 	const baseRevision = tracked?.revision ?? 0;
 	try {
-		const res = await ctx.client.upload(path, baseRevision, hash, data, stat.mtime);
-		ctx.store.set(path, { hash, revision: res.revision, mtime: stat.mtime, size: stat.size });
-		ctx.log(`push: uploaded ${path} (rev ${res.revision})`);
+		const out = await uploadFromPlain(ctx, path, data, baseRevision, stat.mtime);
+		ctx.store.set(path, {
+			hash,
+			serverHash: out.cipherHash,
+			revision: out.revision,
+			mtime: stat.mtime,
+			size: stat.size,
+		});
+		ctx.log(`push: uploaded ${path} (rev ${out.revision})`);
 		return "pushed";
 	} catch (e) {
 		if (e instanceof ConflictError) {
 			const server = e.server;
 			if (server.deleted) {
 				// 服务器上是删除墓碑 → 基于墓碑 revision 重新创建
-				const res = await ctx.client.upload(path, server.revision, hash, data, stat.mtime);
-				ctx.store.set(path, { hash, revision: res.revision, mtime: stat.mtime, size: stat.size });
+				const out = await uploadFromPlain(ctx, path, data, server.revision, stat.mtime);
+				ctx.store.set(path, {
+					hash,
+					serverHash: out.cipherHash,
+					revision: out.revision,
+					mtime: stat.mtime,
+					size: stat.size,
+				});
 				return "pushed";
 			}
-			if (server.hash === hash) {
-				// 服务器已有相同内容（重试或他端相同修改）→ 采纳服务器 revision
-				ctx.store.set(path, { hash, revision: server.revision, mtime: stat.mtime, size: stat.size });
+			if (!ctx.e2ee.enabled && server.hash === hash) {
+				// 明文模式：服务器已有相同内容（重试或他端相同修改）→ 采纳服务器 revision
+				ctx.store.set(path, {
+					hash,
+					serverHash: server.hash,
+					revision: server.revision,
+					mtime: stat.mtime,
+					size: stat.size,
+				});
 				return "skipped";
+			}
+			// E2EE 下密文 hash 不可比 → 下载解密后按明文比较（覆盖重试/两端相同修改，含二进制）
+			try {
+				const dl = await downloadPlain(ctx, path);
+				if (dl.plainHash === hash) {
+					ctx.store.set(path, {
+						hash,
+						serverHash: dl.cipherHash,
+						revision: dl.revision,
+						mtime: stat.mtime,
+						size: stat.size,
+					});
+					return "skipped";
+				}
+			} catch (dlErr) {
+				if (dlErr instanceof E2eeLockedError) throw dlErr;
+				// 下载失败不阻塞冲突处理，继续走合并/兜底
 			}
 			// 真实冲突 → 先尝试三方自动合并（仅 Markdown 文本）
 			const merged = await attemptAutoMerge(ctx, path, data, tracked);
@@ -172,19 +209,16 @@ async function pushDelete(ctx: SyncContext, path: string): Promise<Outcome> {
 				return "skipped";
 			}
 			// 本地删除后服务器又有了新版本 → 数据安全优先：恢复服务器版本，不执行删除
-			const dl = await ctx.client.download(path);
-			const gotHash = await sha256Hex(dl.data);
-			if (dl.hash && gotHash !== dl.hash) {
-				throw new Error(`downloaded content hash mismatch for ${path}`);
-			}
+			const dl = await downloadPlain(ctx, path);
 			await ensureParentFolder(adapter, path);
-			await adapter.writeBinary(path, dl.data, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
+			await adapter.writeBinary(path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
 			const st = await adapter.stat(path);
 			ctx.store.set(path, {
-				hash: gotHash,
+				hash: dl.plainHash,
+				serverHash: dl.cipherHash,
 				revision: dl.revision,
 				mtime: st?.mtime ?? Date.now(),
-				size: dl.size,
+				size: dl.plain.byteLength,
 			});
 			ctx.notify(`该文件在其他设备上已更新，已恢复: ${path}`);
 			return "conflict";

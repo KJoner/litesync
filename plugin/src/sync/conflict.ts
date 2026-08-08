@@ -1,8 +1,8 @@
 import { NotFoundError } from "../api/client";
 import { conflictPathFor } from "../utils/conflict-name";
-import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
 import { SyncContext } from "./context";
+import { downloadPlain } from "./transfer";
 
 /**
  * 冲突处理核心：保留两个版本，绝不丢弃任何一份内容。
@@ -24,7 +24,7 @@ export async function keepBothVersions(
 
 	let dl;
 	try {
-		dl = await ctx.client.download(path);
+		dl = await downloadPlain(ctx, path);
 	} catch (e) {
 		if (e instanceof NotFoundError) {
 			// 服务器版本已不存在：本地文件仍在原路径，撤销刚创建的副本
@@ -35,17 +35,14 @@ export async function keepBothVersions(
 		throw e;
 	}
 
-	const gotHash = await sha256Hex(dl.data);
-	if (dl.hash && gotHash !== dl.hash) {
-		throw new Error(`downloaded content hash mismatch for ${path}`);
-	}
-	await adapter.writeBinary(path, dl.data, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
+	await adapter.writeBinary(path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
 	const stat = await adapter.stat(path);
 	ctx.store.set(path, {
-		hash: gotHash,
+		hash: dl.plainHash,
+		serverHash: dl.cipherHash,
 		revision: dl.revision,
 		mtime: stat?.mtime ?? Date.now(),
-		size: dl.size,
+		size: dl.plain.byteLength,
 	});
 
 	// 冲突副本作为新文件推送到服务器，让其他设备也能看到

@@ -1,8 +1,15 @@
 import { DataAdapter } from "obsidian";
+import { VaultKeyDoc } from "../crypto/crypto";
 
-/** 每个已同步文件的本地状态缓存。 */
+/**
+ * 每个已同步文件的本地状态缓存。
+ * E2EE 启用后明文与密文 hash 不同（随机 IV），因此分开记录：
+ * - hash：本地明文内容 hash（检测本地修改）
+ * - serverHash：服务器上的内容 hash（未加密时与 hash 相同；对齐 changes feed）
+ */
 export interface FileState {
 	hash: string;
+	serverHash: string;
 	revision: number;
 	mtime: number;
 	size: number;
@@ -20,6 +27,8 @@ export interface PersistedState {
 	lastSequence: number;
 	files: Record<string, FileState>;
 	conflicts: Record<string, PendingConflict>;
+	/** vault key 文档缓存（只含加密后的密钥材料，可安全落盘） */
+	e2ee: VaultKeyDoc | null;
 }
 
 /**
@@ -27,7 +36,7 @@ export interface PersistedState {
  * （与 data.json 的设置分离，避免设置文件无限增大）。
  */
 export class StateStore {
-	state: PersistedState = { deviceId: "", lastSequence: 0, files: {}, conflicts: {} };
+	state: PersistedState = { deviceId: "", lastSequence: 0, files: {}, conflicts: {}, e2ee: null };
 
 	constructor(
 		private adapter: DataAdapter,
@@ -43,11 +52,16 @@ export class StateStore {
 					lastSequence: typeof raw.lastSequence === "number" ? raw.lastSequence : 0,
 					files: raw.files && typeof raw.files === "object" ? raw.files : {},
 					conflicts: raw.conflicts && typeof raw.conflicts === "object" ? raw.conflicts : {},
+					e2ee: raw.e2ee && typeof raw.e2ee === "object" ? raw.e2ee : null,
 				};
+				// v0.2 状态升级：当时全部为明文，serverHash 与 hash 相同
+				for (const fs of Object.values(this.state.files)) {
+					if (!fs.serverHash) fs.serverHash = fs.hash;
+				}
 			}
 		} catch (e) {
 			console.error("[private-sync] failed to load state.json, starting fresh", e);
-			this.state = { deviceId: "", lastSequence: 0, files: {}, conflicts: {} };
+			this.state = { deviceId: "", lastSequence: 0, files: {}, conflicts: {}, e2ee: null };
 		}
 		if (!this.state.deviceId) {
 			this.state.deviceId = crypto.randomUUID();

@@ -1,4 +1,5 @@
 import { requestUrl } from "obsidian";
+import { VaultKeyDoc } from "../crypto/crypto";
 
 export interface ServerInfo {
 	version: string;
@@ -213,6 +214,43 @@ export class ApiClient {
 			size: num(header(res.headers, "x-file-size")),
 			mtime: num(header(res.headers, "x-file-mtime")),
 		};
+	}
+
+	/** 获取服务器上的加密 vault key 文档；未启用 E2EE 时返回 null。 */
+	async getVaultKey(): Promise<VaultKeyDoc | null> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/vault-key`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status === 404) return null;
+		if (res.status !== 200) throw new ApiError(res.status, `vault-key get failed: HTTP ${res.status}`);
+		return res.json as VaultKeyDoc;
+	}
+
+	/** 上传加密 vault key 文档。已存在且未 replace 时服务器返回 409。 */
+	async putVaultKey(doc: VaultKeyDoc, replace: boolean): Promise<void> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/vault-key${replace ? "?replace=true" : ""}`,
+			method: "PUT",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify(doc),
+			throw: false,
+		});
+		if (res.status !== 200) throw new ApiError(res.status, `vault-key put failed: HTTP ${res.status}`);
+	}
+
+	/** 清理某路径 beforeRevision 之前的历史版本（E2EE 迁移：密文验证后清明文）。 */
+	async purgeHistory(path: string, beforeRevision: number): Promise<number> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/history?path=${encodeURIComponent(path)}&beforeRevision=${beforeRevision}`,
+			method: "DELETE",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200) throw new ApiError(res.status, `history purge failed: HTTP ${res.status}`);
+		return num((res.json as Record<string, unknown>)?.removed);
 	}
 
 	async remove(path: string, baseRevision: number): Promise<void> {

@@ -1,8 +1,9 @@
+import { E2eeLockedError } from "../crypto/keyring";
 import { SyncContext, SyncCounters } from "./context";
 import { pullRemoteChanges } from "./pull";
 import { pushPendingChanges, scanLocalChanges } from "./push";
 
-export type SyncStatus = "idle" | "syncing" | "synced" | "conflict" | "offline";
+export type SyncStatus = "idle" | "syncing" | "synced" | "conflict" | "offline" | "locked";
 
 /** 网络失败的指数退避序列（秒），上限 5 分钟。 */
 const RETRY_DELAYS = [5, 15, 30, 60, 120, 300];
@@ -52,6 +53,14 @@ export class SyncManager {
 
 		const counters: SyncCounters = { pulled: 0, pushed: 0, conflicts: 0 };
 		try {
+			// E2EE：已启用但未解锁 → 暂停同步（本地编辑不受影响），解锁后再继续
+			await this.ctx.refreshE2ee();
+			if (this.ctx.e2ee.needsUnlock) {
+				this.ctx.log("sync paused: E2EE locked");
+				this.onStatus("locked");
+				return;
+			}
+
 			this.applyingRemote = true;
 			const pull1 = await pullRemoteChanges(this.ctx);
 			this.applyingRemote = false;
@@ -83,8 +92,13 @@ export class SyncManager {
 			} catch {
 				/* 保存状态失败时下次同步会重新扫描，不影响数据安全 */
 			}
-			this.onStatus("offline", e instanceof Error ? e.message : String(e));
-			this.scheduleRetry();
+			if (e instanceof E2eeLockedError) {
+				// 中途遇到密文但未解锁（如其他设备刚启用 E2EE）→ 等待解锁，不做退避重试
+				this.onStatus("locked");
+			} else {
+				this.onStatus("offline", e instanceof Error ? e.message : String(e));
+				this.scheduleRetry();
+			}
 		} finally {
 			this.applyingRemote = false;
 			this.syncing = false;
