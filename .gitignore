@@ -10,6 +10,9 @@ plugin/main.js
 plugin/*.map
 plugin/.test-build/
 
+# Web（构建产物 server/internal/web/dist 有意提交，服务器部署无需 Node）
+web/node_modules/
+
 # 本地文档（不提交）
 docs/开发计划/
 

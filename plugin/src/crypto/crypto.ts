@@ -137,6 +137,56 @@ export async function unlockVaultKey(doc: VaultKeyDoc, password: string): Promis
 	}
 }
 
+// ---------- 分享加密（Phase 17：独立 Share Key，与 Vault Master Key 无关） ----------
+
+const SHARE_MAGIC = new Uint8Array([0x4c, 0x53, 0x53, 0x31]); // "LSS1"
+const SHARE_AAD = new TextEncoder().encode("litesync/v1/share");
+
+/** 用独立 Share Key（随机 32B）加密分享内容，格式 "LSS1" | iv | ct+tag。 */
+export async function encryptShare(keyRaw: Uint8Array, plaintext: ArrayBuffer): Promise<ArrayBuffer> {
+	const key = await crypto.subtle.importKey("raw", keyRaw as BufferSource, { name: "AES-GCM" }, false, [
+		"encrypt",
+	]);
+	const iv = randomBytes(IV_LEN);
+	const ct = new Uint8Array(
+		await crypto.subtle.encrypt(
+			{ name: "AES-GCM", iv: iv as BufferSource, additionalData: SHARE_AAD as BufferSource },
+			key,
+			plaintext,
+		),
+	);
+	const out = new Uint8Array(SHARE_MAGIC.length + IV_LEN + ct.length);
+	out.set(SHARE_MAGIC, 0);
+	out.set(iv, SHARE_MAGIC.length);
+	out.set(ct, SHARE_MAGIC.length + IV_LEN);
+	return out.buffer;
+}
+
+/** 解密分享内容（Web 查看页同款算法，测试用）；失败返回 null。 */
+export async function decryptShare(keyRaw: Uint8Array, payload: ArrayBuffer): Promise<ArrayBuffer | null> {
+	const head = new Uint8Array(payload, 0, Math.min(4, payload.byteLength));
+	if (payload.byteLength < 4 + IV_LEN + 16 || !SHARE_MAGIC.every((b, i) => head[i] === b)) return null;
+	try {
+		const key = await crypto.subtle.importKey("raw", keyRaw as BufferSource, { name: "AES-GCM" }, false, [
+			"decrypt",
+		]);
+		const iv = new Uint8Array(payload, SHARE_MAGIC.length, IV_LEN);
+		const ct = new Uint8Array(payload, SHARE_MAGIC.length + IV_LEN);
+		return await crypto.subtle.decrypt(
+			{ name: "AES-GCM", iv: iv as BufferSource, additionalData: SHARE_AAD as BufferSource },
+			key,
+			ct,
+		);
+	} catch {
+		return null;
+	}
+}
+
+/** base64url（分享链接 fragment 用）。 */
+export function b64urlEncode(bytes: Uint8Array): string {
+	return b64encode(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 /** 判断字节流是否为 LiteSync 加密格式。 */
 export function isEncryptedPayload(data: ArrayBuffer): boolean {
 	if (data.byteLength < MAGIC.length + IV_LEN + 16) return false;

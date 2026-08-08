@@ -13,6 +13,7 @@ import { Keyring } from "./crypto/keyring";
 import { enableE2ee } from "./crypto/migration";
 import { HistoryModal } from "./history/history-view";
 import { DEFAULT_SETTINGS, PluginSettings, SyncSettingTab } from "./settings";
+import { ShareManageModal, ShareModal } from "./share/share-modal";
 import { StateStore } from "./state/store";
 import { SyncContext } from "./sync/context";
 import { PendingQueue } from "./sync/queue";
@@ -75,6 +76,13 @@ export default class PrivateSyncPlugin extends Plugin {
 			name: "解锁端到端加密 (Unlock E2EE)",
 			callback: () => this.openUnlockModal(),
 		});
+		this.addCommand({
+			id: "manage-shares",
+			name: "管理分享 (Manage shares)",
+			callback: () => {
+				if (this.ctx) new ShareManageModal(this.ctx, this.settings.serverUrl).open();
+			},
+		});
 		this.addRibbonIcon("refresh-cw", "Private Sync: 立即同步", () => void this.syncNow());
 
 		this.registerEvent(
@@ -85,6 +93,12 @@ export default class PrivateSyncPlugin extends Plugin {
 						.setTitle("Private Sync: 版本历史")
 						.setIcon("history")
 						.onClick(() => new HistoryModal(this.ctx!, file.path).open()),
+				);
+				menu.addItem((item) =>
+					item
+						.setTitle("Private Sync: 分享此文件…")
+						.setIcon("share-2")
+						.onClick(() => new ShareModal(this.ctx!, this.settings.serverUrl, file.path).open()),
 				);
 			}),
 		);

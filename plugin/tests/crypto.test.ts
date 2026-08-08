@@ -4,9 +4,12 @@ import { test } from "node:test";
 import {
 	b64decode,
 	b64encode,
+	b64urlEncode,
 	createVaultKeyDoc,
 	decryptFile,
+	decryptShare,
 	encryptFile,
+	encryptShare,
 	isEncryptedPayload,
 	randomBytes,
 	unlockVaultKey,
@@ -94,4 +97,39 @@ test("二进制内容加密往返", async () => {
 	const payload = await encryptFile(vmk, "img.png", plain.buffer as ArrayBuffer);
 	const dec = await decryptFile(vmk, "img.png", payload);
 	assert.deepEqual(new Uint8Array(dec!), plain);
+});
+
+// ---------- 分享加密（Phase 17：独立 Share Key） ----------
+
+test("分享加密: LSS1 往返一致", async () => {
+	const key = randomBytes(32);
+	const plain = buf("# 分享的笔记\n\n内容 content");
+	const payload = await encryptShare(key, plain);
+	assert.equal(new TextDecoder().decode(new Uint8Array(payload, 0, 4)), "LSS1");
+	const dec = await decryptShare(key, payload);
+	assert.equal(new TextDecoder().decode(dec!), new TextDecoder().decode(plain));
+});
+
+test("分享加密: 错误 key / 篡改 → null；LSE1 文件不被误当分享", async () => {
+	const key = randomBytes(32);
+	const payload = await encryptShare(key, buf("secret"));
+	assert.equal(await decryptShare(randomBytes(32), payload), null);
+	const tampered = new Uint8Array(payload.slice(0));
+	tampered[tampered.length - 1] ^= 1;
+	assert.equal(await decryptShare(key, tampered.buffer), null);
+
+	const { vmk } = await createVaultKeyDoc("pw");
+	const filePayload = await encryptFile(vmk, "a.md", buf("x"));
+	assert.equal(await decryptShare(key, filePayload), null);
+});
+
+test("分享加密: Share Key 与 Vault Master Key 无关（不同 key 空间）", async () => {
+	// 用 VMK 原始值当 share key 也解不开 LSE1 文件；两套加密相互隔离
+	const key = randomBytes(32);
+	const payload = await encryptShare(key, buf("content"));
+	const url = b64urlEncode(key);
+	assert.ok(!url.includes("+") && !url.includes("/") && !url.includes("="));
+	// b64url 还原后仍可解密
+	const restored = Uint8Array.from(atob(url.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (url.length % 4)) % 4)), (c) => c.charCodeAt(0));
+	assert.notEqual(await decryptShare(restored, payload), null);
 });

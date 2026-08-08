@@ -97,6 +97,16 @@ npm run dev      # watch 模式，开发用
   明文密码与 Token 立即从 `data.json` 抹除
 - 需要 Obsidian 1.11.4+（更老版本自动降级：Token 存 data.json、每次启动手动解锁）
 
+## 分享（v0.4）
+
+右键文件 →「Private Sync: 分享此文件…」：
+
+- 每个分享生成**独立随机 Share Key**，只加密这一个分享对象（与 Vault Master Key 完全无关）
+- 服务器只保存密文；**Share Key 放在链接的 `#` 片段中，浏览器不会把它发给服务器**
+- 支持有效期（7/30/90 天/永久）；命令「管理分享」可随时**撤销**（不影响原始 Vault）
+- 收到链接的人打开 `share.html` 页面，在浏览器本地解密查看（需 HTTPS）
+- Share Key 只记录在本设备 `state.json`，用于事后重新复制链接
+
 ## 版本历史（v0.2）
 
 - 命令 `File history` 或右键文件 →「Private Sync: 版本历史」

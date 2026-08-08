@@ -58,6 +58,17 @@ export interface VersionEntry {
 
 export type UploadAction = "upsert" | "merge" | "restore";
 
+/** 分享元数据（GET /api/v1/shares）。 */
+export interface ShareEntry {
+	id: string;
+	name: string;
+	size: number;
+	expiresAt: number;
+	createdAt: number;
+	revoked: boolean;
+	expired: boolean;
+}
+
 export class ApiError extends Error {
 	constructor(
 		public status: number,
@@ -214,6 +225,45 @@ export class ApiClient {
 			size: num(header(res.headers, "x-file-size")),
 			mtime: num(header(res.headers, "x-file-mtime")),
 		};
+	}
+
+	/** 创建分享（body 是独立 Share Key 加密后的密文；服务器拿不到 key）。 */
+	async createShare(name: string, expiresAt: number, payload: ArrayBuffer): Promise<{ id: string }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/share`,
+			method: "POST",
+			headers: this.headers({
+				"Content-Type": "application/octet-stream",
+				"X-Share-Name": encodeURIComponent(name),
+				"X-Share-Expires": String(expiresAt),
+			}),
+			body: payload,
+			throw: false,
+		});
+		if (res.status !== 200) throw new ApiError(res.status, `share create failed: HTTP ${res.status}`);
+		return res.json as { id: string };
+	}
+
+	async listShares(): Promise<ShareEntry[]> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/shares`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200) throw new ApiError(res.status, `share list failed: HTTP ${res.status}`);
+		return (res.json as { shares: ShareEntry[] }).shares ?? [];
+	}
+
+	async revokeShare(id: string): Promise<void> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/share?id=${encodeURIComponent(id)}`,
+			method: "DELETE",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status === 404) throw new NotFoundError();
+		if (res.status !== 200) throw new ApiError(res.status, `share revoke failed: HTTP ${res.status}`);
 	}
 
 	/** 获取服务器上的加密 vault key 文档；未启用 E2EE 时返回 null。 */

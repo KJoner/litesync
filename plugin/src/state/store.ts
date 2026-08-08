@@ -22,6 +22,14 @@ export interface PendingConflict {
 	createdAt: number;
 }
 
+/** 本设备创建过的分享（Share Key 只存本地，服务器与其他设备都拿不到）。 */
+export interface ShareRecord {
+	path: string;
+	keyB64url: string;
+	createdAt: number;
+	expiresAt: number;
+}
+
 export interface PersistedState {
 	deviceId: string;
 	lastSequence: number;
@@ -29,6 +37,7 @@ export interface PersistedState {
 	conflicts: Record<string, PendingConflict>;
 	/** vault key 文档缓存（只含加密后的密钥材料，可安全落盘） */
 	e2ee: VaultKeyDoc | null;
+	shares: Record<string, ShareRecord>;
 }
 
 /**
@@ -36,7 +45,14 @@ export interface PersistedState {
  * （与 data.json 的设置分离，避免设置文件无限增大）。
  */
 export class StateStore {
-	state: PersistedState = { deviceId: "", lastSequence: 0, files: {}, conflicts: {}, e2ee: null };
+	state: PersistedState = {
+		deviceId: "",
+		lastSequence: 0,
+		files: {},
+		conflicts: {},
+		e2ee: null,
+		shares: {},
+	};
 
 	constructor(
 		private adapter: DataAdapter,
@@ -53,6 +69,7 @@ export class StateStore {
 					files: raw.files && typeof raw.files === "object" ? raw.files : {},
 					conflicts: raw.conflicts && typeof raw.conflicts === "object" ? raw.conflicts : {},
 					e2ee: raw.e2ee && typeof raw.e2ee === "object" ? raw.e2ee : null,
+					shares: raw.shares && typeof raw.shares === "object" ? raw.shares : {},
 				};
 				// v0.2 状态升级：当时全部为明文，serverHash 与 hash 相同
 				for (const fs of Object.values(this.state.files)) {
@@ -61,7 +78,7 @@ export class StateStore {
 			}
 		} catch (e) {
 			console.error("[private-sync] failed to load state.json, starting fresh", e);
-			this.state = { deviceId: "", lastSequence: 0, files: {}, conflicts: {}, e2ee: null };
+			this.state = { deviceId: "", lastSequence: 0, files: {}, conflicts: {}, e2ee: null, shares: {} };
 		}
 		if (!this.state.deviceId) {
 			this.state.deviceId = crypto.randomUUID();
