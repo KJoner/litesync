@@ -1,0 +1,214 @@
+import { requestUrl } from "obsidian";
+
+export interface ServerInfo {
+	version: string;
+	latestSequence: number;
+	serverTime: number;
+}
+
+export interface RemoteChange {
+	sequence: number;
+	path: string;
+	action: "upsert" | "delete";
+	revision: number;
+	hash?: string;
+}
+
+export interface ChangesResponse {
+	latestSequence: number;
+	hasMore: boolean;
+	changes: RemoteChange[];
+}
+
+export interface UploadOk {
+	path: string;
+	revision: number;
+	hash: string;
+	size: number;
+	sequence: number;
+}
+
+/** 409 响应中携带的服务器当前状态。 */
+export interface RemoteFileState {
+	path: string;
+	revision: number;
+	hash: string;
+	deleted: boolean;
+}
+
+export interface DownloadResult {
+	data: ArrayBuffer;
+	revision: number;
+	hash: string;
+	size: number;
+	mtime: number;
+}
+
+export class ApiError extends Error {
+	constructor(
+		public status: number,
+		message: string,
+	) {
+		super(message);
+		this.name = "ApiError";
+	}
+}
+
+export class ConflictError extends Error {
+	constructor(public server: RemoteFileState) {
+		super(`revision conflict on ${server.path} (server revision ${server.revision})`);
+		this.name = "ConflictError";
+	}
+}
+
+export class NotFoundError extends Error {
+	constructor(
+		public deleted = false,
+		public revision = 0,
+	) {
+		super("not found");
+		this.name = "NotFoundError";
+	}
+}
+
+interface ClientConfig {
+	serverUrl: string;
+	apiToken: string;
+	deviceId: string;
+}
+
+/**
+ * 服务端 API 客户端。使用 Obsidian 的 requestUrl（不受 CORS 限制）。
+ * 文件路径经 encodeURIComponent 放入 Header，以支持中文等非 ASCII 文件名。
+ */
+export class ApiClient {
+	constructor(private getConfig: () => ClientConfig) {}
+
+	private base(): string {
+		const url = this.getConfig().serverUrl.trim().replace(/\/+$/, "");
+		if (!url) throw new ApiError(0, "server URL is not configured");
+		return url;
+	}
+
+	private headers(extra?: Record<string, string>): Record<string, string> {
+		const { apiToken, deviceId } = this.getConfig();
+		return {
+			Authorization: `Bearer ${apiToken}`,
+			"X-Device-ID": deviceId,
+			...extra,
+		};
+	}
+
+	async info(): Promise<ServerInfo> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/info`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200) throw new ApiError(res.status, `info failed: HTTP ${res.status}`);
+		return res.json as ServerInfo;
+	}
+
+	async changes(since: number, limit = 500): Promise<ChangesResponse> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/changes?since=${since}&limit=${limit}`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200) throw new ApiError(res.status, `changes failed: HTTP ${res.status}`);
+		return res.json as ChangesResponse;
+	}
+
+	async download(path: string): Promise<DownloadResult> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/file?path=${encodeURIComponent(path)}`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status === 404) {
+			const body = tryJson(res.text);
+			throw new NotFoundError(body?.deleted === true, num(body?.revision));
+		}
+		if (res.status !== 200) throw new ApiError(res.status, `download ${path} failed: HTTP ${res.status}`);
+		return {
+			data: res.arrayBuffer,
+			revision: num(header(res.headers, "x-revision")),
+			hash: header(res.headers, "x-content-hash") ?? "",
+			size: num(header(res.headers, "x-file-size")),
+			mtime: num(header(res.headers, "x-file-mtime")),
+		};
+	}
+
+	async upload(
+		path: string,
+		baseRevision: number,
+		hash: string,
+		data: ArrayBuffer,
+		mtime: number,
+	): Promise<UploadOk> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/file`,
+			method: "PUT",
+			headers: this.headers({
+				"Content-Type": "application/octet-stream",
+				"X-File-Path": encodeURIComponent(path),
+				"X-Base-Revision": String(baseRevision),
+				"X-Content-Hash": hash,
+				"X-File-Mtime": String(Math.round(mtime)),
+			}),
+			body: data,
+			throw: false,
+		});
+		if (res.status === 409) throw new ConflictError(parseConflict(res.text, path));
+		if (res.status !== 200) throw new ApiError(res.status, `upload ${path} failed: HTTP ${res.status}`);
+		return res.json as UploadOk;
+	}
+
+	async remove(path: string, baseRevision: number): Promise<void> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/file`,
+			method: "DELETE",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify({ path, baseRevision }),
+			throw: false,
+		});
+		if (res.status === 409) throw new ConflictError(parseConflict(res.text, path));
+		if (res.status === 404) throw new NotFoundError();
+		if (res.status !== 200) throw new ApiError(res.status, `delete ${path} failed: HTTP ${res.status}`);
+	}
+}
+
+function parseConflict(text: string, path: string): RemoteFileState {
+	const body = tryJson(text);
+	return {
+		path: typeof body?.path === "string" ? body.path : path,
+		revision: num(body?.revision),
+		hash: typeof body?.hash === "string" ? body.hash : "",
+		deleted: body?.deleted === true,
+	};
+}
+
+function tryJson(text: string): Record<string, unknown> | null {
+	try {
+		const v = JSON.parse(text);
+		return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : null;
+	} catch {
+		return null;
+	}
+}
+
+function header(headers: Record<string, string>, name: string): string | undefined {
+	if (name in headers) return headers[name];
+	for (const key of Object.keys(headers)) {
+		if (key.toLowerCase() === name) return headers[key];
+	}
+	return undefined;
+}
+
+function num(v: unknown): number {
+	const n = typeof v === "string" ? parseInt(v, 10) : typeof v === "number" ? v : NaN;
+	return Number.isFinite(n) ? n : 0;
+}
