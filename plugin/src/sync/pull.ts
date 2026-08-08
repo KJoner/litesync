@@ -22,6 +22,16 @@ export async function pullRemoteChanges(ctx: SyncContext): Promise<PullResult> {
 	try {
 		for (;;) {
 			const resp = await ctx.client.changes(ctx.store.state.lastSequence, 500);
+			if (resp.resyncRequired) {
+				// 服务器已裁剪掉旧 changes：走 snapshot 全量对账重建游标（绝不漏删改）
+				ctx.log(
+					`resync required (cursor ${ctx.store.state.lastSequence} < min ${resp.minSequence ?? 0})`,
+				);
+				const r = await resyncFromSnapshot(ctx);
+				result.applied += r.applied;
+				result.conflicts += r.conflicts;
+				break;
+			}
 			if (resp.changes.length === 0) {
 				// 没有新变更；latestSequence 可能因事务回滚出现空洞，直接对齐
 				if (resp.latestSequence > ctx.store.state.lastSequence) {
@@ -44,6 +54,54 @@ export async function pullRemoteChanges(ctx: SyncContext): Promise<PullResult> {
 }
 
 type Outcome = "applied" | "skipped" | "conflict";
+
+/**
+ * snapshot 全量对账：把「快照 vs 本地状态缓存」的差异合成为等价的远端变更，
+ * 复用 applyRemoteChange 的全部安全逻辑（冲突/合并/回收站），最后对齐游标。
+ */
+async function resyncFromSnapshot(ctx: SyncContext): Promise<PullResult> {
+	const result: PullResult = { applied: 0, conflicts: 0 };
+	const snap = await ctx.client.snapshot();
+	const snapPaths = new Set(snap.files.map((f) => f.path));
+
+	// 已跟踪但快照中不存在 → 远端已删除
+	for (const path of ctx.store.paths()) {
+		if (ctx.ignores(path) || snapPaths.has(path)) continue;
+		const outcome = await applyRemoteChange(ctx, {
+			sequence: snap.sequence,
+			path,
+			action: "delete",
+			revision: 0,
+		});
+		if (outcome === "applied") result.applied++;
+		if (outcome === "conflict") result.conflicts++;
+	}
+	// 快照与本地已知服务器状态不一致 → 远端有更新
+	for (const f of snap.files) {
+		if (ctx.ignores(f.path)) continue;
+		const tracked = ctx.store.get(f.path);
+		if (tracked && tracked.serverHash === f.hash) {
+			if (tracked.revision !== f.revision) {
+				ctx.store.set(f.path, { ...tracked, revision: f.revision });
+			}
+			continue;
+		}
+		const outcome = await applyRemoteChange(ctx, {
+			sequence: snap.sequence,
+			path: f.path,
+			action: "upsert",
+			revision: f.revision,
+			hash: f.hash,
+		});
+		if (outcome === "applied") result.applied++;
+		if (outcome === "conflict") result.conflicts++;
+	}
+
+	ctx.store.state.lastSequence = snap.sequence;
+	await ctx.store.save();
+	ctx.notify("服务器变更日志已轮转，已通过快照完成全量对账");
+	return result;
+}
 
 async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promise<Outcome> {
 	const path = change.path;

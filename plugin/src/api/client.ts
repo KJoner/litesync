@@ -19,6 +19,18 @@ export interface ChangesResponse {
 	latestSequence: number;
 	hasMore: boolean;
 	changes: RemoteChange[];
+	/** 服务器已裁剪掉本游标之前的 changes：必须走 snapshot 全量对账 */
+	resyncRequired?: boolean;
+	minSequence?: number;
+}
+
+/** snapshot 文件元数据（全量对账用）。 */
+export interface SnapshotFile {
+	path: string;
+	revision: number;
+	hash: string;
+	size: number;
+	mtime: number;
 }
 
 export interface UploadOk {
@@ -144,6 +156,18 @@ export class ApiClient {
 		});
 		if (res.status !== 200) throw new ApiError(res.status, `changes failed: HTTP ${res.status}`);
 		return res.json as ChangesResponse;
+	}
+
+	/** 当前所有未删除文件的元数据（changes 被裁剪后的全量对账）。 */
+	async snapshot(): Promise<{ sequence: number; files: SnapshotFile[] }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/snapshot`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200) throw new ApiError(res.status, `snapshot failed: HTTP ${res.status}`);
+		return res.json as { sequence: number; files: SnapshotFile[] };
 	}
 
 	async download(path: string): Promise<DownloadResult> {
