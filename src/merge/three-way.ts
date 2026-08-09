@@ -14,8 +14,8 @@ interface SideHunk extends DiffHunk {
 	side: "local" | "remote";
 }
 
-/** 内部分段：以行数组表示，避免空串与空行的歧义。 */
-type Piece =
+/** 内部分段：以行数组表示，避免空串与空行的歧义（token 级合并复用同一结构）。 */
+export type Piece =
 	| { kind: "lines"; lines: string[] }
 	| {
 			kind: "conflict";
@@ -30,7 +30,14 @@ export function threeWayMerge(input: MergeInput): MergeResult {
 	const base = splitLines(input.base);
 	const local = splitLines(input.local);
 	const remote = splitLines(input.remote);
+	return piecesToResult(mergePieces(base, local, remote));
+}
 
+/**
+ * 三方序列合并核心：对任意字符串序列（行或 token）做 diff3 分段。
+ * smartThreeWayMerge 的 section 级与 token 级合并都复用这里。
+ */
+export function mergePieces(base: string[], local: string[], remote: string[]): Piece[] {
 	const hunks: SideHunk[] = [
 		...diffHunks(base, local).map((h) => ({ ...h, side: "local" as const })),
 		...diffHunks(base, remote).map((h) => ({ ...h, side: "remote" as const })),
@@ -93,8 +100,11 @@ export function threeWayMerge(input: MergeInput): MergeResult {
 	if (cursor < base.length) {
 		pieces.push({ kind: "lines", lines: base.slice(cursor) });
 	}
+	return pieces;
+}
 
-	// 生成公开结构
+/** 把内部分段转成公开的 MergeResult 结构（行域）。 */
+export function piecesToResult(pieces: Piece[]): MergeResult {
 	const segments: MergeSegment[] = [];
 	const conflicts: MergeConflict[] = [];
 	const mergedLines: string[] = [];

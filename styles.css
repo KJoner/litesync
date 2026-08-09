@@ -222,3 +222,12 @@
 	border-radius: 8px;
 	max-width: 100%;
 }
+
+/* ---------- 智能合并建议（0.8.1） ---------- */
+.litesync-hunk-suggest {
+	border-left: 3px solid var(--interactive-accent);
+	border-radius: 4px;
+	background: var(--background-secondary);
+	padding: 4px 8px;
+	margin: 6px 0;
+}

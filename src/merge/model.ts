@@ -6,6 +6,9 @@ export interface MergeInput {
 	remote: string;
 }
 
+/** 冲突类别（v0.8.1 智能合并）。 */
+export type ConflictKind = "text" | "list-item" | "delete-edit" | "frontmatter-value" | "code";
+
 export interface MergeConflict {
 	id: string;
 
@@ -16,6 +19,14 @@ export interface MergeConflict {
 	baseText: string;
 	localText: string;
 	remoteText: string;
+
+	// ---- v0.8.1 智能合并附加信息（可选，行级引擎不填） ----
+	kind?: ConflictKind;
+	/** 引擎给出的建议结果（只建议，绝不自动写入；由用户在 Resolver 里采纳） */
+	suggestedText?: string;
+	confidence?: "high" | "medium" | "low";
+	/** 建议理由（展示给用户） */
+	reason?: string;
 }
 
 /** 合并结果的分段表示：稳定文本段与冲突段交替出现，供 Resolver UI 使用。 */
@@ -33,4 +44,6 @@ export interface MergeResult {
 	mergedText: string;
 	conflicts: MergeConflict[];
 	segments: MergeSegment[];
+	/** 智能合并统计（v0.8.1）：行级引擎判冲突、但被智能层自动解决的数量 */
+	stats?: { autoResolved: number };
 }

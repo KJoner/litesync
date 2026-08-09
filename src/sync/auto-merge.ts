@@ -10,7 +10,7 @@
  */
 import { ConflictError } from "../api/client";
 import { E2eeLockedError } from "../crypto/keyring";
-import { threeWayMerge } from "../merge/three-way";
+import { smartThreeWayMerge } from "../merge/smart-merge";
 import { FileState } from "../state/store";
 import { sha256Hex } from "../utils/hash";
 import { decodeUtf8Strict, encodeUtf8 } from "../utils/text";
@@ -73,14 +73,17 @@ export async function attemptAutoMerge(
 				return "merged";
 			}
 
-			const result = threeWayMerge({ base: baseText, local: localText, remote: remoteText });
+			const result = smartThreeWayMerge({ base: baseText, local: localText, remote: remoteText });
 			if (!result.clean) {
 				ctx.store.setConflict(path, {
 					baseRevision: tracked.revision,
 					remoteRevision: remote.revision,
 					createdAt: Date.now(),
 				});
-				ctx.log(`auto-merge: structured conflicts on ${path} (${result.conflicts.length} hunks)`);
+				ctx.log(
+					`auto-merge: structured conflicts on ${path} ` +
+						`(${result.conflicts.length} hunks, ${result.stats?.autoResolved ?? 0} auto-resolved)`,
+				);
 				return "pending";
 			}
 

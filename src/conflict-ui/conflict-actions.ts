@@ -1,5 +1,5 @@
 import { NotFoundError } from "../api/client";
-import { threeWayMerge } from "../merge/three-way";
+import { smartThreeWayMerge } from "../merge/smart-merge";
 import { keepBothVersions } from "../sync/conflict";
 import { SyncContext } from "../sync/context";
 import { downloadPlain, uploadFromPlain, versionPlain } from "../sync/transfer";
@@ -48,7 +48,7 @@ export async function loadConflict(ctx: SyncContext, path: string): Promise<Load
 		baseText = null; // base 已被 GC → 两方对比模式
 	}
 
-	const merge = threeWayMerge({ base: baseText ?? "", local: localText, remote: remoteText });
+	const merge = smartThreeWayMerge({ base: baseText ?? "", local: localText, remote: remoteText });
 
 	// 记录最新远端 revision（Race Protection 的锚点）
 	pending.remoteRevision = remote.revision;

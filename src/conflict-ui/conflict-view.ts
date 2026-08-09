@@ -121,7 +121,21 @@ export class ResolverModal extends Modal {
 		const nav = contentEl.createDiv({ cls: "litesync-hunk-buttons" });
 		nav.createEl("button", { text: "上一个冲突" }).onclick = () => this.gotoHunk(this.currentHunk - 1);
 		nav.createEl("button", { text: "下一个冲突" }).onclick = () => this.gotoHunk(this.currentHunk + 1);
-		nav.createSpan({ cls: "litesync-history-meta", text: `共 ${conflicts.length} 处冲突` });
+		const autoResolved = loaded.merge.stats?.autoResolved ?? 0;
+		nav.createSpan({
+			cls: "litesync-history-meta",
+			text:
+				`共 ${conflicts.length} 处冲突` +
+				(autoResolved > 0 ? `（另有 ${autoResolved} 处已智能自动合并）` : ""),
+		});
+		// 「采用全部建议」：一次性接受引擎给出的全部建议（仍需 Save merge 才生效）
+		const suggestionAppliers: Array<() => void> = [];
+		const suggestedCount = conflicts.filter((c) => c.suggestedText !== undefined).length;
+		if (suggestedCount > 0) {
+			nav.createEl("button", { text: `采用全部建议 (${suggestedCount})`, cls: "mod-cta" }).onclick = () => {
+				for (const apply of suggestionAppliers) apply();
+			};
+		}
 
 		conflicts.forEach((c, idx) => {
 			const box = hunksBox.createDiv({ cls: "litesync-hunk" });
@@ -136,17 +150,41 @@ export class ResolverModal extends Modal {
 			box.createDiv({ cls: "litesync-hunk-label", text: "REMOTE:" });
 			box.createDiv({ cls: "litesync-hunk-text litesync-hunk-remote", text: c.remoteText || "（删除该段）" });
 
+			// 智能合并建议（v0.8.1）：只建议，绝不自动写入；用户点击才采纳
+			let bSuggest: HTMLButtonElement | null = null;
+			if (c.suggestedText !== undefined) {
+				const confidenceText = c.confidence === "high" ? "高" : c.confidence === "low" ? "低" : "中";
+				const sug = box.createDiv({ cls: "litesync-hunk-suggest" });
+				sug.createDiv({
+					cls: "litesync-hunk-label",
+					text: `LiteSync 建议（置信度：${confidenceText}）：${c.reason ?? ""}`,
+				});
+				sug.createDiv({ cls: "litesync-hunk-text", text: c.suggestedText || "（删除该段）" });
+			}
+
 			const btns = box.createDiv({ cls: "litesync-hunk-buttons" });
+			if (c.suggestedText !== undefined) {
+				bSuggest = btns.createEl("button", { text: "采用建议", cls: "mod-cta" });
+			}
 			const bLocal = btns.createEl("button", { text: "Use local" });
 			const bRemote = btns.createEl("button", { text: "Use remote" });
 			const bBoth = btns.createEl("button", { text: "Use both" });
+			const allBtns = [bLocal, bRemote, bBoth, ...(bSuggest ? [bSuggest] : [])];
 			const pick = (text: string, chosen: HTMLButtonElement) => {
 				this.choices[c.id] = text;
 				box.addClass("litesync-hunk-resolved");
-				for (const b of [bLocal, bRemote, bBoth]) b.removeClass("litesync-chosen");
+				for (const b of allBtns) b.removeClass("litesync-chosen");
 				chosen.addClass("litesync-chosen");
 				this.refreshMerged();
 			};
+			if (bSuggest) {
+				const applySuggestion = () => pick(c.suggestedText!, bSuggest);
+				bSuggest.onclick = applySuggestion;
+				suggestionAppliers.push(() => {
+					// 批量采用时不覆盖用户已手动做出的选择
+					if (this.choices[c.id] === undefined) applySuggestion();
+				});
+			}
 			bLocal.onclick = () => pick(c.localText, bLocal);
 			bRemote.onclick = () => pick(c.remoteText, bRemote);
 			bBoth.onclick = () =>
