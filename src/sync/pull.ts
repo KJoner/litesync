@@ -211,19 +211,19 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 }
 
 /**
- * 删除本地文件时优先进回收站，绝不静默永久删除。返回是否成功。
- * 移动端（iOS 无系统回收站）使用 vault 内 .trash；任何回收站失败时
- * 桌面端才回退永久删除，移动端返回 false（宁可多留，不可误删）。
+ * 删除本地文件时进回收站，绝不静默永久删除。返回是否成功。
+ * 优先 FileManager.trashFile（尊重用户在「删除的文件」中的偏好设置）；
+ * 失败时桌面端才回退永久删除，移动端返回 false（宁可多留，不可误删）。
  */
 async function trashLocal(app: App, path: string): Promise<boolean> {
 	const adapter = app.vault.adapter;
 	try {
 		const af = app.vault.getAbstractFileByPath(path);
 		if (af) {
-			await app.vault.trash(af, !Platform.isMobileApp);
+			await app.fileManager.trashFile(af);
 			return true;
 		}
-		// .obsidian 等隐藏路径拿不到 TAbstractFile，退回 adapter
+		// 配置目录等隐藏路径拿不到 TAbstractFile，退回 adapter
 		if (!Platform.isMobileApp && (await adapter.trashSystem(path))) return true;
 		await adapter.trashLocal(path);
 		return true;

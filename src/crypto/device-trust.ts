@@ -32,7 +32,7 @@ interface SecretStorageLike {
 	getSecret(id: string): string | null;
 }
 
-/** 取 Obsidian SecretStorage；旧版本（<1.11.4）返回 null，功能优雅降级。 */
+/** 取 Obsidian SecretStorage；旧版本返回 null，功能优雅降级。 */
 export function secretStorageOf(app: App): SecretStorageLike | null {
 	const ss = (app as App & { secretStorage?: SecretStorageLike }).secretStorage;
 	return ss && typeof ss.setSecret === "function" && typeof ss.getSecret === "function" ? ss : null;

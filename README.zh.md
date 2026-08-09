@@ -3,7 +3,7 @@
 配合 [LiteSync Server](https://github.com/KJoner/litesync-server) 使用的 Obsidian 同步插件。
 基于 revision + SHA-256 + change sequence 实现可靠增量同步，
 支持三方自动合并、版本历史、端到端加密与加密分享。
-桌面与 **iOS / Android 移动端**通用（需要 Obsidian 1.11.4+）。
+桌面与 **iOS / Android 移动端**通用（需要 Obsidian 1.13+）。
 
 ## 构建与安装
 
@@ -84,7 +84,7 @@ npm run dev          # watch 模式，开发用
 
 ## 版本历史
 
-- 命令 `File history` 或右键文件 →「Private Sync: 版本历史」
+- 命令 `File history` 或右键文件 →「LiteSync: 版本历史」
 - 每个版本可**对比**（逐行 diff）、**恢复**（旧内容作为新版本上传，
   历史线性可追踪）、**另存副本**（`xxx.rev-N.md`）
 
@@ -111,12 +111,12 @@ npm run dev          # watch 模式，开发用
 - 服务器密钥轮换后设备信任自动失效（keyId 绑定）
 - 设置页提供 **🔒 立即锁定**（本次会话）与 **🗑 忘记此设备**（下次需密码）
 - 旧版本升级自动迁移：明文密码/Token 从 `data.json` 抹除
-- v0.6 起要求 Obsidian 1.11.4+（`minAppVersion`），凭据一律 SecretStorage，
+- v0.7.1 起要求 Obsidian 1.13+（`minAppVersion`，声明式设置 API），凭据一律 SecretStorage，
   不再提供 data.json 明文降级
 
 ## 分享
 
-右键文件 →「Private Sync: 分享此文件…」：
+右键文件 →「LiteSync: 分享此文件…」：
 
 - 每个分享生成**独立随机 Share Key**，只加密该分享对象（与 VMK 完全无关）
 - 服务器只存密文；**Share Key 在链接 `#` 片段中，不会发给服务器**

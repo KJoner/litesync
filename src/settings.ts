@@ -1,4 +1,4 @@
-import { App, Notice, Platform, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, Platform, PluginSettingTab, SettingDefinitionItem } from "obsidian";
 import type PrivateSyncPlugin from "./main";
 
 export interface PluginSettings {
@@ -23,7 +23,7 @@ export interface PluginSettings {
 
 export const DEFAULT_SETTINGS: PluginSettings = {
 	serverUrl: "",
-	apiToken: "", // 仅作为无 SecretStorage 时的降级存储；正常情况下为空，真实值在 SecretStorage
+	apiToken: "", // 仅作旧版本迁移的读取来源；正常情况下为空，真实值在 SecretStorage
 	deviceName: "",
 	autoSync: true,
 	syncIntervalSeconds: 30,
@@ -34,6 +34,11 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	deviceKeyB64: "",
 };
 
+/**
+ * 设置页（1.13 声明式 API）：设置项可被 Obsidian 的设置搜索索引到。
+ * 值的读写经 getControlValue / setControlValue 统一路由——
+ * API Token 走 SecretStorage，trustDevice 走 setTrustDevice，其余进 data.json。
+ */
 export class SyncSettingTab extends PluginSettingTab {
 	constructor(
 		app: App,
@@ -42,195 +47,177 @@ export class SyncSettingTab extends PluginSettingTab {
 		super(app, plugin);
 	}
 
-	display(): void {
-		const { containerEl } = this;
-		containerEl.empty();
+	getSettingDefinitions(): SettingDefinitionItem[] {
+		const plugin = this.plugin;
+		return [
+			{
+				type: "group",
+				heading: "服务器",
+				items: [
+					{
+						name: "Server URL",
+						desc: createFragment((frag) => {
+							frag.appendText("同步服务器地址，例如 https://sync.example.com。还没有服务器？");
+							// 指向自建部署指南（插件绝不代替用户下载/运行服务器程序）
+							frag.createEl("a", {
+								text: "查看部署指南（litesync-server）",
+								href: "https://github.com/KJoner/litesync-server",
+							});
+						}),
+						control: { type: "text", key: "serverUrl", placeholder: "https://sync.example.com" },
+					},
+					{
+						name: "API Token",
+						desc: "与服务器 OBSYNC_TOKEN 一致（保存在 Obsidian SecretStorage，不进入 data.json）",
+						render: (setting) => {
+							setting.addText((text) => {
+								text.inputEl.type = "password";
+								text
+									.setPlaceholder("token")
+									.setValue(plugin.getApiToken())
+									.onChange(async (value) => {
+										await plugin.setApiToken(value.trim());
+									});
+							});
+						},
+					},
+					{
+						name: "测试连接",
+						desc: "验证服务器地址与 Token 是否可用",
+						action: (el) => {
+							el.addClass("is-disabled");
+							void plugin.testConnection().then((msg) => {
+								new Notice(msg);
+								el.removeClass("is-disabled");
+							});
+						},
+					},
+					{
+						name: "设备名称",
+						desc: "用于冲突文件命名和服务器日志，例如 MacBook",
+						control: { type: "text", key: "deviceName", placeholder: "MacBook" },
+					},
+				],
+			},
+			{
+				type: "group",
+				heading: "同步",
+				items: [
+					{
+						name: "自动同步",
+						desc: "文件变化后自动同步（含定时拉取远端变更）",
+						control: { type: "toggle", key: "autoSync" },
+					},
+					{
+						name: "同步间隔",
+						desc: Platform.isMobileApp
+							? "定时拉取仅在 App 前台运行，移动端最低 60 秒（切回 App 时会自动补同步）"
+							: "定时向服务器拉取其他设备产生的变更",
+						control: {
+							type: "dropdown",
+							key: "syncIntervalSeconds",
+							options: {
+								"15": "15 秒",
+								"30": "30 秒",
+								"60": "60 秒",
+								"120": "2 分钟",
+								"300": "5 分钟",
+								"0": "关闭定时同步",
+							},
+						},
+					},
+					{
+						name: "同步 Obsidian 配置目录",
+						desc: Platform.isMobileApp
+							? "移动端始终不同步配置目录（桌面与移动配置差异大，避免互相覆盖）"
+							: "同步 Obsidian 配置目录（workspace 和本插件目录永远不同步）",
+						control: { type: "toggle", key: "syncObsidian" },
+					},
+					{
+						name: "忽略规则",
+						desc: "每行一个 Glob 模式；不含 / 的模式按文件名匹配",
+						control: { type: "textarea", key: "ignorePatterns", rows: 4 },
+					},
+					{
+						name: "立即同步",
+						desc: "手动触发一次完整同步",
+						action: () => void plugin.syncNow(),
+					},
+				],
+			},
+			{
+				type: "group",
+				heading: "端到端加密 (E2EE)",
+				items: [
+					{
+						name: "状态",
+						aliases: ["E2EE", "端到端加密", "加密"],
+						render: (setting) => {
+							const status = plugin.e2eeStatusText();
+							setting.setDesc(status.desc);
+							setting.addButton((btn) =>
+								btn.setButtonText(status.action).onClick(async () => {
+									await plugin.e2eeAction();
+									this.update(); // 状态与按钮文案随之刷新
+								}),
+							);
+						},
+					},
+					{
+						name: "信任此设备（保持解锁）",
+						desc:
+							"解锁后将 Vault Master Key 用随机设备密钥包装存入 Obsidian SecretStorage，" +
+							"之后启动自动解锁。E2EE 密码本身永远不会被保存。",
+						control: { type: "toggle", key: "trustDevice" },
+					},
+					{
+						name: "忘记此设备",
+						desc: "删除本设备保存的密钥包装并锁定；下次必须重新输入 E2EE 密码",
+						visible: () => plugin.hasTrustedDevice(),
+						action: () => {
+							void plugin.forgetThisDevice().then(() => this.update());
+						},
+					},
+				],
+			},
+			{
+				type: "group",
+				heading: "调试",
+				items: [
+					{
+						name: "Debug 日志",
+						desc: "在开发者控制台输出同步日志",
+						control: { type: "toggle", key: "debug" },
+					},
+				],
+			},
+		];
+	}
 
-		new Setting(containerEl).setName("服务器").setHeading();
+	getControlValue(key: string): unknown {
+		if (key === "syncIntervalSeconds") return String(this.plugin.settings.syncIntervalSeconds);
+		return (this.plugin.settings as unknown as Record<string, unknown>)[key];
+	}
 
-		new Setting(containerEl)
-			.setName("Server URL")
-			.setDesc("同步服务器地址，例如 https://sync.example.com")
-			.addText((text) =>
-				text
-					.setPlaceholder("https://sync.example.com")
-					.setValue(this.plugin.settings.serverUrl)
-					.onChange(async (value) => {
-						this.plugin.settings.serverUrl = value.trim();
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		// 还没有服务器的用户：指向自建部署指南（插件绝不代替用户下载/运行服务器程序）
-		const guide = containerEl.createEl("div", { cls: "setting-item-description" });
-		guide.appendText("还没有 LiteSync 服务器？");
-		guide.createEl("a", {
-			text: "查看部署指南（litesync-server）",
-			href: "https://github.com/KJoner/litesync-server",
-		});
-
-		new Setting(containerEl)
-			.setName("API Token")
-			.setDesc("与服务器 OBSYNC_TOKEN 一致（保存在 Obsidian SecretStorage，不进入 data.json）")
-			.addText((text) => {
-				text.inputEl.type = "password";
-				text
-					.setPlaceholder("token")
-					.setValue(this.plugin.getApiToken())
-					.onChange(async (value) => {
-						await this.plugin.setApiToken(value.trim());
-					});
-			});
-
-		new Setting(containerEl)
-			.setName("测试连接")
-			.setDesc("验证服务器地址与 Token 是否可用")
-			.addButton((btn) =>
-				btn.setButtonText("Test Connection").onClick(async () => {
-					btn.setDisabled(true);
-					try {
-						new Notice(await this.plugin.testConnection());
-					} finally {
-						btn.setDisabled(false);
-					}
-				}),
-			);
-
-		new Setting(containerEl)
-			.setName("设备名称")
-			.setDesc("用于冲突文件命名和服务器日志，例如 MacBook")
-			.addText((text) =>
-				text
-					.setPlaceholder("MacBook")
-					.setValue(this.plugin.settings.deviceName)
-					.onChange(async (value) => {
-						this.plugin.settings.deviceName = value.trim();
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl).setName("同步").setHeading();
-
-		new Setting(containerEl)
-			.setName("自动同步")
-			.setDesc("文件变化后自动同步（含定时拉取远端变更）")
-			.addToggle((toggle) =>
-				toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {
-					this.plugin.settings.autoSync = value;
-					await this.plugin.saveSettings();
-					this.plugin.applySettings();
-				}),
-			);
-
-		new Setting(containerEl)
-			.setName("同步间隔")
-			.setDesc(
-				Platform.isMobileApp
-					? "定时拉取仅在 App 前台运行，移动端最低 60 秒（切回 App 时会自动补同步）"
-					: "定时向服务器拉取其他设备产生的变更",
-			)
-			.addDropdown((dd) =>
-				dd
-					.addOptions({
-						"15": "15 秒",
-						"30": "30 秒",
-						"60": "60 秒",
-						"120": "2 分钟",
-						"300": "5 分钟",
-						"0": "关闭定时同步",
-					})
-					.setValue(String(this.plugin.settings.syncIntervalSeconds))
-					.onChange(async (value) => {
-						this.plugin.settings.syncIntervalSeconds = parseInt(value, 10);
-						await this.plugin.saveSettings();
-						this.plugin.applySettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("同步 .obsidian 配置")
-			.setDesc(
-				Platform.isMobileApp
-					? "移动端始终不同步 .obsidian（桌面与移动配置差异大，避免互相覆盖）"
-					: "同步 Obsidian 配置目录（workspace 和本插件目录永远不同步）",
-			)
-			.addToggle((toggle) =>
-				toggle.setValue(this.plugin.settings.syncObsidian).onChange(async (value) => {
-					this.plugin.settings.syncObsidian = value;
-					await this.plugin.saveSettings();
-					this.plugin.applySettings();
-				}),
-			);
-
-		new Setting(containerEl)
-			.setName("忽略规则")
-			.setDesc("每行一个 Glob 模式；不含 / 的模式按文件名匹配")
-			.addTextArea((text) => {
-				text.inputEl.rows = 4;
-				text.setValue(this.plugin.settings.ignorePatterns).onChange(async (value) => {
-					this.plugin.settings.ignorePatterns = value;
-					await this.plugin.saveSettings();
-					this.plugin.applySettings();
-				});
-			});
-
-		new Setting(containerEl)
-			.setName("立即同步")
-			.addButton((btn) =>
-				btn
-					.setButtonText("Sync Now")
-					.setCta()
-					.onClick(() => void this.plugin.syncNow()),
-			);
-
-		new Setting(containerEl).setName("端到端加密 (E2EE)").setHeading();
-
-		const e2eeStatus = this.plugin.e2eeStatusText();
-		new Setting(containerEl)
-			.setName("状态")
-			.setDesc(e2eeStatus.desc)
-			.addButton((btn) => {
-				btn.setButtonText(e2eeStatus.action).onClick(async () => {
-					await this.plugin.e2eeAction();
-					this.display(); // 刷新状态显示
-				});
-			});
-
-		new Setting(containerEl)
-			.setName("信任此设备（保持解锁）")
-			.setDesc(
-				"解锁后将 Vault Master Key 用随机设备密钥包装存入 Obsidian SecretStorage，" +
-					"之后启动自动解锁。E2EE 密码本身永远不会被保存。",
-			)
-			.addToggle((toggle) =>
-				toggle.setValue(this.plugin.settings.trustDevice).onChange(async (value) => {
-					await this.plugin.setTrustDevice(value);
-					this.display();
-				}),
-			);
-
-		if (this.plugin.hasTrustedDevice()) {
-			new Setting(containerEl)
-				.setName("忘记此设备")
-				.setDesc("删除本设备保存的密钥包装并锁定；下次必须重新输入 E2EE 密码")
-				.addButton((btn) =>
-					btn.setButtonText("🗑 忘记此设备").onClick(async () => {
-						await this.plugin.forgetThisDevice();
-						this.display();
-					}),
-				);
+	async setControlValue(key: string, value: unknown): Promise<void> {
+		const settings = this.plugin.settings as unknown as Record<string, unknown>;
+		switch (key) {
+			case "serverUrl":
+			case "deviceName":
+				settings[key] = String(value).trim();
+				break;
+			case "syncIntervalSeconds":
+				this.plugin.settings.syncIntervalSeconds = parseInt(String(value), 10) || 0;
+				break;
+			case "trustDevice":
+				// 自带保存逻辑（写 SecretStorage / 删除信任），并影响「忘记此设备」的可见性
+				await this.plugin.setTrustDevice(value === true);
+				this.update();
+				return;
+			default:
+				settings[key] = value;
 		}
-
-		new Setting(containerEl).setName("调试").setHeading();
-
-		new Setting(containerEl)
-			.setName("Debug 日志")
-			.setDesc("在开发者控制台输出同步日志")
-			.addToggle((toggle) =>
-				toggle.setValue(this.plugin.settings.debug).onChange(async (value) => {
-					this.plugin.settings.debug = value;
-					await this.plugin.saveSettings();
-				}),
-			);
+		await this.plugin.saveSettings();
+		this.plugin.applySettings();
 	}
 }

@@ -29,7 +29,7 @@ else's cloud.
   Obsidian SecretStorage) instead of your password
 - **Encrypted sharing** — share a single note via a link whose key lives only
   in the URL fragment; revocable, with optional expiry
-- **Mobile support** — works on iOS/Android (Obsidian 1.11.4+): foreground
+- **Mobile support** — works on iOS/Android (Obsidian 1.13+): foreground
   catch-up sync, deletion safety (never permanently deletes), responsive UI
 
 ## Installation
@@ -60,6 +60,11 @@ install script sets everything up.
   ciphertext and cannot read your notes.
 - The API token is stored in Obsidian's SecretStorage (never in plain-text
   `data.json`).
+- As a sync plugin, LiteSync enumerates the files in your vault to determine
+  what needs syncing. File paths and contents go only to your own configured
+  server, nowhere else.
+- The system clipboard is written **only** when you explicitly click
+  "Copy link" for an encrypted share. LiteSync never reads the clipboard.
 - The server component is a separate open-source project:
   <https://github.com/KJoner/litesync-server>
 

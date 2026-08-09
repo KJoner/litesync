@@ -38,7 +38,7 @@ export class ShareModal extends Modal {
 		});
 
 		contentEl.createDiv({ text: "有效期：" });
-		const select = contentEl.createEl("select");
+		const select = contentEl.createEl("select", { cls: "litesync-share-select" });
 		for (const [label, days] of [
 			["7 天", 7],
 			["30 天", 30],
@@ -48,7 +48,6 @@ export class ShareModal extends Modal {
 			const opt = select.createEl("option", { text: label });
 			opt.value = String(days);
 		}
-		select.style.margin = "6px 0 12px";
 
 		const resultEl = contentEl.createDiv();
 		const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
@@ -81,8 +80,7 @@ export class ShareModal extends Modal {
 				const url = shareUrl(this.serverUrl, id, keyB64url);
 				resultEl.empty();
 				resultEl.createDiv({ text: "分享链接（含解密密钥，请通过安全渠道发送）：", cls: "litesync-history-meta" });
-				const input = resultEl.createEl("input", { type: "text", value: url });
-				input.style.width = "100%";
+				const input = resultEl.createEl("input", { type: "text", value: url, cls: "litesync-modal-input" });
 				input.readOnly = true;
 				input.onclick = () => input.select();
 				const row = resultEl.createDiv({ cls: "litesync-resolver-footer" });

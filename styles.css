@@ -195,3 +195,19 @@
 		gap: 6px;
 	}
 }
+
+/* ---------- 弹窗通用控件（0.7.1：审核要求样式走 CSS 类，不做内联赋值） ---------- */
+.litesync-modal-input {
+	width: 100%;
+	margin: 8px 0;
+}
+.litesync-trust-label {
+	display: block;
+	margin: 4px 0 10px;
+}
+.litesync-share-select {
+	margin: 6px 0 12px;
+}
+.litesync-status-clickable {
+	cursor: pointer;
+}

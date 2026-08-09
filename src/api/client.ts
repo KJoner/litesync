@@ -376,7 +376,7 @@ function parseConflict(text: string, path: string): RemoteFileState {
 
 function tryJson(text: string): Record<string, unknown> | null {
 	try {
-		const v = JSON.parse(text);
+		const v: unknown = JSON.parse(text);
 		return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : null;
 	} catch {
 		return null;

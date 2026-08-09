@@ -3,9 +3,10 @@
  *
  * 永远排除（不受设置影响）：
  * - 本插件自己的目录（data.json 含 API Token，state.json 是设备本地状态）
- * - .obsidian/workspace.json / workspace-mobile.json
+ * - 配置目录下的 workspace.json / workspace-mobile.json
  *
- * syncObsidian=false 时整个 .obsidian 目录不同步。
+ * syncObsidian=false 时整个 Obsidian 配置目录不同步。
+ * 配置目录名可被用户修改，因此由调用方传入 Vault#configDir，不做硬编码。
  * 用户模式支持简单 Glob：** 匹配任意层级，* 匹配单层，? 匹配单字符；
  * 不含 "/" 的模式按文件名（任意目录下）匹配。
  */
@@ -15,7 +16,8 @@ export class IgnoreMatcher {
 
 	constructor(
 		private syncObsidian: boolean,
-		private pluginDir: string, // 例如 ".obsidian/plugins/litesync"
+		private configDir: string, // Vault#configDir，通常是 ".obsidian"
+		private pluginDir: string, // 例如 "<configDir>/plugins/litesync"
 		patternsText: string,
 	) {
 		for (const raw of patternsText.split("\n")) {
@@ -31,8 +33,12 @@ export class IgnoreMatcher {
 
 	ignores(path: string): boolean {
 		if (path === this.pluginDir || path.startsWith(this.pluginDir + "/")) return true;
-		if (path === ".obsidian/workspace.json" || path === ".obsidian/workspace-mobile.json") return true;
-		if (!this.syncObsidian && (path === ".obsidian" || path.startsWith(".obsidian/"))) return true;
+		if (path === `${this.configDir}/workspace.json` || path === `${this.configDir}/workspace-mobile.json`) {
+			return true;
+		}
+		if (!this.syncObsidian && (path === this.configDir || path.startsWith(this.configDir + "/"))) {
+			return true;
+		}
 
 		for (const re of this.fullPatterns) {
 			if (re.test(path)) return true;

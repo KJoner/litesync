@@ -42,7 +42,7 @@ export default class PrivateSyncPlugin extends Plugin {
 	private intervalId: number | null = null;
 	private lastStatus: SyncStatus = "idle";
 	private keyring = new Keyring();
-	/** API Token 运行时值（真实存储在 Obsidian SecretStorage，1.11.4+ 必备） */
+	/** API Token 运行时值（真实存储在 Obsidian SecretStorage） */
 	private apiTokenValue = "";
 	/** v3.1 迁移：旧版本明文保存的 E2EE 密码，仅在首次启动时用一次后即抹除 */
 	private legacyE2eePassword = "";
@@ -121,7 +121,7 @@ export default class PrivateSyncPlugin extends Plugin {
 	}
 
 	private async initialize(): Promise<void> {
-		const pluginDir = this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
+		const pluginDir = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
 		this.store = new StateStore(this.app.vault.adapter, `${pluginDir}/state.json`);
 		await this.store.load();
 
@@ -157,9 +157,9 @@ export default class PrivateSyncPlugin extends Plugin {
 			deviceId: this.store?.state.deviceId ?? "",
 		}));
 
-		// 移动端第一阶段不同步 .obsidian：桌面与移动配置差异大，避免互相覆盖（v6）
+		// 移动端第一阶段不同步 Obsidian 配置目录：桌面与移动配置差异大，避免互相覆盖（v6）
 		if (Platform.isMobileApp && this.settings.syncObsidian) {
-			new Notice("移动端不同步 .obsidian 配置（桌面与移动端的界面配置互不兼容），普通笔记与附件不受影响");
+			new Notice("移动端不同步 Obsidian 配置目录（桌面与移动端的界面配置互不兼容），普通笔记与附件不受影响");
 		}
 
 		const ctx: SyncContext = {
@@ -172,7 +172,8 @@ export default class PrivateSyncPlugin extends Plugin {
 			deviceName: () =>
 				this.settings.deviceName || `device-${(this.store?.state.deviceId ?? "").slice(0, 8)}`,
 			log: (msg) => {
-				if (this.settings.debug) console.log(`[private-sync] ${msg}`);
+				// 仅在用户显式开启 Debug 时输出；用 debug 级别不污染默认控制台
+				if (this.settings.debug) console.debug(`[litesync] ${msg}`);
 			},
 			notify: (msg) => new Notice(msg, 8000),
 			onConflictsChanged: () => this.updateStatus(this.lastStatus),
@@ -265,7 +266,7 @@ export default class PrivateSyncPlugin extends Plugin {
 		return this.settings.serverUrl !== "" && this.getApiToken() !== "";
 	}
 
-	// ---------- API Token（SecretStorage required，v6 起 minAppVersion 1.11.4） ----------
+	// ---------- API Token（SecretStorage required） ----------
 
 	getApiToken(): string {
 		return this.apiTokenValue;
@@ -275,8 +276,8 @@ export default class PrivateSyncPlugin extends Plugin {
 		this.apiTokenValue = value;
 		const ss = secretStorageOf(this.app);
 		if (!ss) {
-			// minAppVersion 1.11.4 下不应发生；绝不再把 Token 明文写入 data.json
-			new Notice("此 Obsidian 版本没有 SecretStorage（需要 1.11.4+），Token 无法保存");
+			// minAppVersion 下不应发生；绝不再把 Token 明文写入 data.json
+			new Notice("此 Obsidian 版本没有 SecretStorage（需要 1.13+），Token 无法保存");
 			return;
 		}
 		ss.setSecret(API_TOKEN_SECRET_ID, value);
@@ -290,7 +291,7 @@ export default class PrivateSyncPlugin extends Plugin {
 	private async loadOrMigrateApiToken(): Promise<void> {
 		const ss = secretStorageOf(this.app);
 		if (!ss) {
-			new Notice("LiteSync 需要 Obsidian 1.11.4+（SecretStorage）");
+			new Notice("LiteSync 需要 Obsidian 1.13+（SecretStorage）");
 			this.apiTokenValue = this.settings.apiToken; // 只读兼容，不再回写
 			return;
 		}
@@ -311,9 +312,11 @@ export default class PrivateSyncPlugin extends Plugin {
 	}
 
 	private rebuildIgnoreMatcher(): void {
-		const pluginDir = this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
+		const configDir = this.app.vault.configDir;
+		const pluginDir = this.manifest.dir ?? `${configDir}/plugins/${this.manifest.id}`;
 		this.ignoreMatcher = new IgnoreMatcher(
 			this.effectiveSyncObsidian(),
+			configDir,
 			pluginDir,
 			this.settings.ignorePatterns,
 		);
@@ -399,7 +402,7 @@ export default class PrivateSyncPlugin extends Plugin {
 		this.statusEl.setText(text);
 		this.statusEl.setAttribute("aria-label", detail ?? text);
 		const clickable = pending > 0 || status === "locked";
-		this.statusEl.style.cursor = clickable ? "pointer" : "default";
+		this.statusEl.toggleClass("litesync-status-clickable", clickable);
 		this.statusEl.onclick = !clickable
 			? null
 			: status === "locked"
@@ -494,7 +497,7 @@ export default class PrivateSyncPlugin extends Plugin {
 		if (!this.keyring.unlocked) return;
 		const deviceKeyB64 = await persistTrustedDevice(this.app, this.settings.deviceKeyB64, this.keyring);
 		if (deviceKeyB64 === null) {
-			new Notice("此 Obsidian 版本没有 SecretStorage（需要 1.11.4+），无法信任此设备");
+			new Notice("此 Obsidian 版本没有 SecretStorage（需要 1.13+），无法信任此设备");
 			return;
 		}
 		if (this.settings.deviceKeyB64 !== deviceKeyB64) {
@@ -536,7 +539,7 @@ export default class PrivateSyncPlugin extends Plugin {
 		delete raw.e2eePassword;
 		delete raw.rememberE2eePassword;
 
-		this.settings = { ...DEFAULT_SETTINGS, ...raw } as PluginSettings;
+		this.settings = { ...DEFAULT_SETTINGS, ...raw };
 		if (hadLegacyRemember) this.settings.trustDevice = true; // 语义等价迁移
 
 		if (this.legacyE2eePassword !== "" || hadLegacyRemember) {

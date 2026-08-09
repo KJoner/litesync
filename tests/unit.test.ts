@@ -9,28 +9,28 @@ import { IgnoreMatcher } from "../src/utils/ignore";
 const PLUGIN_DIR = ".obsidian/plugins/litesync";
 
 test("IgnoreMatcher: 插件自身目录永远排除（data.json 含 Token）", () => {
-	const m = new IgnoreMatcher(true, PLUGIN_DIR, "");
+	const m = new IgnoreMatcher(true, ".obsidian", PLUGIN_DIR, "");
 	assert.equal(m.ignores(`${PLUGIN_DIR}/data.json`), true);
 	assert.equal(m.ignores(`${PLUGIN_DIR}/state.json`), true);
 	assert.equal(m.ignores(PLUGIN_DIR), true);
 });
 
 test("IgnoreMatcher: workspace 文件永远排除", () => {
-	const m = new IgnoreMatcher(true, PLUGIN_DIR, "");
+	const m = new IgnoreMatcher(true, ".obsidian", PLUGIN_DIR, "");
 	assert.equal(m.ignores(".obsidian/workspace.json"), true);
 	assert.equal(m.ignores(".obsidian/workspace-mobile.json"), true);
 	assert.equal(m.ignores(".obsidian/app.json"), false); // syncObsidian=true 时其余可同步
 });
 
 test("IgnoreMatcher: syncObsidian=false 时整个 .obsidian 排除", () => {
-	const m = new IgnoreMatcher(false, PLUGIN_DIR, "");
+	const m = new IgnoreMatcher(false, ".obsidian", PLUGIN_DIR, "");
 	assert.equal(m.ignores(".obsidian/app.json"), true);
 	assert.equal(m.ignores(".obsidian/themes/x/theme.css"), true);
 	assert.equal(m.ignores("Notes/hello.md"), false);
 });
 
 test("IgnoreMatcher: 默认模式匹配", () => {
-	const m = new IgnoreMatcher(false, PLUGIN_DIR, ".trash/**\n.DS_Store\nThumbs.db");
+	const m = new IgnoreMatcher(false, ".obsidian", PLUGIN_DIR, ".trash/**\n.DS_Store\nThumbs.db");
 	assert.equal(m.ignores(".trash/old.md"), true);
 	assert.equal(m.ignores(".trash/deep/nested.md"), true);
 	assert.equal(m.ignores(".DS_Store"), true);
@@ -41,7 +41,7 @@ test("IgnoreMatcher: 默认模式匹配", () => {
 });
 
 test("IgnoreMatcher: 用户 Glob 规则", () => {
-	const m = new IgnoreMatcher(false, PLUGIN_DIR, "Private/**\n*.tmp\nDrafts/*.md");
+	const m = new IgnoreMatcher(false, ".obsidian", PLUGIN_DIR, "Private/**\n*.tmp\nDrafts/*.md");
 	assert.equal(m.ignores("Private/secret.md"), true);
 	assert.equal(m.ignores("Private/a/b/c.md"), true);
 	assert.equal(m.ignores("note.tmp"), true);
@@ -52,7 +52,7 @@ test("IgnoreMatcher: 用户 Glob 规则", () => {
 });
 
 test("IgnoreMatcher: 中文路径", () => {
-	const m = new IgnoreMatcher(false, PLUGIN_DIR, "私密/**");
+	const m = new IgnoreMatcher(false, ".obsidian", PLUGIN_DIR, "私密/**");
 	assert.equal(m.ignores("私密/日记.md"), true);
 	assert.equal(m.ignores("笔记/日常.md"), false);
 });

@@ -17,13 +17,9 @@ export class UnlockModal extends Modal {
 		this.titleEl.setText("解锁端到端加密");
 		const { contentEl } = this;
 		contentEl.createDiv({ text: "输入 E2EE 密码以解锁同步（密码只在内存中使用，不会被保存）。" });
-		const input = contentEl.createEl("input", { type: "password" });
-		input.style.width = "100%";
-		input.style.margin = "10px 0";
+		const input = contentEl.createEl("input", { type: "password", cls: "litesync-modal-input" });
 
-		const trustLabel = contentEl.createEl("label");
-		trustLabel.style.display = "block";
-		trustLabel.style.margin = "4px 0 10px";
+		const trustLabel = contentEl.createEl("label", { cls: "litesync-trust-label" });
 		const trustBox = trustLabel.createEl("input", { type: "checkbox" });
 		trustBox.checked = this.defaultTrust;
 		trustLabel.appendText(" 信任此设备（之后启动自动解锁）");
@@ -54,7 +50,7 @@ export class UnlockModal extends Modal {
 		input.addEventListener("keydown", (e) => {
 			if (e.key === "Enter") void submit();
 		});
-		setTimeout(() => input.focus(), 50);
+		window.setTimeout(() => input.focus(), 50);
 	}
 }
 
@@ -90,17 +86,11 @@ export class EnableE2eeModal extends Modal {
 		});
 
 		contentEl.createDiv({ text: "设置 E2EE 密码（至少 8 个字符）：" });
-		const pw1 = contentEl.createEl("input", { type: "password" });
-		pw1.style.width = "100%";
-		pw1.style.margin = "6px 0";
+		const pw1 = contentEl.createEl("input", { type: "password", cls: "litesync-modal-input" });
 		contentEl.createDiv({ text: "再次输入确认：" });
-		const pw2 = contentEl.createEl("input", { type: "password" });
-		pw2.style.width = "100%";
-		pw2.style.margin = "6px 0";
+		const pw2 = contentEl.createEl("input", { type: "password", cls: "litesync-modal-input" });
 
-		const trustLabel = contentEl.createEl("label");
-		trustLabel.style.display = "block";
-		trustLabel.style.margin = "4px 0 10px";
+		const trustLabel = contentEl.createEl("label", { cls: "litesync-trust-label" });
 		const trustBox = trustLabel.createEl("input", { type: "checkbox" });
 		trustBox.checked = this.defaultTrust;
 		trustLabel.appendText(" 信任此设备（之后启动自动解锁）");

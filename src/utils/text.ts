@@ -16,5 +16,5 @@ export function decodeUtf8Strict(data: ArrayBuffer): string | null {
 
 export function encodeUtf8(text: string): ArrayBuffer {
 	const bytes = new TextEncoder().encode(text);
-	return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+	return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 }

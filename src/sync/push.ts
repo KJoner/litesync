@@ -38,9 +38,9 @@ export async function scanLocalChanges(ctx: SyncContext): Promise<void> {
 		}
 	}
 
-	// vault.getFiles() 不包含 .obsidian 下的隐藏文件，需要单独遍历
+	// vault.getFiles() 不包含配置目录下的隐藏文件，需要单独遍历（目录名以 Vault#configDir 为准）
 	if (ctx.syncObsidian()) {
-		for (const path of await listHiddenFiles(ctx, ".obsidian")) {
+		for (const path of await listHiddenFiles(ctx, ctx.app.vault.configDir)) {
 			if (ctx.ignores(path) || ctx.store.hasPendingDelete(path)) continue;
 			seen.add(path);
 			const stat = await ctx.app.vault.adapter.stat(path);
