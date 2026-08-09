@@ -132,7 +132,7 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 				ctx.log(`pull: deleted ${path}`);
 				return "applied";
 			}
-			// 移动端删除安全（v6）：回收站失败时宁可多留一份，绝不永久删除。
+			// 删除安全（所有平台）：回收站失败时宁可多留一份，绝不永久删除。
 			// 记入 pendingDeletes：扫描时跳过（不会被当作新文件重新上传），等用户手动删除
 			ctx.store.delete(path);
 			ctx.store.setPendingDelete(path);
@@ -211,11 +211,12 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 }
 
 /**
- * 删除本地文件时进回收站，绝不静默永久删除。返回是否成功。
+ * 删除本地文件时进回收站，任何平台都绝不永久删除（README 承诺）。返回是否成功。
  * 优先 FileManager.trashFile（尊重用户在「删除的文件」中的偏好设置）；
- * 失败时桌面端才回退永久删除，移动端返回 false（宁可多留，不可误删）。
+ * 回收站失败一律返回 false，由调用方保留本地文件并登记 pendingDeletes，
+ * 提示用户手动删除——宁可多留一份，不可误删。
  */
-async function trashLocal(app: App, path: string): Promise<boolean> {
+export async function trashLocal(app: App, path: string): Promise<boolean> {
 	const adapter = app.vault.adapter;
 	try {
 		const af = app.vault.getAbstractFileByPath(path);
@@ -228,12 +229,6 @@ async function trashLocal(app: App, path: string): Promise<boolean> {
 		await adapter.trashLocal(path);
 		return true;
 	} catch {
-		if (Platform.isMobileApp) return false;
-		try {
-			await adapter.remove(path);
-			return true;
-		} catch {
-			return false;
-		}
+		return false;
 	}
 }

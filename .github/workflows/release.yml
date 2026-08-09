@@ -11,6 +11,7 @@ permissions:
   contents: write
   id-token: write
   attestations: write
+  artifact-metadata: write
 
 jobs:
   release:
@@ -39,9 +40,10 @@ jobs:
             exit 1
           fi
 
-      # 产物溯源证明：用户可加密学验证 Release 资产确实构建自本仓库源码
+      # 产物溯源证明（默认生成 SLSA build provenance）：
+      # 用户可加密学验证 Release 资产确实构建自本仓库源码
       - name: Attest release artifacts
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest@v4
         with:
           subject-path: |
             main.js
