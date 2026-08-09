@@ -3,6 +3,7 @@ server/data/
 server/obsync
 server/obsync.exe
 server/.env
+server/etc-litesync/
 
 # Node / 插件构建产物
 plugin/node_modules/

@@ -1,4 +1,4 @@
-import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, Platform, PluginSettingTab, Setting } from "obsidian";
 import type PrivateSyncPlugin from "./main";
 
 export interface PluginSettings {
@@ -116,13 +116,18 @@ export class SyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("同步间隔")
-			.setDesc("定时向服务器拉取其他设备产生的变更")
+			.setDesc(
+				Platform.isMobileApp
+					? "定时拉取仅在 App 前台运行，移动端最低 60 秒（切回 App 时会自动补同步）"
+					: "定时向服务器拉取其他设备产生的变更",
+			)
 			.addDropdown((dd) =>
 				dd
 					.addOptions({
 						"15": "15 秒",
 						"30": "30 秒",
 						"60": "60 秒",
+						"120": "2 分钟",
 						"300": "5 分钟",
 						"0": "关闭定时同步",
 					})
@@ -136,7 +141,11 @@ export class SyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("同步 .obsidian 配置")
-			.setDesc("同步 Obsidian 配置目录（workspace 和本插件目录永远不同步）")
+			.setDesc(
+				Platform.isMobileApp
+					? "移动端始终不同步 .obsidian（桌面与移动配置差异大，避免互相覆盖）"
+					: "同步 Obsidian 配置目录（workspace 和本插件目录永远不同步）",
+			)
 			.addToggle((toggle) =>
 				toggle.setValue(this.plugin.settings.syncObsidian).onChange(async (value) => {
 					this.plugin.settings.syncObsidian = value;

@@ -1,3 +1,4 @@
+import { Platform } from "obsidian";
 import { ApiError, ConflictError, NotFoundError } from "../api/client";
 import { E2eeLockedError } from "../crypto/keyring";
 import { sha256Hex } from "../utils/hash";
@@ -22,9 +23,14 @@ export interface PushResult {
 export async function scanLocalChanges(ctx: SyncContext): Promise<void> {
 	const seen = new Set<string>();
 
+	// 待手动删除的文件（移动端回收站失败时保留的，v6）：用户已手动删除则清除记录
+	for (const path of Object.keys(ctx.store.state.pendingDeletes)) {
+		if (!(await ctx.app.vault.adapter.stat(path))) ctx.store.clearPendingDelete(path);
+	}
+
 	for (const file of ctx.app.vault.getFiles()) {
 		const path = file.path;
-		if (ctx.ignores(path)) continue;
+		if (ctx.ignores(path) || ctx.store.hasPendingDelete(path)) continue;
 		seen.add(path);
 		const tracked = ctx.store.get(path);
 		if (!tracked || tracked.mtime !== file.stat.mtime || tracked.size !== file.stat.size) {
@@ -35,7 +41,7 @@ export async function scanLocalChanges(ctx: SyncContext): Promise<void> {
 	// vault.getFiles() 不包含 .obsidian 下的隐藏文件，需要单独遍历
 	if (ctx.syncObsidian()) {
 		for (const path of await listHiddenFiles(ctx, ".obsidian")) {
-			if (ctx.ignores(path)) continue;
+			if (ctx.ignores(path) || ctx.store.hasPendingDelete(path)) continue;
 			seen.add(path);
 			const stat = await ctx.app.vault.adapter.stat(path);
 			if (!stat) continue;
@@ -95,6 +101,10 @@ export async function pushPendingChanges(ctx: SyncContext): Promise<PushResult> 
 
 type Outcome = "pushed" | "skipped" | "conflict";
 
+/** 移动端大文件内存警告阈值（整文件进内存加密上传，见 v6 计划 Part 28）。 */
+const MOBILE_LARGE_FILE_WARNING_BYTES = 50 << 20;
+const warnedLargeFiles = new Set<string>();
+
 async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 	// 文件处于 unresolved conflict：不继续自动 Push（计划书 Pending Conflict 规则）
 	if (ctx.store.getConflict(path)) return "skipped";
@@ -103,6 +113,11 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 	if (!stat || stat.type === "folder") return "skipped"; // 入队后又被删除，交给 delete 流程
 
 	const data = await adapter.readBinary(path);
+	// 只警告不跳过：静默跳过会破坏同步一致性
+	if (Platform.isMobileApp && data.byteLength > MOBILE_LARGE_FILE_WARNING_BYTES && !warnedLargeFiles.has(path)) {
+		warnedLargeFiles.add(path);
+		ctx.notify(`⚠ 大文件在移动端同步可能占用较多内存：${path}（${Math.round(data.byteLength / (1 << 20))} MB）`);
+	}
 	const hash = await sha256Hex(data);
 	const tracked = ctx.store.get(path);
 	if (tracked && tracked.hash === hash) {

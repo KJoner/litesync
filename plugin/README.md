@@ -3,15 +3,17 @@
 配合 [obsync 服务器](../server/README.md) 使用的 Obsidian 同步插件。
 基于 revision + SHA-256 + change sequence 实现可靠增量同步，
 支持三方自动合并、版本历史、端到端加密与加密分享。
+桌面与 **iOS / Android 移动端**通用（需要 Obsidian 1.11.4+）。
 
 ## 构建与安装
 
 ```bash
 cd plugin
 npm install
-npm run build    # 类型检查 + 打包，产出 main.js
-npm test         # 47 个单元测试（合并引擎 / 加密 / 设备信任 / 忽略规则等）
-npm run dev      # watch 模式，开发用
+npm run build        # 类型检查 + 打包，产出 main.js
+npm test             # 49 个单元测试（合并引擎 / 加密 / 设备信任 / 状态存储等）
+npm run test:mobile  # 移动端 CI：Node/Electron 依赖审计 + 构建 + 全部测试
+npm run dev          # watch 模式，开发用
 ```
 
 把以下三个文件复制到 Vault 的插件目录，然后在设置 → 第三方插件中启用：
@@ -48,6 +50,22 @@ npm run dev      # watch 模式，开发用
   重建游标，不漏任何删改
 - 同步状态（deviceId、lastSequence、hash 缓存、未解决冲突、分享密钥）
   保存在插件目录 `state.json`，与设置分离，永远不会被同步出去
+
+## 移动端（iOS / Android，v0.6）
+
+网络层（`requestUrl`）、加密（Web Crypto）、文件访问（`vault.adapter`）
+全部使用跨平台 API，`npm run test:mobile` 强制审计不引入 Node/Electron 依赖。
+移动端专属行为：
+
+- **同步时机**：启动 / 文件修改防抖 / 前台定时（最低 60 秒）之外，
+  **切回 App 时自动补同步**（visibilitychange + 防抖，iOS 后台定时器会被系统暂停）
+- **删除安全**：远端删除 → 移入 vault 内 `.trash`；回收站失败时**保留本地文件**
+  并记录待手动删除（绝不永久删除，也不会被重新上传）
+- **`.obsidian` 不同步**：无论设置如何，移动端始终不同步 Obsidian 配置目录
+  （桌面与移动界面配置差异大，避免互相覆盖）；普通笔记与附件不受影响
+- **大文件警告**：>50MB 文件同步时提示内存占用（不跳过，保证一致性）
+- **界面**：冲突 Resolver 等在窄屏自动纵向堆叠，按钮满足触控尺寸
+- 桌面开发时可用 `this.app.emulateMobile(true)`（开发者控制台）模拟移动界面
 
 ## 冲突处理：三方自动合并
 
@@ -93,7 +111,8 @@ npm run dev      # watch 模式，开发用
 - 服务器密钥轮换后设备信任自动失效（keyId 绑定）
 - 设置页提供 **🔒 立即锁定**（本次会话）与 **🗑 忘记此设备**（下次需密码）
 - 旧版本升级自动迁移：明文密码/Token 从 `data.json` 抹除
-- 需要 Obsidian 1.11.4+（旧版自动降级：Token 存 data.json、每次手动解锁）
+- v0.6 起要求 Obsidian 1.11.4+（`minAppVersion`），凭据一律 SecretStorage，
+  不再提供 data.json 明文降级
 
 ## 分享
 

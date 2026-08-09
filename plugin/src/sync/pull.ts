@@ -1,4 +1,4 @@
-import { App } from "obsidian";
+import { App, Platform } from "obsidian";
 import { NotFoundError, RemoteChange } from "../api/client";
 import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
@@ -120,15 +120,23 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 	if (change.action === "delete") {
 		if (!stat) {
 			ctx.store.delete(path);
+			ctx.store.clearPendingDelete(path);
 			return "skipped";
 		}
 		const localData = await adapter.readBinary(path);
 		const localHash = await sha256Hex(localData);
 		if (tracked && localHash === tracked.hash) {
 			// 本地未修改 → 跟随远端删除（进回收站，保底不丢数据）
-			await trashLocal(ctx.app, path);
+			if (await trashLocal(ctx.app, path)) {
+				ctx.store.delete(path);
+				ctx.log(`pull: deleted ${path}`);
+				return "applied";
+			}
+			// 移动端删除安全（v6）：回收站失败时宁可多留一份，绝不永久删除。
+			// 记入 pendingDeletes：扫描时跳过（不会被当作新文件重新上传），等用户手动删除
 			ctx.store.delete(path);
-			ctx.log(`pull: deleted ${path}`);
+			ctx.store.setPendingDelete(path);
+			ctx.notify(`无法移入回收站，已保留本地文件（不会重新上传）：${path}\n请手动删除`);
 			return "applied";
 		}
 		// 本地有未同步修改 → 保留本地内容，转为新文件重新上传
@@ -202,20 +210,30 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 	return kept === null ? "skipped" : "conflict";
 }
 
-/** 删除本地文件时优先进回收站，绝不静默永久删除。 */
-async function trashLocal(app: App, path: string): Promise<void> {
-	const af = app.vault.getAbstractFileByPath(path);
-	if (af) {
-		await app.vault.trash(af, true);
-		return;
-	}
-	// .obsidian 等隐藏路径拿不到 TAbstractFile，退回 adapter
+/**
+ * 删除本地文件时优先进回收站，绝不静默永久删除。返回是否成功。
+ * 移动端（iOS 无系统回收站）使用 vault 内 .trash；任何回收站失败时
+ * 桌面端才回退永久删除，移动端返回 false（宁可多留，不可误删）。
+ */
+async function trashLocal(app: App, path: string): Promise<boolean> {
 	const adapter = app.vault.adapter;
 	try {
-		if (!(await adapter.trashSystem(path))) {
-			await adapter.trashLocal(path);
+		const af = app.vault.getAbstractFileByPath(path);
+		if (af) {
+			await app.vault.trash(af, !Platform.isMobileApp);
+			return true;
 		}
+		// .obsidian 等隐藏路径拿不到 TAbstractFile，退回 adapter
+		if (!Platform.isMobileApp && (await adapter.trashSystem(path))) return true;
+		await adapter.trashLocal(path);
+		return true;
 	} catch {
-		await adapter.remove(path);
+		if (Platform.isMobileApp) return false;
+		try {
+			await adapter.remove(path);
+			return true;
+		} catch {
+			return false;
+		}
 	}
 }

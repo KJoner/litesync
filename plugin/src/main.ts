@@ -1,4 +1,4 @@
-import { Notice, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
+import { Notice, Platform, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
 import { ApiClient } from "./api/client";
 import { ConflictListModal } from "./conflict-ui/conflict-view";
 import {
@@ -22,6 +22,10 @@ import { IgnoreMatcher } from "./utils/ignore";
 
 /** 文件变化后延迟同步，避免连续输入时频繁上传。 */
 const DEBOUNCE_MS = 3000;
+/** App 回到前台后的同步防抖（避免快速切换 App 触发同步风暴，v6）。 */
+const FOREGROUND_DEBOUNCE_MS = 2500;
+/** 移动端定时拉取的最小间隔：避免 iPhone 不必要的轮询耗电（v6）。 */
+const MOBILE_MIN_INTERVAL_SECONDS = 60;
 
 export default class PrivateSyncPlugin extends Plugin {
 	settings: PluginSettings = { ...DEFAULT_SETTINGS };
@@ -34,10 +38,11 @@ export default class PrivateSyncPlugin extends Plugin {
 	private ignoreMatcher: IgnoreMatcher | null = null;
 	private statusEl: HTMLElement | null = null;
 	private debounceTimer: number | null = null;
+	private foregroundTimer: number | null = null;
 	private intervalId: number | null = null;
 	private lastStatus: SyncStatus = "idle";
 	private keyring = new Keyring();
-	/** API Token 运行时值（真实存储在 SecretStorage；无 SecretStorage 时降级到 data.json） */
+	/** API Token 运行时值（真实存储在 Obsidian SecretStorage，1.11.4+ 必备） */
 	private apiTokenValue = "";
 	/** v3.1 迁移：旧版本明文保存的 E2EE 密码，仅在首次启动时用一次后即抹除 */
 	private legacyE2eePassword = "";
@@ -110,6 +115,7 @@ export default class PrivateSyncPlugin extends Plugin {
 	onunload(): void {
 		this.manager?.dispose();
 		if (this.debounceTimer !== null) window.clearTimeout(this.debounceTimer);
+		if (this.foregroundTimer !== null) window.clearTimeout(this.foregroundTimer);
 		if (this.intervalId !== null) window.clearInterval(this.intervalId);
 		void this.store?.save();
 	}
@@ -151,12 +157,17 @@ export default class PrivateSyncPlugin extends Plugin {
 			deviceId: this.store?.state.deviceId ?? "",
 		}));
 
+		// 移动端第一阶段不同步 .obsidian：桌面与移动配置差异大，避免互相覆盖（v6）
+		if (Platform.isMobileApp && this.settings.syncObsidian) {
+			new Notice("移动端不同步 .obsidian 配置（桌面与移动端的界面配置互不兼容），普通笔记与附件不受影响");
+		}
+
 		const ctx: SyncContext = {
 			app: this.app,
 			client: this.client,
 			store: this.store,
 			queue: this.queue,
-			syncObsidian: () => this.settings.syncObsidian,
+			syncObsidian: () => this.effectiveSyncObsidian(),
 			ignores: (path) => this.ignoreMatcher?.ignores(path) ?? false,
 			deviceName: () =>
 				this.settings.deviceName || `device-${(this.store?.state.deviceId ?? "").slice(0, 8)}`,
@@ -177,11 +188,33 @@ export default class PrivateSyncPlugin extends Plugin {
 		this.manager.onStatus = (status, detail) => this.updateStatus(status, detail);
 
 		this.registerVaultEvents();
+		this.registerForegroundSync();
 		this.applySettings();
 
 		if (this.settings.autoSync && this.isConfigured()) {
 			void this.manager.sync("startup");
 		}
+	}
+
+	/**
+	 * App 回到前台时同步（v6 移动端策略）：iOS 会暂停后台 App 的定时器，
+	 * hidden → visible 是移动端最可靠的补同步时机；带防抖避免快速切换风暴。
+	 */
+	private registerForegroundSync(): void {
+		this.registerDomEvent(document, "visibilitychange", () => {
+			if (document.visibilityState !== "visible") return;
+			if (!this.settings.autoSync || !this.isConfigured()) return;
+			if (this.foregroundTimer !== null) window.clearTimeout(this.foregroundTimer);
+			this.foregroundTimer = window.setTimeout(() => {
+				this.foregroundTimer = null;
+				void this.manager?.sync("foreground");
+			}, FOREGROUND_DEBOUNCE_MS);
+		});
+	}
+
+	/** 移动端第一阶段不同步 .obsidian，无论设置如何（v6 计划 Part 27）。 */
+	effectiveSyncObsidian(): boolean {
+		return this.settings.syncObsidian && !Platform.isMobileApp;
 	}
 
 	/** 设置变化后重建忽略规则和定时器。 */
@@ -193,9 +226,13 @@ export default class PrivateSyncPlugin extends Plugin {
 			this.intervalId = null;
 		}
 		if (this.settings.autoSync && this.settings.syncIntervalSeconds > 0) {
+			// 移动端最低 60 秒：定时器只在 App 前台运行，补同步靠 foreground sync
+			const seconds = Platform.isMobileApp
+				? Math.max(MOBILE_MIN_INTERVAL_SECONDS, this.settings.syncIntervalSeconds)
+				: this.settings.syncIntervalSeconds;
 			this.intervalId = window.setInterval(() => {
 				if (this.isConfigured()) void this.manager?.sync("interval");
-			}, this.settings.syncIntervalSeconds * 1000);
+			}, seconds * 1000);
 			this.registerInterval(this.intervalId);
 		}
 	}
@@ -228,33 +265,33 @@ export default class PrivateSyncPlugin extends Plugin {
 		return this.settings.serverUrl !== "" && this.getApiToken() !== "";
 	}
 
-	// ---------- API Token（SecretStorage） ----------
+	// ---------- API Token（SecretStorage required，v6 起 minAppVersion 1.11.4） ----------
 
 	getApiToken(): string {
-		return this.apiTokenValue || this.settings.apiToken;
+		return this.apiTokenValue;
 	}
 
 	async setApiToken(value: string): Promise<void> {
 		this.apiTokenValue = value;
 		const ss = secretStorageOf(this.app);
-		if (ss) {
-			ss.setSecret(API_TOKEN_SECRET_ID, value);
-			if (this.settings.apiToken !== "") {
-				this.settings.apiToken = "";
-				await this.saveSettings();
-			}
-		} else {
-			// 无 SecretStorage（Obsidian < 1.11.4）：降级保存在 data.json
-			this.settings.apiToken = value;
+		if (!ss) {
+			// minAppVersion 1.11.4 下不应发生；绝不再把 Token 明文写入 data.json
+			new Notice("此 Obsidian 版本没有 SecretStorage（需要 1.11.4+），Token 无法保存");
+			return;
+		}
+		ss.setSecret(API_TOKEN_SECRET_ID, value);
+		if (this.settings.apiToken !== "") {
+			this.settings.apiToken = "";
 			await this.saveSettings();
 		}
 	}
 
-	/** 启动时读取 Token；data.json 中的旧值迁移进 SecretStorage 并抹除。 */
+	/** 启动时读取 Token；data.json 中的旧版明文值迁移进 SecretStorage 并抹除。 */
 	private async loadOrMigrateApiToken(): Promise<void> {
 		const ss = secretStorageOf(this.app);
 		if (!ss) {
-			this.apiTokenValue = this.settings.apiToken;
+			new Notice("Private Sync 需要 Obsidian 1.11.4+（SecretStorage）");
+			this.apiTokenValue = this.settings.apiToken; // 只读兼容，不再回写
 			return;
 		}
 		const stored = ss.getSecret(API_TOKEN_SECRET_ID);
@@ -276,7 +313,7 @@ export default class PrivateSyncPlugin extends Plugin {
 	private rebuildIgnoreMatcher(): void {
 		const pluginDir = this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
 		this.ignoreMatcher = new IgnoreMatcher(
-			this.settings.syncObsidian,
+			this.effectiveSyncObsidian(),
 			pluginDir,
 			this.settings.ignorePatterns,
 		);

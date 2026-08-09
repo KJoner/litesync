@@ -38,6 +38,12 @@ export interface PersistedState {
 	/** vault key 文档缓存（只含加密后的密钥材料，可安全落盘） */
 	e2ee: VaultKeyDoc | null;
 	shares: Record<string, ShareRecord>;
+	/**
+	 * 待手动删除的路径（移动端删除安全，v6）：
+	 * 远端已删除但本地移入回收站失败时，保留本地文件并记录在此——
+	 * 扫描时跳过（不会被当作新文件重新上传），用户手动删除后自动清除。
+	 */
+	pendingDeletes: Record<string, number>;
 }
 
 /**
@@ -52,6 +58,7 @@ export class StateStore {
 		conflicts: {},
 		e2ee: null,
 		shares: {},
+		pendingDeletes: {},
 	};
 
 	constructor(
@@ -70,6 +77,8 @@ export class StateStore {
 					conflicts: raw.conflicts && typeof raw.conflicts === "object" ? raw.conflicts : {},
 					e2ee: raw.e2ee && typeof raw.e2ee === "object" ? raw.e2ee : null,
 					shares: raw.shares && typeof raw.shares === "object" ? raw.shares : {},
+					pendingDeletes:
+						raw.pendingDeletes && typeof raw.pendingDeletes === "object" ? raw.pendingDeletes : {},
 				};
 				// v0.2 状态升级：当时全部为明文，serverHash 与 hash 相同
 				for (const fs of Object.values(this.state.files)) {
@@ -78,7 +87,15 @@ export class StateStore {
 			}
 		} catch (e) {
 			console.error("[private-sync] failed to load state.json, starting fresh", e);
-			this.state = { deviceId: "", lastSequence: 0, files: {}, conflicts: {}, e2ee: null, shares: {} };
+			this.state = {
+				deviceId: "",
+				lastSequence: 0,
+				files: {},
+				conflicts: {},
+				e2ee: null,
+				shares: {},
+				pendingDeletes: {},
+			};
 		}
 		if (!this.state.deviceId) {
 			this.state.deviceId = crypto.randomUUID();
@@ -120,5 +137,19 @@ export class StateStore {
 
 	conflictPaths(): string[] {
 		return Object.keys(this.state.conflicts);
+	}
+
+	// ---------- 待手动删除（移动端删除安全，v6） ----------
+
+	hasPendingDelete(path: string): boolean {
+		return this.state.pendingDeletes[path] !== undefined;
+	}
+
+	setPendingDelete(path: string): void {
+		this.state.pendingDeletes[path] = Date.now();
+	}
+
+	clearPendingDelete(path: string): void {
+		delete this.state.pendingDeletes[path];
 	}
 }

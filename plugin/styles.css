@@ -167,3 +167,31 @@
 	gap: 8px;
 	justify-content: flex-end;
 }
+
+/* ---------- 移动端响应式（v6：iPhone 竖屏禁用双栏，纵向堆叠） ---------- */
+@media (max-width: 600px) {
+	/* Resolver：LOCAL | REMOTE 双栏 → [Local] [Remote] 纵向堆叠 */
+	.litesync-resolver-panes {
+		flex-direction: column;
+	}
+	.litesync-resolver-pre {
+		max-height: 18vh;
+	}
+	/* 历史行：横向排列改为换行，操作按钮占满整行便于触控 */
+	.litesync-history-row {
+		flex-wrap: wrap;
+	}
+	.litesync-history-actions {
+		width: 100%;
+		justify-content: flex-start;
+	}
+	.litesync-history-actions button,
+	.litesync-hunk-buttons button,
+	.litesync-resolver-footer button {
+		min-height: 36px; /* 触控目标 */
+	}
+	.litesync-resolver-footer {
+		flex-wrap: wrap;
+		gap: 6px;
+	}
+}
