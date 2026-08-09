@@ -1,9 +1,0 @@
-{
-  "id": "obsidian-private-sync",
-  "name": "Private Sync",
-  "version": "0.6.0",
-  "minAppVersion": "1.11.4",
-  "description": "Sync this vault with your own private obsync server.",
-  "author": "xukan",
-  "isDesktopOnly": false
-}
