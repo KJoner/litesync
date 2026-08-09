@@ -1,22 +1,52 @@
 # LiteSync
 
-**Private, self-hosted sync for Obsidian.**
+**Private, self-hosted sync for Obsidian.** Your notes sync through a
+lightweight server that you run yourself — end-to-end encrypted, with version
+history and automatic merge. No third-party cloud, no account, no telemetry.
 
-LiteSync keeps your vaults in sync across desktop and mobile devices through a
-lightweight server that you host yourself — your notes never touch anyone
-else's cloud.
-
+Works on desktop and mobile (Obsidian 1.13+).
 [中文文档 / Chinese documentation →](README.zh.md)
 
-> **Requires a LiteSync Server.** LiteSync does not operate a hosted sync
-> service; you deploy your own server (a single Docker container, happily
-> running on a 1-core / 256MB VPS):
+> **Requires a LiteSync Server** — a single Docker container you deploy with
+> one command (runs happily on a 1-core / 256MB VPS):
 > **<https://github.com/KJoner/litesync-server>**
+
+## Getting started (first device)
+
+1. Deploy the server — one line on your VPS, it prints your API token when done:
+
+   ```bash
+   bash <(wget -qO- https://raw.githubusercontent.com/KJoner/litesync-server/master/scripts/litesync-install.sh)
+   ```
+
+2. Install LiteSync in Obsidian and open its settings
+3. Fill in **Server URL** and **API Token**, hit **Test Connection**
+4. Follow the onboarding wizard — it will offer to initialize the remote
+   vault from this device
+5. (Optional) Enable **end-to-end encryption** in settings and set a password
+
+That's it — edits now sync automatically in the background.
+
+## Adding a new device (QR pairing)
+
+You never type the server config twice:
+
+1. On a configured device: Settings → **Devices & migration** → **Add device**
+2. On the new device: install LiteSync, then scan the QR code with the system
+   camera (or open the pairing link) → **Open in Obsidian** → confirm import
+3. If E2EE is enabled, type your password once (it is never transmitted)
+4. In the onboarding wizard, pick **Restore from remote** — done
+
+The pairing package is encrypted on-device and expires in 5 minutes after a
+single use; the server only ever sees ciphertext. If your vault on the new
+device already has notes, the wizard offers a safe **merge** instead — nothing
+is ever silently overwritten, and nothing is ever permanently deleted.
 
 ## Features
 
 - **Incremental sync** — per-file revisions + SHA-256 + a global change
-  sequence; offline edits queue up and retry with exponential backoff
+  sequence; offline edits queue up and retry with exponential backoff;
+  mobile catches up automatically when the app returns to the foreground
 - **Conflict handling** — automatic three-way merge for Markdown (diff3);
   overlapping edits open a conflict resolver UI; anything unresolvable falls
   back to keeping both versions — no content is ever lost
@@ -29,37 +59,14 @@ else's cloud.
   Obsidian SecretStorage) instead of your password
 - **Encrypted sharing** — share a single note via a link whose key lives only
   in the URL fragment; revocable, with optional expiry
-- **Mobile support** — works on iOS/Android (Obsidian 1.13+): foreground
-  catch-up sync, deletion safety (never permanently deletes), responsive UI
-- **First-run wizard & QR pairing** — new devices go through an onboarding
-  wizard (restore from remote / merge, nothing is ever silently overwritten);
-  "Add device" generates a one-time encrypted QR code that transfers server
-  config to a new device — the E2EE password is always typed manually
-
-## Installation
-
-Until LiteSync is available in Community Plugins, install manually:
-
-1. Download `main.js`, `manifest.json`, `styles.css` from the
-   [latest release](https://github.com/KJoner/litesync/releases)
-2. Copy them into `<YourVault>/.obsidian/plugins/litesync/`
-3. Enable **LiteSync** in Settings → Community plugins
-
-**First device:** open the plugin settings, fill in your **Server URL** and
-**API Token** (shown by the server's install script), hit **Test Connection**,
-then follow the onboarding wizard (it will offer to initialize the remote
-vault from this device).
-
-**Second and later devices:** on an already-configured device, open
-Settings → Devices & migration → **Add device** and scan the QR code (or open
-the pairing link) on the new device. Server config is transferred through a
-one-time encrypted package (5-minute expiry, single use; the server only ever
-sees ciphertext). Enter your E2EE password once, pick **Restore from remote**
-in the wizard, done.
-
-Don't have a server yet? Follow the
-[deployment guide](https://github.com/KJoner/litesync-server) — a one-line
-install script sets everything up.
+- **Onboarding wizard** — new devices explicitly choose *restore from remote*
+  or *merge* before any sync happens; the server's stable vault identity is
+  verified so a reinstalled server can never silently clobber your notes
+- **Deletion safety** — remote deletions go to the trash on every platform;
+  if trashing fails the file is kept and flagged, never permanently deleted
+- **Web read-only client & off-site backup** — the server ships an embedded
+  browser reader (decrypts locally) and optional Restic → Cloudflare R2
+  disaster backup, managed from a web admin page
 
 ## Privacy & Network Access
 
@@ -86,18 +93,28 @@ install script sets everything up.
 - The server component is a separate open-source project:
   <https://github.com/KJoner/litesync-server>
 
+## Manual installation
+
+Until LiteSync is available in Community Plugins:
+
+1. Download `main.js`, `manifest.json`, `styles.css` from the
+   [latest release](https://github.com/KJoner/litesync/releases)
+2. Copy them into `<YourVault>/.obsidian/plugins/litesync/`
+3. Enable **LiteSync** in Settings → Community plugins
+
 ## Development
 
 ```bash
 npm install
 npm run build        # type-check + bundle to main.js
-npm test             # unit tests (merge engine / crypto / device trust / state)
+npm run lint         # eslint-plugin-obsidianmd recommended rules
+npm test             # unit tests (merge engine / crypto / pairing / state)
 npm run test:mobile  # mobile CI: Node/Electron dependency audit + build + tests
 npm run dev          # watch mode
 ```
 
 Releases are automated: pushing a tag that matches `manifest.json`'s version
-builds the plugin and drafts a GitHub Release with `main.js`,
+lints, builds, attests provenance, and drafts a GitHub Release with `main.js`,
 `manifest.json`, and `styles.css` attached.
 
 ## License

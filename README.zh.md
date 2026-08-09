@@ -5,6 +5,20 @@
 支持三方自动合并、版本历史、端到端加密与加密分享。
 桌面与 **iOS / Android 移动端**通用（需要 Obsidian 1.13+）。
 
+## 快速上手
+
+**第一台设备**：
+
+1. 在 VPS 上一键部署服务器（完成后会输出 API Token）：
+   `bash <(wget -qO- https://raw.githubusercontent.com/KJoner/litesync-server/master/scripts/litesync-install.sh)`
+2. Obsidian 安装本插件 → 设置里填 **Server URL** 和 **API Token** → **Test Connection**
+3. 跟随接入向导（会提示「用本设备初始化远端」）
+4. 可选：在设置里启用端到端加密并设置密码
+
+**第二台及以后的设备**：在已配置设备上「设置 → 设备与迁移 → 添加新设备」，
+新设备扫码 → 在 Obsidian 中打开 → 确认导入 →（E2EE 输一次密码）→
+向导里选「从远端恢复」即完成。详见文末[「新设备接入与配对」](#新设备接入与配对v08)。
+
 ## 构建与安装
 
 ```bash
