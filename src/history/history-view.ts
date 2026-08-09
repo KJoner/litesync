@@ -145,7 +145,7 @@ export class HistoryModal extends Modal {
 			this.close();
 		} catch (e) {
 			if (e instanceof ConflictError) {
-				new Notice("本地与服务器不同步，请先 Sync Now 再恢复");
+				new Notice("本地与服务器不同步，请先执行「立即同步」再恢复");
 			} else if (e instanceof NotFoundError) {
 				new Notice("该版本内容已被服务器清理，无法恢复");
 			} else {

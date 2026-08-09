@@ -6,7 +6,6 @@ import {
 	forgetTrustedDevice,
 	loadTrustedVmk,
 	persistTrustedDevice,
-	secretStorageOf,
 } from "./crypto/device-trust";
 import { EnableE2eeModal, UnlockModal } from "./crypto/e2ee-modals";
 import { Keyring } from "./crypto/keyring";
@@ -125,7 +124,7 @@ export default class PrivateSyncPlugin extends Plugin {
 		this.store = new StateStore(this.app.vault.adapter, `${pluginDir}/state.json`);
 		await this.store.load();
 
-		// API Token：迁移到 SecretStorage（无 SecretStorage 时保留 data.json 降级）
+		// API Token：读取 SecretStorage（旧版 data.json 明文值迁入后抹除）
 		await this.loadOrMigrateApiToken();
 
 		// E2EE：加载缓存的 vault key 文档
@@ -274,13 +273,7 @@ export default class PrivateSyncPlugin extends Plugin {
 
 	async setApiToken(value: string): Promise<void> {
 		this.apiTokenValue = value;
-		const ss = secretStorageOf(this.app);
-		if (!ss) {
-			// minAppVersion 下不应发生；绝不再把 Token 明文写入 data.json
-			new Notice("此 Obsidian 版本没有 SecretStorage（需要 1.13+），Token 无法保存");
-			return;
-		}
-		ss.setSecret(API_TOKEN_SECRET_ID, value);
+		this.app.secretStorage.setSecret(API_TOKEN_SECRET_ID, value);
 		if (this.settings.apiToken !== "") {
 			this.settings.apiToken = "";
 			await this.saveSettings();
@@ -289,13 +282,7 @@ export default class PrivateSyncPlugin extends Plugin {
 
 	/** 启动时读取 Token；data.json 中的旧版明文值迁移进 SecretStorage 并抹除。 */
 	private async loadOrMigrateApiToken(): Promise<void> {
-		const ss = secretStorageOf(this.app);
-		if (!ss) {
-			new Notice("LiteSync 需要 Obsidian 1.13+（SecretStorage）");
-			this.apiTokenValue = this.settings.apiToken; // 只读兼容，不再回写
-			return;
-		}
-		const stored = ss.getSecret(API_TOKEN_SECRET_ID);
+		const stored = this.app.secretStorage.getSecret(API_TOKEN_SECRET_ID);
 		if (stored) {
 			this.apiTokenValue = stored;
 			if (this.settings.apiToken !== "") {
@@ -303,7 +290,7 @@ export default class PrivateSyncPlugin extends Plugin {
 				await this.saveSettings();
 			}
 		} else if (this.settings.apiToken) {
-			ss.setSecret(API_TOKEN_SECRET_ID, this.settings.apiToken);
+			this.app.secretStorage.setSecret(API_TOKEN_SECRET_ID, this.settings.apiToken);
 			this.apiTokenValue = this.settings.apiToken;
 			this.settings.apiToken = "";
 			await this.saveSettings();
@@ -496,10 +483,7 @@ export default class PrivateSyncPlugin extends Plugin {
 	private async persistTrust(): Promise<void> {
 		if (!this.keyring.unlocked) return;
 		const deviceKeyB64 = await persistTrustedDevice(this.app, this.settings.deviceKeyB64, this.keyring);
-		if (deviceKeyB64 === null) {
-			new Notice("此 Obsidian 版本没有 SecretStorage（需要 1.13+），无法信任此设备");
-			return;
-		}
+		if (deviceKeyB64 === null) return; // 无 vault key 文档（前置条件不满足），静默跳过
 		if (this.settings.deviceKeyB64 !== deviceKeyB64) {
 			this.settings.deviceKeyB64 = deviceKeyB64;
 		}

@@ -23,10 +23,13 @@ jobs:
           node-version: "20"
           cache: npm
 
-      - name: Build plugin
+      - name: Lint (eslint-plugin-obsidianmd)
         run: |
           npm ci
-          npm run test:mobile
+          npm run lint
+
+      - name: Build plugin
+        run: npm run test:mobile
 
       - name: Verify tag matches manifest version
         run: |

@@ -23,7 +23,7 @@ export interface PluginSettings {
 
 export const DEFAULT_SETTINGS: PluginSettings = {
 	serverUrl: "",
-	apiToken: "", // 仅作旧版本迁移的读取来源；正常情况下为空，真实值在 SecretStorage
+	apiToken: "", // 仅作旧版本 data.json 明文值的迁移来源；迁移后始终为空，真实值在 SecretStorage
 	deviceName: "",
 	autoSync: true,
 	syncIntervalSeconds: 30,
@@ -73,7 +73,7 @@ export class SyncSettingTab extends PluginSettingTab {
 							setting.addText((text) => {
 								text.inputEl.type = "password";
 								text
-									.setPlaceholder("token")
+									.setPlaceholder("Token")
 									.setValue(plugin.getApiToken())
 									.onChange(async (value) => {
 										await plugin.setApiToken(value.trim());

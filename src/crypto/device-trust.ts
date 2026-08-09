@@ -27,17 +27,6 @@ interface TrustBlob {
 	data: string; // base64（AES-GCM 加密的 VMK）
 }
 
-interface SecretStorageLike {
-	setSecret(id: string, secret: string): void;
-	getSecret(id: string): string | null;
-}
-
-/** 取 Obsidian SecretStorage；旧版本返回 null，功能优雅降级。 */
-export function secretStorageOf(app: App): SecretStorageLike | null {
-	const ss = (app as App & { secretStorage?: SecretStorageLike }).secretStorage;
-	return ss && typeof ss.setSecret === "function" && typeof ss.getSecret === "function" ? ss : null;
-}
-
 /** vault key 文档的稳定标识（密钥材料变化即失配）。 */
 function keyIdOf(doc: VaultKeyDoc): string {
 	return doc.wrappedKey.slice(0, 24);
@@ -101,21 +90,20 @@ export async function unwrapVmkForDevice(
 
 /**
  * 把当前已解锁的 VMK 持久化为设备信任。
- * 返回应保存到设置中的设备密钥（base64）；SecretStorage 不可用时返回 null。
+ * 返回应保存到设置中的设备密钥（base64）；keyring 未解锁或无 vault key 文档时返回 null。
  */
 export async function persistTrustedDevice(
 	app: App,
 	existingDeviceKeyB64: string,
 	keyring: Keyring,
 ): Promise<string | null> {
-	const ss = secretStorageOf(app);
-	if (!ss || !keyring.doc || !keyring.unlocked) return null;
+	if (!keyring.doc || !keyring.unlocked) return null;
 
 	const deviceKey = existingDeviceKeyB64 ? b64decode(existingDeviceKeyB64) : randomBytes(32);
 	const vmkRaw = await exportVmkRaw(keyring.requireKey());
 	try {
 		const blob = await wrapVmkForDevice(deviceKey, vmkRaw, keyIdOf(keyring.doc));
-		ss.setSecret(VAULT_KEY_SECRET_ID, blob);
+		app.secretStorage.setSecret(VAULT_KEY_SECRET_ID, blob);
 	} finally {
 		vmkRaw.fill(0);
 	}
@@ -128,22 +116,13 @@ export async function loadTrustedVmk(
 	deviceKeyB64: string,
 	doc: VaultKeyDoc,
 ): Promise<Uint8Array | null> {
-	const ss = secretStorageOf(app);
-	if (!ss || !deviceKeyB64) return null;
-	const blob = ss.getSecret(VAULT_KEY_SECRET_ID);
+	if (!deviceKeyB64) return null;
+	const blob = app.secretStorage.getSecret(VAULT_KEY_SECRET_ID);
 	if (!blob) return null;
 	return unwrapVmkForDevice(b64decode(deviceKeyB64), blob, keyIdOf(doc));
 }
 
-/** 忘记此设备：删除本地保存的设备包装密钥。 */
+/** 忘记此设备：清空本地保存的设备包装密钥（SecretStorage 无删除接口，写空即失效）。 */
 export function forgetTrustedDevice(app: App): void {
-	const ss = secretStorageOf(app);
-	if (!ss) return;
-	const maybe = ss as SecretStorageLike & {
-		removeSecret?: (id: string) => void;
-		deleteSecret?: (id: string) => void;
-	};
-	if (typeof maybe.removeSecret === "function") maybe.removeSecret(VAULT_KEY_SECRET_ID);
-	else if (typeof maybe.deleteSecret === "function") maybe.deleteSecret(VAULT_KEY_SECRET_ID);
-	else ss.setSecret(VAULT_KEY_SECRET_ID, "");
+	app.secretStorage.setSecret(VAULT_KEY_SECRET_ID, "");
 }

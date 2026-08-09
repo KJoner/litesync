@@ -109,10 +109,10 @@ export class ResolverModal extends Modal {
 		// LOCAL / REMOTE 双栏
 		const panes = contentEl.createDiv({ cls: "litesync-resolver-panes" });
 		const localPane = panes.createDiv({ cls: "litesync-resolver-pane" });
-		localPane.createEl("h4", { text: "LOCAL（本设备）" });
+		localPane.createEl("h4", { text: "Local（本设备）" });
 		localPane.createEl("pre", { cls: "litesync-resolver-pre", text: loaded.localText });
 		const remotePane = panes.createDiv({ cls: "litesync-resolver-pane" });
-		remotePane.createEl("h4", { text: `REMOTE（服务器 rev ${loaded.remoteRevision}）` });
+		remotePane.createEl("h4", { text: `Remote（服务器 rev ${loaded.remoteRevision}）` });
 		remotePane.createEl("pre", { cls: "litesync-resolver-pre", text: loaded.remoteText });
 
 		// 冲突段列表
@@ -137,9 +137,9 @@ export class ResolverModal extends Modal {
 			box.createDiv({ cls: "litesync-hunk-text litesync-hunk-remote", text: c.remoteText || "（删除该段）" });
 
 			const btns = box.createDiv({ cls: "litesync-hunk-buttons" });
-			const bLocal = btns.createEl("button", { text: "Use Local" });
-			const bRemote = btns.createEl("button", { text: "Use Remote" });
-			const bBoth = btns.createEl("button", { text: "Use Both" });
+			const bLocal = btns.createEl("button", { text: "Use local" });
+			const bRemote = btns.createEl("button", { text: "Use remote" });
+			const bBoth = btns.createEl("button", { text: "Use both" });
 			const pick = (text: string, chosen: HTMLButtonElement) => {
 				this.choices[c.id] = text;
 				box.addClass("litesync-hunk-resolved");
@@ -158,9 +158,9 @@ export class ResolverModal extends Modal {
 
 		// 合并结果（可编辑）
 		const mergedBox = contentEl.createDiv({ cls: "litesync-resolver-merged" });
-		mergedBox.createEl("h4", { text: "MERGED RESULT（可直接编辑）" });
+		mergedBox.createEl("h4", { text: "Merged result（可直接编辑）" });
 		this.mergedTextarea = mergedBox.createEl("textarea");
-		this.mergedTextarea.placeholder = "为每个冲突段选择 Use Local / Use Remote / Use Both，或直接在此编辑最终内容";
+		this.mergedTextarea.placeholder = "为每个冲突段选择 Use local / Use remote / Use both，或直接在此编辑最终内容";
 		this.mergedTextarea.addEventListener("input", () => {
 			this.manualEdit = true;
 		});
@@ -168,9 +168,9 @@ export class ResolverModal extends Modal {
 
 		// 底部操作
 		const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
-		const saveBtn = footer.createEl("button", { text: "Save Merge", cls: "mod-cta" });
+		const saveBtn = footer.createEl("button", { text: "Save merge", cls: "mod-cta" });
 		saveBtn.onclick = () => void this.save();
-		footer.createEl("button", { text: "Keep Both（保留两个版本）" }).onclick = () => void this.keepBoth();
+		footer.createEl("button", { text: "Keep both（保留两个版本）" }).onclick = () => void this.keepBoth();
 		footer.createEl("button", { text: "Cancel" }).onclick = () => this.close();
 	}
 
