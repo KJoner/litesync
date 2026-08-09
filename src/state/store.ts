@@ -1,4 +1,5 @@
 import { DataAdapter } from "obsidian";
+import { BootstrapMode, BootstrapState, PENDING_BOOTSTRAP } from "../bootstrap/bootstrap-types";
 import { VaultKeyDoc } from "../crypto/crypto";
 
 /**
@@ -44,6 +45,8 @@ export interface PersistedState {
 	 * 扫描时跳过（不会被当作新文件重新上传），用户手动删除后自动清除。
 	 */
 	pendingDeletes: Record<string, number>;
+	/** 首次接入状态（v8）：pending 时所有同步入口被 Gate 拦截，先走接入向导 */
+	bootstrap: BootstrapState;
 }
 
 /**
@@ -59,6 +62,7 @@ export class StateStore {
 		e2ee: null,
 		shares: {},
 		pendingDeletes: {},
+		bootstrap: { ...PENDING_BOOTSTRAP },
 	};
 
 	constructor(
@@ -79,14 +83,23 @@ export class StateStore {
 					shares: raw.shares && typeof raw.shares === "object" ? raw.shares : {},
 					pendingDeletes:
 						raw.pendingDeletes && typeof raw.pendingDeletes === "object" ? raw.pendingDeletes : {},
+					bootstrap:
+						raw.bootstrap && typeof raw.bootstrap === "object"
+							? (raw.bootstrap)
+							: { ...PENDING_BOOTSTRAP },
 				};
 				// v0.2 状态升级：当时全部为明文，serverHash 与 hash 相同
 				for (const fs of Object.values(this.state.files)) {
 					if (!fs.serverHash) fs.serverHash = fs.hash;
 				}
+				// v0.8 升级：已经在正常同步中的老设备无 bootstrap 字段，
+				// 自动视为已接入（绝不能让升级用户突然被向导拦住）
+				if (!raw.bootstrap && (this.state.lastSequence > 0 || Object.keys(this.state.files).length > 0)) {
+					this.state.bootstrap = { status: "ready", mode: "legacy", completedAt: Date.now() };
+				}
 			}
 		} catch (e) {
-			console.error("[private-sync] failed to load state.json, starting fresh", e);
+			console.error("[litesync] failed to load state.json, starting fresh", e);
 			this.state = {
 				deviceId: "",
 				lastSequence: 0,
@@ -95,6 +108,7 @@ export class StateStore {
 				e2ee: null,
 				shares: {},
 				pendingDeletes: {},
+				bootstrap: { ...PENDING_BOOTSTRAP },
 			};
 		}
 		if (!this.state.deviceId) {
@@ -137,6 +151,27 @@ export class StateStore {
 
 	conflictPaths(): string[] {
 		return Object.keys(this.state.conflicts);
+	}
+
+	// ---------- Bootstrap（首次接入，v8） ----------
+
+	get bootstrapReady(): boolean {
+		return this.state.bootstrap.status === "ready";
+	}
+
+	completeBootstrap(mode: BootstrapMode, remoteVaultId: string | undefined, snapshotSequence: number): void {
+		this.state.bootstrap = {
+			status: "ready",
+			mode,
+			remoteVaultId,
+			snapshotSequence,
+			completedAt: Date.now(),
+		};
+	}
+
+	/** 重置为待接入（vaultId 变化 / 用户重跑向导 / 导入新配置时）。 */
+	resetBootstrap(): void {
+		this.state.bootstrap = { ...PENDING_BOOTSTRAP };
 	}
 
 	// ---------- 待手动删除（移动端删除安全，v6） ----------

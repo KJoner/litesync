@@ -9,6 +9,8 @@ export interface ServerInfo {
 	protocolVersion?: number;
 	/** 服务器仍兼容的最低客户端协议版本 */
 	minProtocolVersion?: number;
+	/** 同步仓库的稳定标识（0.8.0+）：URL 不变但 vaultId 变化 = 服务器被重装/换库 */
+	vaultId?: string;
 }
 
 /**
@@ -311,6 +313,30 @@ export class ApiClient {
 		});
 		if (res.status === 404) throw new NotFoundError();
 		if (res.status !== 200) throw new ApiError(res.status, `share revoke failed: HTTP ${res.status}`);
+	}
+
+	/** 创建一次性加密配对包（v8「添加新设备」；服务器只存密文）。 */
+	async createPairing(ciphertextB64: string, ttlSeconds = 300): Promise<{ id: string; expiresAt: number }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/pairing`,
+			method: "POST",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify({ ciphertext: ciphertextB64, ttlSeconds }),
+			throw: false,
+		});
+		if (res.status !== 200) throw new ApiError(res.status, `pairing create failed: HTTP ${res.status}`);
+		return res.json as { id: string; expiresAt: number };
+	}
+
+	/** 撤销配对包（配对窗口关闭时调用；已消费/不存在也视为成功）。 */
+	async deletePairing(id: string): Promise<void> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/pairing/${encodeURIComponent(id)}`,
+			method: "DELETE",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200) throw new ApiError(res.status, `pairing delete failed: HTTP ${res.status}`);
 	}
 
 	/** 获取服务器上的加密 vault key 文档；未启用 E2EE 时返回 null。 */

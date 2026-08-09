@@ -1,5 +1,6 @@
 import { Notice, Platform, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
 import { ApiClient } from "./api/client";
+import { BootstrapWizardModal } from "./bootstrap/bootstrap-modal";
 import { ConflictListModal } from "./conflict-ui/conflict-view";
 import {
 	API_TOKEN_SECRET_ID,
@@ -11,6 +12,8 @@ import { EnableE2eeModal, UnlockModal } from "./crypto/e2ee-modals";
 import { Keyring } from "./crypto/keyring";
 import { enableE2ee } from "./crypto/migration";
 import { HistoryModal } from "./history/history-view";
+import { PasteLinkModal, registerImportHandler } from "./pairing/import-handler";
+import { AddDeviceModal } from "./pairing/pairing-modal";
 import { DEFAULT_SETTINGS, PluginSettings, SyncSettingTab } from "./settings";
 import { ShareManageModal, ShareModal } from "./share/share-modal";
 import { StateStore } from "./state/store";
@@ -41,6 +44,8 @@ export default class PrivateSyncPlugin extends Plugin {
 	private intervalId: number | null = null;
 	private lastStatus: SyncStatus = "idle";
 	private keyring = new Keyring();
+	/** 接入向导单例标志（v8）：避免多个同步入口重复弹窗 */
+	private wizardOpen = false;
 	/** API Token 运行时值（真实存储在 Obsidian SecretStorage） */
 	private apiTokenValue = "";
 	/** v3.1 迁移：旧版本明文保存的 E2EE 密码，仅在首次启动时用一次后即抹除 */
@@ -106,6 +111,9 @@ export default class PrivateSyncPlugin extends Plugin {
 				);
 			}),
 		);
+
+		// obsidian://litesync-import：扫码/配对链接导入配置（v8）
+		registerImportHandler(this);
 
 		// 等待 vault 索引就绪后再初始化，避免启动时的 create 事件风暴
 		this.app.workspace.onLayoutReady(() => void this.initialize());
@@ -191,9 +199,67 @@ export default class PrivateSyncPlugin extends Plugin {
 		this.registerForegroundSync();
 		this.applySettings();
 
-		if (this.settings.autoSync && this.isConfigured()) {
-			void this.manager.sync("startup");
+		// Bootstrap Gate（v8）：填完 URL + Token ≠ 可以开始同步。
+		// 未接入时先进向导；接入完成后才允许任何自动同步
+		if (this.isConfigured()) {
+			if (!this.store.bootstrapReady) {
+				this.openBootstrapWizard();
+			} else if (this.settings.autoSync) {
+				void this.manager.sync("startup");
+			}
 		}
+	}
+
+	// ---------- Bootstrap（首次接入向导，v8） ----------
+
+	get bootstrapReady(): boolean {
+		return this.store?.bootstrapReady ?? false;
+	}
+
+	openBootstrapWizard(): void {
+		if (this.wizardOpen || !this.ctx) return;
+		if (!this.isConfigured()) {
+			new Notice("请先在设置中填写 Server URL 和 API Token");
+			return;
+		}
+		this.wizardOpen = true;
+		new BootstrapWizardModal(this.app, this.ctx, {
+			openUnlock: () => this.openUnlockModal(),
+			onDone: () => {
+				this.updateStatus("idle");
+				void this.manager?.sync("bootstrap");
+			},
+			onClosed: () => {
+				this.wizardOpen = false;
+			},
+		}).open();
+	}
+
+	/** 重新运行接入向导（设置页入口；会把本设备重置为待接入）。 */
+	rerunBootstrapWizard(): void {
+		this.store?.resetBootstrap();
+		void this.store?.save();
+		this.openBootstrapWizard();
+	}
+
+	/** 重置为待接入（导入新配对配置后调用）。 */
+	resetBootstrapState(): void {
+		this.store?.resetBootstrap();
+		void this.store?.save();
+	}
+
+	/** 「添加新设备」：生成一次性加密配对包并展示二维码/链接。 */
+	openAddDeviceModal(): void {
+		if (!this.client || !this.isConfigured()) {
+			new Notice("请先在设置中填写 Server URL 和 API Token");
+			return;
+		}
+		new AddDeviceModal(this.app, this.client, this.settings, this.getApiToken()).open();
+	}
+
+	/** 「导入配对链接」：手动粘贴其他设备生成的配对链接。 */
+	openPasteLinkModal(): void {
+		new PasteLinkModal(this.app, this).open();
 	}
 
 	/**
@@ -203,7 +269,7 @@ export default class PrivateSyncPlugin extends Plugin {
 	private registerForegroundSync(): void {
 		this.registerDomEvent(document, "visibilitychange", () => {
 			if (document.visibilityState !== "visible") return;
-			if (!this.settings.autoSync || !this.isConfigured()) return;
+			if (!this.settings.autoSync || !this.isConfigured() || !this.bootstrapReady) return;
 			if (this.foregroundTimer !== null) window.clearTimeout(this.foregroundTimer);
 			this.foregroundTimer = window.setTimeout(() => {
 				this.foregroundTimer = null;
@@ -231,7 +297,8 @@ export default class PrivateSyncPlugin extends Plugin {
 				? Math.max(MOBILE_MIN_INTERVAL_SECONDS, this.settings.syncIntervalSeconds)
 				: this.settings.syncIntervalSeconds;
 			this.intervalId = window.setInterval(() => {
-				if (this.isConfigured()) void this.manager?.sync("interval");
+				// Bootstrap Gate：自动入口在未接入时静默跳过（向导只由启动/手动触发弹出）
+				if (this.isConfigured() && this.bootstrapReady) void this.manager?.sync("interval");
 			}, seconds * 1000);
 			this.registerInterval(this.intervalId);
 		}
@@ -244,6 +311,11 @@ export default class PrivateSyncPlugin extends Plugin {
 		}
 		if (!this.manager) {
 			new Notice("插件尚未初始化完成，请稍候");
+			return;
+		}
+		// Bootstrap Gate：未接入时手动同步先走向导
+		if (!this.bootstrapReady) {
+			this.openBootstrapWizard();
 			return;
 		}
 		this.manager.resetRetry();
@@ -447,7 +519,9 @@ export default class PrivateSyncPlugin extends Plugin {
 			await this.setTrustDevice(trustDevice);
 			new Notice("E2EE 已解锁 ✓");
 			this.updateStatus("idle");
-			void this.manager?.sync("unlock");
+			// 未接入的设备解锁后回到接入向导；已接入的正常同步
+			if (!this.bootstrapReady) this.openBootstrapWizard();
+			else void this.manager?.sync("unlock");
 			return null;
 		}).open();
 	}

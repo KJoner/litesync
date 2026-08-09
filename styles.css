@@ -211,3 +211,14 @@
 .litesync-status-clickable {
 	cursor: pointer;
 }
+
+/* ---------- 配对二维码（v8 添加新设备） ---------- */
+.litesync-qr-wrap {
+	display: flex;
+	justify-content: center;
+	margin: 12px 0;
+}
+.litesync-qr {
+	border-radius: 8px;
+	max-width: 100%;
+}

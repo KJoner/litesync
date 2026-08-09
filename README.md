@@ -31,6 +31,10 @@ else's cloud.
   in the URL fragment; revocable, with optional expiry
 - **Mobile support** — works on iOS/Android (Obsidian 1.13+): foreground
   catch-up sync, deletion safety (never permanently deletes), responsive UI
+- **First-run wizard & QR pairing** — new devices go through an onboarding
+  wizard (restore from remote / merge, nothing is ever silently overwritten);
+  "Add device" generates a one-time encrypted QR code that transfers server
+  config to a new device — the E2EE password is always typed manually
 
 ## Installation
 
@@ -41,8 +45,17 @@ Until LiteSync is available in Community Plugins, install manually:
 2. Copy them into `<YourVault>/.obsidian/plugins/litesync/`
 3. Enable **LiteSync** in Settings → Community plugins
 
-Then open the plugin settings, fill in your **Server URL** and **API Token**
-(shown by the server's install script), and hit **Test Connection**.
+**First device:** open the plugin settings, fill in your **Server URL** and
+**API Token** (shown by the server's install script), hit **Test Connection**,
+then follow the onboarding wizard (it will offer to initialize the remote
+vault from this device).
+
+**Second and later devices:** on an already-configured device, open
+Settings → Devices & migration → **Add device** and scan the QR code (or open
+the pairing link) on the new device. Server config is transferred through a
+one-time encrypted package (5-minute expiry, single use; the server only ever
+sees ciphertext). Enter your E2EE password once, pick **Restore from remote**
+in the wizard, done.
 
 Don't have a server yet? Follow the
 [deployment guide](https://github.com/KJoner/litesync-server) — a one-line
@@ -64,7 +77,12 @@ install script sets everything up.
   what needs syncing. File paths and contents go only to your own configured
   server, nowhere else.
 - The system clipboard is written **only** when you explicitly click
-  "Copy link" for an encrypted share. LiteSync never reads the clipboard.
+  "Copy link" for an encrypted share or a device-pairing link. LiteSync never
+  reads the clipboard.
+- Device pairing never transmits your E2EE password. The pairing package
+  (server URL, API token, sync settings) is encrypted on-device; the
+  decryption key lives only in the link's `#fragment`, which browsers do not
+  send to servers.
 - The server component is a separate open-source project:
   <https://github.com/KJoner/litesync-server>
 

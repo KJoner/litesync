@@ -57,10 +57,19 @@ export class SyncManager {
 
 		const counters: SyncCounters = { pulled: 0, pushed: 0, conflicts: 0 };
 		try {
+			// Bootstrap Gate 硬保护（v8）：未接入的设备绝不执行任何同步
+			//（向导由 main 侧入口负责弹出，这里只兜底阻断）
+			if (!this.ctx.store.bootstrapReady) {
+				this.ctx.log(`sync blocked (${reason}): bootstrap pending`);
+				this.onStatus("idle");
+				return;
+			}
+
 			// 协议兼容性（v7 分仓后插件与服务器独立发版）：不兼容则拒绝同步，
 			// 给出明确的升级指引，而不是让后续请求以奇怪的方式失败
 			if (!this.protocolOk) {
-				const err = protocolError(await this.ctx.client.info());
+				const info = await this.ctx.client.info();
+				const err = protocolError(info);
 				if (err) {
 					if (!this.protocolWarned) {
 						this.protocolWarned = true;
@@ -68,6 +77,18 @@ export class SyncManager {
 					}
 					this.ctx.log(`sync blocked: ${err}`);
 					this.onStatus("offline", err);
+					return;
+				}
+				// vaultId 保护（v8）：URL 没变但仓库身份变了（服务器重装/换库/换目标）
+				// → 立即停止自动同步，重置为待接入，等用户重新走向导确认
+				const saved = this.ctx.store.state.bootstrap.remoteVaultId;
+				if (saved && info.vaultId && info.vaultId !== saved) {
+					this.ctx.store.resetBootstrap();
+					await this.ctx.store.save();
+					const msg = "服务器上的同步仓库已更换（vaultId 变化），已暂停同步；请重新运行接入向导确认本设备的接入方式";
+					this.ctx.notify(msg);
+					this.ctx.log(`sync blocked: vaultId changed ${saved} -> ${info.vaultId}`);
+					this.onStatus("offline", msg);
 					return;
 				}
 				this.protocolOk = true;

@@ -1,0 +1,31 @@
+/**
+ * Bootstrap（v8 首次接入）：新设备在开始任何自动同步之前，
+ * 必须先通过接入向导明确「本地与远端的关系」。
+ */
+
+export type BootstrapMode = "remote-wins" | "merge" | "local-init" | "legacy";
+
+export interface BootstrapState {
+	status: "pending" | "ready";
+	/** 完成接入时服务器的 vaultId；同一 URL 上 vaultId 变化 = 服务器被重装/换库 */
+	remoteVaultId?: string;
+	mode?: BootstrapMode;
+	snapshotSequence?: number;
+	completedAt?: number;
+}
+
+export const PENDING_BOOTSTRAP: BootstrapState = { status: "pending" };
+
+/** 接入场景分类（纯函数，供向导选择界面与测试）。 */
+export type BootstrapScenario =
+	| "both-empty" // 本地空 + 远端空 → 直接初始化
+	| "local-only" // 本地有 + 远端空 → 用本设备初始化远端
+	| "remote-only" // 本地空 + 远端有 → 从远端恢复（无需询问）
+	| "both"; // 双方都有 → 必须让用户选择
+
+export function classifyBootstrap(localCount: number, remoteCount: number): BootstrapScenario {
+	if (localCount === 0 && remoteCount === 0) return "both-empty";
+	if (remoteCount === 0) return "local-only";
+	if (localCount === 0) return "remote-only";
+	return "both";
+}

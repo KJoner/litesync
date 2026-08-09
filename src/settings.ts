@@ -147,6 +147,27 @@ export class SyncSettingTab extends PluginSettingTab {
 			},
 			{
 				type: "group",
+				heading: "设备与迁移",
+				items: [
+					{
+						name: "添加新设备",
+						desc: "生成一次性加密配对二维码/链接：新设备扫码即可自动导入服务器配置（E2EE 密码仍需手动输入）",
+						action: () => plugin.openAddDeviceModal(),
+					},
+					{
+						name: "导入配对链接",
+						desc: "粘贴在其他设备上生成的配对链接，导入其服务器配置",
+						action: () => plugin.openPasteLinkModal(),
+					},
+					{
+						name: "重新运行接入向导",
+						desc: "重新选择本设备与远端仓库的接入方式（从远端恢复 / 合并）",
+						action: () => plugin.rerunBootstrapWizard(),
+					},
+				],
+			},
+			{
+				type: "group",
 				heading: "端到端加密 (E2EE)",
 				items: [
 					{
