@@ -128,9 +128,14 @@ export class SyncManager {
 					this.ctx.store.state.bootstrap.remoteVaultId = info.vaultId;
 					adopted = true;
 				}
-				// E2EE 密钥世代（v9.2）：LSE2 信封的 AAD 绑定材料，跟随服务器状态机
+				// E2EE 密钥世代（v9.2）：LSE2/LSE3 信封的 AAD 绑定材料，跟随服务器状态机
 				if (info.keyEpoch !== undefined && this.ctx.store.state.bootstrap.keyEpoch !== info.keyEpoch) {
 					this.ctx.store.state.bootstrap.keyEpoch = info.keyEpoch;
+					adopted = true;
+				}
+				// 元数据加密状态（v9.3 三期）：encrypted 后所有服务器路径都是伪名
+				if (info.metaState !== undefined && this.ctx.store.state.bootstrap.metaState !== info.metaState) {
+					this.ctx.store.state.bootstrap.metaState = info.metaState;
 					adopted = true;
 				}
 				if (adopted) await this.ctx.store.save();

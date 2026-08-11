@@ -8,10 +8,12 @@
  */
 import { DownloadResult, UploadAction } from "../api/client";
 import {
+	canonicalPathHmac,
 	decryptFile,
 	decryptFileV3,
 	encryptFile,
 	encryptFileV3,
+	encryptMeta,
 	FileKeyBinding,
 	isEncryptedPayload,
 	isLse3Envelope,
@@ -21,6 +23,20 @@ import { E2eeLockedError } from "../crypto/keyring";
 import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
 import { SyncContext } from "./context";
+
+/** 元数据加密模式（v9.3 三期）：服务器只见伪名（=fileId），真实路径在 LSM1 里。 */
+export function metaEncrypted(ctx: SyncContext): boolean {
+	return ctx.store.state.bootstrap.metaState === "encrypted";
+}
+
+/**
+ * 真实路径 → 服务器可见路径（伪名翻译）。
+ * meta 模式下已跟踪文件用 fileId；未跟踪（如冲突流程不该出现）回退真实路径。
+ */
+export function serverPathOf(ctx: SyncContext, realPath: string): string {
+	if (!metaEncrypted(ctx)) return realPath;
+	return ctx.store.get(realPath)?.fileId ?? realPath;
+}
 
 export interface PlainDownload {
 	/** 解密后的明文内容 */
@@ -34,6 +50,9 @@ export interface PlainDownload {
 	fileId?: string;
 	/** LSE3 信封中的 contentGeneration（AAD 认证后返回；非 LSE3 为 undefined） */
 	generation?: number;
+	/** 加密元数据（meta 模式；调用方解出真实路径） */
+	metaEnc?: string;
+	metaGeneration?: number;
 }
 
 /**
@@ -98,6 +117,8 @@ async function decode(
 			mtime: dl.mtime,
 			fileId: dl.fileId,
 			generation: dec.generation,
+			metaEnc: dl.metaEnc,
+			metaGeneration: dl.metaGeneration,
 		};
 	}
 
@@ -121,17 +142,35 @@ async function decode(
 		revision: dl.revision,
 		mtime: dl.mtime,
 		fileId: dl.fileId,
+		metaEnc: dl.metaEnc,
+		metaGeneration: dl.metaGeneration,
 	};
 }
 
-/** 下载当前 HEAD 并解密（强制 generation 不回退）。 */
-export async function downloadPlain(ctx: SyncContext, path: string): Promise<PlainDownload> {
-	return decode(ctx, path, await ctx.client.download(path), { enforceGeneration: true });
+/**
+ * 下载当前 HEAD 并解密（强制 generation 不回退）。
+ * path 为本地真实路径；meta 模式下自动翻译为伪名（serverPath 可显式覆盖，
+ * bootstrap 等 tracked 尚不存在的场景用）。
+ */
+export async function downloadPlain(ctx: SyncContext, path: string, serverPath?: string): Promise<PlainDownload> {
+	const sp = serverPath ?? serverPathOf(ctx, path);
+	return decode(ctx, path, await ctx.client.download(sp), { enforceGeneration: true });
 }
 
 /** 下载历史版本并解密（历史本来就是旧 generation，不做回退检查）。 */
-export async function versionPlain(ctx: SyncContext, path: string, revision: number): Promise<PlainDownload> {
-	return decode(ctx, path, await ctx.client.version(path, revision), { enforceGeneration: false });
+export async function versionPlain(
+	ctx: SyncContext,
+	path: string,
+	revision: number,
+	serverPath?: string,
+): Promise<PlainDownload> {
+	const sp = serverPath ?? serverPathOf(ctx, path);
+	return decode(ctx, path, await ctx.client.version(sp, revision), { enforceGeneration: false });
+}
+
+/** 远端删除（meta 模式自动翻译伪名）。 */
+export async function removeRemote(ctx: SyncContext, path: string, baseRevision: number): Promise<void> {
+	await ctx.client.remove(serverPathOf(ctx, path), baseRevision);
 }
 
 /**
@@ -164,9 +203,11 @@ export interface UploadOutcome {
 	fileId?: string;
 	/** 本次写入的 contentGeneration（仅 LSE3；成功后必须记入 FileState） */
 	generation?: number;
+	/** 元数据世代（meta 模式建档为 1；成功后记入 FileState） */
+	metaGeneration?: number;
 }
 
-/** 上传明文内容（E2EE 启用时自动加密，默认 LSE3）。 */
+/** 上传明文内容（E2EE 启用时自动加密，默认 LSE3；meta 模式自动伪名 + 挂元数据）。 */
 export async function uploadFromPlain(
 	ctx: SyncContext,
 	path: string,
@@ -178,6 +219,9 @@ export async function uploadFromPlain(
 	let payload = plain;
 	let sendFileId: string | undefined;
 	let generation: number | undefined;
+	let serverPath = path;
+	let meta: { metaEnc: string; canonicalHash: string } | undefined;
+	let metaGeneration: number | undefined;
 
 	if (ctx.e2ee.enabled) {
 		const bind = e2eeBinding(ctx);
@@ -192,18 +236,38 @@ export async function uploadFromPlain(
 				plain,
 			);
 			sendFileId = fileId;
+
+			// 元数据加密模式（v9.3 三期）：服务器只见伪名；建档随带 LSM1 元数据
+			if (metaEncrypted(ctx)) {
+				serverPath = fileId;
+				if (!tracked) {
+					const keys = await ctx.e2ee.metaKeys();
+					metaGeneration = 1;
+					meta = {
+						metaEnc: await encryptMeta(
+							keys,
+							{ vaultId: bind.vaultId, keyEpoch: bind.keyEpoch, fileId, metaGeneration },
+							{ path },
+						),
+						canonicalHash: await canonicalPathHmac(keys, path),
+					};
+				} else {
+					metaGeneration = tracked.metaGeneration;
+				}
+			}
 		} else {
 			// 绑定材料未就绪（升级过渡首轮）：回退 LSE1，下一轮自动切 LSE3
 			payload = await encryptFile(ctx.e2ee.requireKey(), path, plain);
 		}
 	}
 	const cipherHash = await sha256Hex(payload);
-	const res = await ctx.client.upload(path, baseRevision, cipherHash, payload, mtime, action, sendFileId);
+	const res = await ctx.client.upload(serverPath, baseRevision, cipherHash, payload, mtime, action, sendFileId, meta);
 	return {
 		revision: res.revision,
 		cipherHash,
 		sequence: res.sequence,
 		fileId: res.fileId ?? sendFileId,
 		generation,
+		metaGeneration,
 	};
 }

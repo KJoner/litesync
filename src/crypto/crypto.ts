@@ -53,6 +53,133 @@ export function newFileId(): string {
 	return out;
 }
 
+// ---------- 元数据加密（v9.3 三期：LSM1 信封 + canonical HMAC） ----------
+
+const META_MAGIC = new Uint8Array([0x4c, 0x53, 0x4d, 0x31]); // "LSM1"
+
+/** 从 VMK 派生的元数据密钥对：enc 加密路径等元数据，mac 计算同名判定 HMAC。 */
+export interface MetaKeys {
+	enc: CryptoKey;
+	mac: CryptoKey;
+}
+
+/**
+ * HKDF 从 VMK 原始字节派生元数据密钥（与内容密钥域分离）。
+ * 派生是确定性的：任何解锁了 VMK 的设备得到同一组 metaKeys。
+ */
+export async function deriveMetaKeys(vmkRaw: Uint8Array): Promise<MetaKeys> {
+	const master = await crypto.subtle.importKey("raw", vmkRaw as BufferSource, "HKDF", false, ["deriveKey"]);
+	const hkdf = (info: string, algo: AesKeyGenParams | HmacKeyGenParams, usages: KeyUsage[]) =>
+		crypto.subtle.deriveKey(
+			{
+				name: "HKDF",
+				hash: "SHA-256",
+				salt: new Uint8Array(32) as BufferSource,
+				info: new TextEncoder().encode(info) as BufferSource,
+			},
+			master,
+			algo,
+			false,
+			usages,
+		);
+	const [enc, mac] = await Promise.all([
+		hkdf("litesync/v5/meta-enc", { name: "AES-GCM", length: 256 }, ["encrypt", "decrypt"]),
+		hkdf("litesync/v5/meta-mac", { name: "HMAC", hash: "SHA-256", length: 256 }, ["sign"]),
+	]);
+	return { enc, mac };
+}
+
+/** 文件元数据明文（LSM1 内容；未来可扩展更多字段）。 */
+export interface FileMeta {
+	path: string;
+}
+
+function metaAad(vaultId: string, keyEpoch: number, fileId: string, metaGeneration: number): Uint8Array {
+	return new TextEncoder().encode(`litesync/v5/meta:${vaultId}:${keyEpoch}:${fileId}:${metaGeneration}`);
+}
+
+/** LSM1 加密：magic | keyEpoch(u32) | metaGeneration(u64) | iv | ct+tag → base64。 */
+export async function encryptMeta(
+	keys: MetaKeys,
+	binding: { vaultId: string; keyEpoch: number; fileId: string; metaGeneration: number },
+	meta: FileMeta,
+): Promise<string> {
+	const iv = randomBytes(IV_LEN);
+	const plain = new TextEncoder().encode(JSON.stringify(meta));
+	const ct = new Uint8Array(
+		await crypto.subtle.encrypt(
+			{
+				name: "AES-GCM",
+				iv: iv as BufferSource,
+				additionalData: metaAad(binding.vaultId, binding.keyEpoch, binding.fileId, binding.metaGeneration) as BufferSource,
+			},
+			keys.enc,
+			plain,
+		),
+	);
+	const head = META_MAGIC.length + EPOCH_LEN + GEN_LEN;
+	const out = new Uint8Array(head + IV_LEN + ct.length);
+	out.set(META_MAGIC, 0);
+	const view = new DataView(out.buffer);
+	view.setUint32(META_MAGIC.length, binding.keyEpoch >>> 0, false);
+	view.setBigUint64(META_MAGIC.length + EPOCH_LEN, BigInt(binding.metaGeneration), false);
+	out.set(iv, head);
+	out.set(ct, head + IV_LEN);
+	return b64encode(out);
+}
+
+/** LSM1 解密（AAD 由 vaultId + 信封头 + fileId 重建）；失败返回 null。 */
+export async function decryptMeta(
+	keys: MetaKeys,
+	payloadB64: string,
+	vaultId: string,
+	fileId: string,
+): Promise<{ meta: FileMeta; metaGeneration: number; keyEpoch: number } | null> {
+	let raw: Uint8Array;
+	try {
+		raw = b64decode(payloadB64);
+	} catch {
+		return null;
+	}
+	const head = META_MAGIC.length + EPOCH_LEN + GEN_LEN;
+	if (raw.byteLength < head + IV_LEN + 16) return null;
+	for (let i = 0; i < META_MAGIC.length; i++) {
+		if (raw[i] !== META_MAGIC[i]) return null;
+	}
+	const view = new DataView(raw.buffer, raw.byteOffset);
+	const keyEpoch = view.getUint32(META_MAGIC.length, false);
+	const metaGeneration = Number(view.getBigUint64(META_MAGIC.length + EPOCH_LEN, false));
+	try {
+		const iv = raw.subarray(head, head + IV_LEN);
+		const ct = raw.subarray(head + IV_LEN);
+		const plain = await crypto.subtle.decrypt(
+			{
+				name: "AES-GCM",
+				iv: iv as BufferSource,
+				additionalData: metaAad(vaultId, keyEpoch, fileId, metaGeneration) as BufferSource,
+			},
+			keys.enc,
+			ct as BufferSource,
+		);
+		const meta = JSON.parse(new TextDecoder().decode(plain)) as FileMeta;
+		if (typeof meta.path !== "string" || meta.path === "") return null;
+		return { meta, metaGeneration, keyEpoch };
+	} catch {
+		return null;
+	}
+}
+
+/** canonical 同名判定 HMAC（服务器只见 HMAC，学不到路径内容）。 */
+export async function canonicalPathHmac(keys: MetaKeys, path: string): Promise<string> {
+	const canonical = path.normalize("NFC").toLowerCase();
+	const sig = new Uint8Array(
+		await crypto.subtle.sign("HMAC", keys.mac, new TextEncoder().encode(canonical)),
+	);
+	let out = "";
+	for (const b of sig) out += b.toString(16).padStart(2, "0");
+	return out;
+}
+
 /** 存服务器 / 本地缓存的 vault key 文档（不含任何明文密钥材料）。 */
 export interface VaultKeyDoc {
 	version: 1;

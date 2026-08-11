@@ -10,7 +10,8 @@ import {
 } from "./crypto/device-trust";
 import { EnableE2eeModal, UnlockModal } from "./crypto/e2ee-modals";
 import { Keyring } from "./crypto/keyring";
-import { enableE2ee, upgradeEnvelopes } from "./crypto/migration";
+import { ConfirmMetaEncryptionModal } from "./crypto/meta-modals";
+import { enableE2ee, encryptMetadata, upgradeEnvelopes } from "./crypto/migration";
 import { HistoryModal } from "./history/history-view";
 import { DeviceListModal } from "./pairing/device-list-modal";
 import { PasteLinkModal, registerImportHandler } from "./pairing/import-handler";
@@ -102,8 +103,13 @@ export default class PrivateSyncPlugin extends Plugin {
 		});
 		this.addCommand({
 			id: "upgrade-envelopes",
-			name: "升级加密信封 LSE1 → LSE2 (Upgrade encryption envelopes)",
+			name: "升级加密信封 LSE1 → LSE3 (Upgrade encryption envelopes)",
 			callback: () => void this.runEnvelopeUpgrade(),
+		});
+		this.addCommand({
+			id: "encrypt-metadata",
+			name: "加密路径与文件名 (Encrypt file paths and names)",
+			callback: () => this.confirmMetaEncryption(),
 		});
 		this.addRibbonIcon("refresh-cw", "LiteSync: 立即同步", () => void this.syncNow());
 
@@ -289,6 +295,42 @@ export default class PrivateSyncPlugin extends Plugin {
 	/** 「导入配对链接」：手动粘贴其他设备生成的配对链接。 */
 	openPasteLinkModal(): void {
 		new PasteLinkModal(this.app, this).open();
+	}
+
+	/** 「加密路径与文件名」（v9.3 三期）：确认后执行元数据加密迁移。 */
+	private confirmMetaEncryption(): void {
+		if (!this.ctx) return;
+		if (!this.keyring.enabled) {
+			new Notice("请先启用端到端加密");
+			return;
+		}
+		if (!this.keyring.unlocked) {
+			new Notice("请先解锁端到端加密（Unlock E2EE）");
+			return;
+		}
+		if (this.store?.state.bootstrap.metaState === "encrypted") {
+			new Notice("路径与文件名已经是加密状态");
+			return;
+		}
+		new ConfirmMetaEncryptionModal(this.app, () => void this.runMetaEncryption()).open();
+	}
+
+	private async runMetaEncryption(): Promise<void> {
+		if (!this.ctx) return;
+		const progress = new Notice("正在加密路径与文件名…", 0);
+		try {
+			const r = await encryptMetadata(this.ctx, (p) => {
+				progress.setMessage(`加密元数据 ${p.done}/${p.total}：${p.current}`);
+			});
+			progress.hide();
+			new Notice(
+				`元数据加密完成：${r.migrated} 个文件的路径已伪名化，服务器上的明文路径已抹除。\n其他设备下次同步会自动对账（需 0.12+ 并解锁 E2EE）`,
+				10000,
+			);
+		} catch (e) {
+			progress.hide();
+			new Notice(`元数据加密失败（可重新执行续传）：${e instanceof Error ? e.message : String(e)}`, 10000);
+		}
 	}
 
 	/** 「升级加密信封」（v9.2）：把仓库中的 LSE1 密文重新加密为 LSE2。 */

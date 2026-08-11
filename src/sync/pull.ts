@@ -1,10 +1,81 @@
 import { App, Platform } from "obsidian";
-import { NotFoundError, RemoteChange } from "../api/client";
+import { NotFoundError, RemoteChange, SnapshotFile } from "../api/client";
+import { decryptMeta } from "../crypto/crypto";
 import { sha256Hex } from "../utils/hash";
+import { ensureParentFolder } from "../utils/path";
 import { attemptAutoMerge } from "./auto-merge";
 import { keepBothVersions } from "./conflict";
 import { SyncContext } from "./context";
-import { downloadPlain, writeIfLocalUnchanged } from "./transfer";
+import { downloadPlain, metaEncrypted, writeIfLocalUnchanged } from "./transfer";
+
+const HEX32 = /^[0-9a-f]{32}$/;
+
+/**
+ * 伪名变更解析（v9.3 三期 meta 模式）：change.path 是 32-hex 伪名（=fileId）。
+ * 已跟踪 → 反查真实路径；未知伪名 → 轻量取加密元数据解出真实路径。
+ * 返回 null 表示该变更无需处理（如从未有过的文件被删除）。
+ */
+async function resolveMetaChange(
+	ctx: SyncContext,
+	change: RemoteChange,
+): Promise<{ realPath: string; serverPath: string } | "skip" | null> {
+	const pseudonym = change.path;
+	const known = ctx.store.pathByFileId(pseudonym);
+	if (known !== undefined) return { realPath: known, serverPath: pseudonym };
+	if (change.action === "delete") return "skip"; // 本地从未有过
+
+	// 未知伪名：取元数据解出真实路径（无需下载内容）
+	let meta;
+	try {
+		meta = await ctx.client.getFileMeta(pseudonym);
+	} catch (e) {
+		if (e instanceof NotFoundError) return "skip"; // 已被后续 change 删除
+		throw e;
+	}
+	if (!meta.metaEnc) throw new Error(`meta 模式下服务器未返回加密元数据：${pseudonym}`);
+	const bind = ctx.store.state.bootstrap;
+	const keys = await ctx.e2ee.metaKeys();
+	const dec = await decryptMeta(keys, meta.metaEnc, bind.remoteVaultId ?? "", pseudonym);
+	if (dec === null) throw new Error(`无法解密文件元数据（${pseudonym}）：密钥不匹配或数据被篡改，已停止同步`);
+	return { realPath: dec.meta.path, serverPath: pseudonym };
+}
+
+/**
+ * 元数据改名应用（v9.3 三期）：内容未变、metaGeneration 变新 → 本地 rename。
+ * 目标已被占用时登记 blocked（不覆盖任何本地内容）。
+ */
+async function applyMetaRename(ctx: SyncContext, realPath: string, pseudonym: string): Promise<Outcome> {
+	const tracked = ctx.store.get(realPath);
+	if (!tracked) return "skipped";
+	const meta = await ctx.client.getFileMeta(pseudonym);
+	const bind = ctx.store.state.bootstrap;
+	const keys = await ctx.e2ee.metaKeys();
+	const dec = await decryptMeta(keys, meta.metaEnc, bind.remoteVaultId ?? "", pseudonym);
+	if (dec === null) throw new Error(`无法解密文件元数据（${pseudonym}）`);
+	const newPath = dec.meta.path;
+	if (newPath === realPath) {
+		ctx.store.set(realPath, { ...tracked, metaGeneration: dec.metaGeneration });
+		return "skipped";
+	}
+	const adapter = ctx.app.vault.adapter;
+	if (await adapter.stat(newPath)) {
+		ctx.store.setBlockedChange(newPath, `远端改名目标已被本地文件占用（原 ${realPath}）`);
+		ctx.notify(`远端将 ${realPath} 改名为 ${newPath}，但目标已存在本地文件，已暂缓`);
+		return "blocked";
+	}
+	if (!(await adapter.stat(realPath))) {
+		// 本地原文件不在（可能刚被用户移走）：只更新状态键，内容由扫描收敛
+		ctx.store.delete(realPath);
+		ctx.store.set(newPath, { ...tracked, metaGeneration: dec.metaGeneration });
+		return "applied";
+	}
+	await ensureParentFolder(adapter, newPath);
+	await adapter.rename(realPath, newPath);
+	ctx.store.delete(realPath);
+	ctx.store.set(newPath, { ...tracked, metaGeneration: dec.metaGeneration });
+	ctx.log(`pull: renamed ${realPath} -> ${newPath} (metaGen ${dec.metaGeneration})`);
+	return "applied";
+}
 
 export interface PullResult {
 	applied: number;
@@ -127,14 +198,18 @@ async function resyncFromSnapshot(ctx: SyncContext): Promise<PullResult> {
 	const result: PullResult = { applied: 0, conflicts: 0 };
 	const snap = await ctx.client.snapshot();
 	await guardRepoEpoch(ctx, snap.repoEpoch);
-	const snapPaths = new Set(snap.files.map((f) => f.path));
+
+	// meta 模式（v9.3 三期）：快照条目是伪名 + 加密元数据 → 先解出真实路径
+	const files = await resolveSnapshotPaths(ctx, snap.files);
+	const snapPaths = new Set(files.map((f) => f.path));
 
 	// 已跟踪但快照中不存在 → 远端已删除
 	for (const path of ctx.store.paths()) {
 		if (ctx.ignores(path) || snapPaths.has(path)) continue;
+		const tracked = ctx.store.get(path);
 		const outcome = await applyRemoteChange(ctx, {
 			sequence: snap.sequence,
-			path,
+			path: metaEncrypted(ctx) && tracked?.fileId ? tracked.fileId : path,
 			action: "delete",
 			revision: 0,
 		});
@@ -142,21 +217,31 @@ async function resyncFromSnapshot(ctx: SyncContext): Promise<PullResult> {
 		if (outcome === "conflict") result.conflicts++;
 	}
 	// 快照与本地已知服务器状态不一致 → 远端有更新
-	for (const f of snap.files) {
+	for (const f of files) {
 		if (ctx.ignores(f.path)) continue;
+		// 离线期间的远端改名：同 fileId 挂在别的本地路径上 → 先做本地 rename
+		if (f.fileId && f.serverPseudonym) {
+			const existing = ctx.store.pathByFileId(f.fileId);
+			if (existing !== undefined && existing !== f.path) {
+				const outcome = await applyMetaRename(ctx, existing, f.serverPseudonym);
+				if (outcome === "applied") result.applied++;
+				if (outcome === "blocked") continue;
+			}
+		}
 		const tracked = ctx.store.get(f.path);
 		if (tracked && tracked.serverHash === f.hash) {
-			if (tracked.revision !== f.revision) {
-				ctx.store.set(f.path, { ...tracked, revision: f.revision });
+			if (tracked.revision !== f.revision || tracked.metaGeneration !== f.metaGeneration) {
+				ctx.store.set(f.path, { ...tracked, revision: f.revision, metaGeneration: f.metaGeneration });
 			}
 			continue;
 		}
 		const outcome = await applyRemoteChange(ctx, {
 			sequence: snap.sequence,
-			path: f.path,
+			path: f.serverPseudonym ?? f.path,
 			action: "upsert",
 			revision: f.revision,
 			hash: f.hash,
+			metaGeneration: f.metaGeneration,
 		});
 		if (outcome === "applied") result.applied++;
 		if (outcome === "conflict") result.conflicts++;
@@ -168,8 +253,58 @@ async function resyncFromSnapshot(ctx: SyncContext): Promise<PullResult> {
 	return result;
 }
 
+interface ResolvedSnapshotFile extends SnapshotFile {
+	/** meta 模式下的服务器伪名（path 已替换为解密出的真实路径） */
+	serverPseudonym?: string;
+}
+
+/** 快照条目的元数据解密（明文模式原样返回）。 */
+export async function resolveSnapshotPaths(
+	ctx: SyncContext,
+	files: SnapshotFile[],
+): Promise<ResolvedSnapshotFile[]> {
+	if (!files.some((f) => f.metaEnc)) return files;
+	const vaultId = ctx.store.state.bootstrap.remoteVaultId ?? "";
+	const keys = await ctx.e2ee.metaKeys();
+	const out: ResolvedSnapshotFile[] = [];
+	for (const f of files) {
+		if (!f.metaEnc || !f.fileId) {
+			out.push(f); // 迁移中的混合态：明文路径条目原样处理
+			continue;
+		}
+		const dec = await decryptMeta(keys, f.metaEnc, vaultId, f.fileId);
+		if (dec === null) {
+			throw new Error(`无法解密文件元数据（${f.fileId}）：密钥不匹配或数据被篡改，已停止同步`);
+		}
+		out.push({ ...f, path: dec.meta.path, metaGeneration: dec.metaGeneration, serverPseudonym: f.fileId });
+	}
+	return out;
+}
+
 async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promise<Outcome> {
-	const path = change.path;
+	let path = change.path;
+	let serverPath: string | undefined;
+
+	// meta 模式（v9.3 三期）：变更携带伪名，先解析出真实路径
+	if (metaEncrypted(ctx) && HEX32.test(change.path)) {
+		const resolved = await resolveMetaChange(ctx, change);
+		if (resolved === "skip" || resolved === null) return "skipped";
+		path = resolved.realPath;
+		serverPath = resolved.serverPath;
+
+		// 内容未变但元数据世代变新 = 仅改名
+		const tracked = ctx.store.get(path);
+		if (
+			change.action === "upsert" &&
+			tracked &&
+			change.hash &&
+			change.hash === tracked.serverHash &&
+			(change.metaGeneration ?? 0) > (tracked.metaGeneration ?? 0)
+		) {
+			return applyMetaRename(ctx, path, resolved.serverPath);
+		}
+	}
+
 	if (ctx.ignores(path)) return "skipped";
 	// 文件正在冲突处理中：冻结远端应用，避免来回覆盖；Resolver 解决时会重新取远端 HEAD
 	if (ctx.store.getConflict(path)) return "skipped";
@@ -247,7 +382,7 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 		// 本地不存在，或本地自上次同步后未修改 → 采用远端版本
 		let dl;
 		try {
-			dl = await downloadPlain(ctx, path);
+			dl = await downloadPlain(ctx, path, serverPath);
 		} catch (e) {
 			if (e instanceof NotFoundError) return "skipped"; // 已被后续 change 删除
 			throw e;
@@ -265,6 +400,7 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 				size: dl.plain.byteLength,
 				fileId: dl.fileId,
 				generation: dl.generation,
+				metaGeneration: dl.metaGeneration ?? change.metaGeneration,
 			});
 			ctx.log(`pull: downloaded ${path} (rev ${dl.revision})`);
 			return "applied";

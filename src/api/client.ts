@@ -21,6 +21,8 @@ export interface ServerInfo {
 	/** E2EE 状态机（0.9.0+）：plaintext / migrating / encrypted */
 	encryptionState?: string;
 	keyEpoch?: number;
+	/** 元数据加密状态机（0.12.0+）：plain / migrating / encrypted */
+	metaState?: string;
 }
 
 /**
@@ -29,8 +31,9 @@ export interface ServerInfo {
  * v2（0.9.0）：repoEpoch、tombstone 拒绝 base 0、E2EE 状态机、vault-key CAS。
  * v3（0.10.0）：设备级凭据与配对包 v2（enrollment）、LSE2 加密信封。
  * v4（0.11.0）：LSE3 信封（fileId-AAD + contentGeneration 抗回退重放）、E2EE 原子 MOVE。
+ * v5（0.12.0）：元数据加密——伪名路径 + LSM1 信封，改名 = 元数据更新。
  */
-export const PLUGIN_PROTOCOL_VERSION = 4;
+export const PLUGIN_PROTOCOL_VERSION = 5;
 
 /** 协议不兼容时返回给用户的提示；兼容返回 null。 */
 export function protocolError(info: ServerInfo): string | null {
@@ -51,6 +54,8 @@ export interface RemoteChange {
 	action: "upsert" | "delete";
 	revision: number;
 	hash?: string;
+	/** 元数据世代（0.12.0+）：hash 未变但世代变新 = 仅改名 */
+	metaGeneration?: number;
 }
 
 export interface ChangesResponse {
@@ -74,6 +79,9 @@ export interface SnapshotFile {
 	mtime: number;
 	/** 稳定文件身份（0.11.0+） */
 	fileId?: string;
+	/** 加密元数据（0.12.0+，meta 模式）：真实路径在里面 */
+	metaEnc?: string;
+	metaGeneration?: number;
 }
 
 export interface UploadOk {
@@ -107,6 +115,9 @@ export interface DownloadResult {
 	mtime: number;
 	/** 稳定文件身份（0.11.0+）；历史版本返回写入当时的身份，旧版本可能为空 */
 	fileId?: string;
+	/** 加密元数据与其世代（0.12.0+，meta 模式） */
+	metaEnc?: string;
+	metaGeneration?: number;
 }
 
 /** 历史版本元数据（GET /api/v1/history）。 */
@@ -246,6 +257,8 @@ export class ApiClient {
 			size: num(header(res.headers, "x-file-size")),
 			mtime: num(header(res.headers, "x-file-mtime")),
 			fileId: header(res.headers, "x-file-id") || undefined,
+			metaEnc: header(res.headers, "x-meta-enc") || undefined,
+			metaGeneration: num(header(res.headers, "x-meta-generation")) || undefined,
 		};
 	}
 
@@ -257,6 +270,7 @@ export class ApiClient {
 		mtime: number,
 		action: UploadAction = "upsert",
 		fileId?: string,
+		meta?: { metaEnc: string; canonicalHash: string },
 	): Promise<UploadOk> {
 		const res = await requestUrl({
 			url: `${this.base()}/api/v1/file`,
@@ -269,6 +283,7 @@ export class ApiClient {
 				"X-File-Mtime": String(Math.round(mtime)),
 				"X-Action": action,
 				...(fileId ? { "X-File-Id": fileId } : {}),
+				...(meta ? { "X-Meta-Enc": meta.metaEnc, "X-Canonical-Hash": meta.canonicalHash } : {}),
 			}),
 			body: data,
 			throw: false,
@@ -521,6 +536,77 @@ export class ApiClient {
 		if (res.status !== 200)
 			throw new ApiError(res.status, `move ${fromPath} -> ${toPath} failed: HTTP ${res.status}${serverErrText(res.text)}`);
 		return res.json as { revision: number; tombstoneRevision: number; sequence: number };
+	}
+
+	// ---------- 元数据加密（v9.3 三期，协议 v5） ----------
+
+	/** 轻量获取文件元数据（改名变更无需下载内容）。 */
+	async getFileMeta(
+		path: string,
+	): Promise<{ path: string; fileId: string; revision: number; metaEnc: string; metaGeneration: number }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/file/meta?path=${encodeURIComponent(path)}`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status === 404) throw new NotFoundError();
+		if (res.status !== 200) throw new ApiError(res.status, `meta get failed: HTTP ${res.status}`);
+		return res.json as { path: string; fileId: string; revision: number; metaEnc: string; metaGeneration: number };
+	}
+
+	/** 改名 = 元数据更新（metaGeneration CAS；412 = 并发改名需重取）。 */
+	async updateFileMeta(
+		path: string,
+		baseMetaGeneration: number,
+		metaEnc: string,
+		canonicalHash: string,
+	): Promise<{ revision: number; metaGeneration: number; sequence: number }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/file/meta`,
+			method: "PUT",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify({ path, baseMetaGeneration, metaEnc, canonicalHash }),
+			throw: false,
+		});
+		if (res.status === 409) throw new ConflictError(parseConflict(res.text, path));
+		if (res.status !== 200)
+			throw new ApiError(res.status, `meta update failed: HTTP ${res.status}${serverErrText(res.text)}`);
+		return res.json as { revision: number; metaGeneration: number; sequence: number };
+	}
+
+	/** 元数据迁移：单文件真实路径 → 伪名（断点续传安全）。 */
+	async migrateFileMeta(
+		fromPath: string,
+		metaEnc: string,
+		canonicalHash: string,
+	): Promise<{ fromPath: string; toPath: string; revision: number; sequence: number }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/meta/migrate`,
+			method: "POST",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify({ fromPath, metaEnc, canonicalHash }),
+			throw: false,
+		});
+		if (res.status !== 200)
+			throw new ApiError(res.status, `meta migrate failed: HTTP ${res.status}${serverErrText(res.text)}`);
+		return res.json as { fromPath: string; toPath: string; revision: number; sequence: number };
+	}
+
+	/** 元数据加密状态机；complete 是明文路径抹除的单向点（必须显式确认）。 */
+	async metaTransition(action: "begin" | "abort"): Promise<{ metaState: string }>;
+	async metaTransition(action: "complete", confirmErase: true): Promise<{ metaState: string }>;
+	async metaTransition(action: "begin" | "complete" | "abort", confirmErase?: boolean): Promise<{ metaState: string }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/meta/${action}`,
+			method: "POST",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: action === "complete" ? JSON.stringify({ confirmErase: confirmErase === true }) : "{}",
+			throw: false,
+		});
+		if (res.status !== 200)
+			throw new ApiError(res.status, `meta ${action} failed: HTTP ${res.status}${serverErrText(res.text)}`);
+		return res.json as { metaState: string };
 	}
 
 	async remove(path: string, baseRevision: number): Promise<void> {

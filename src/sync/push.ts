@@ -6,7 +6,15 @@ import { ensureParentFolder } from "../utils/path";
 import { attemptAutoMerge } from "./auto-merge";
 import { keepBothVersions } from "./conflict";
 import { SyncContext } from "./context";
-import { downloadPlain, uploadFromPlain, versionPlain } from "./transfer";
+import { canonicalPathHmac, encryptMeta } from "../crypto/crypto";
+import {
+	downloadPlain,
+	e2eeBinding,
+	metaEncrypted,
+	removeRemote,
+	uploadFromPlain,
+	versionPlain,
+} from "./transfer";
 
 export interface PushResult {
 	pushed: number;
@@ -157,6 +165,34 @@ async function pushMove(ctx: SyncContext, toPath: string, fromPath: string): Pro
 	const data = await adapter.readBinary(toPath);
 	const hash = await sha256Hex(data);
 	if (hash !== tracked.hash) return fallback(); // 改名后又编辑：内容需要正常上传
+
+	// meta 模式（v9.3 三期）：改名 = 元数据更新，内容与伪名完全不动
+	if (metaEncrypted(ctx)) {
+		if (!tracked.fileId || tracked.metaGeneration === undefined) return fallback();
+		const bind = e2eeBinding(ctx);
+		if (!bind) return fallback();
+		try {
+			const keys = await ctx.e2ee.metaKeys();
+			const newGen = tracked.metaGeneration + 1;
+			const metaEnc = await encryptMeta(
+				keys,
+				{ vaultId: bind.vaultId, keyEpoch: bind.keyEpoch, fileId: tracked.fileId, metaGeneration: newGen },
+				{ path: toPath },
+			);
+			const canonicalHash = await canonicalPathHmac(keys, toPath);
+			const out = await ctx.client.updateFileMeta(tracked.fileId, tracked.metaGeneration, metaEnc, canonicalHash);
+			ctx.store.delete(fromPath);
+			ctx.store.set(toPath, { ...tracked, mtime: stat.mtime, size: stat.size, metaGeneration: out.metaGeneration });
+			ctx.log(`push: meta-renamed ${fromPath} -> ${toPath} (metaGen ${out.metaGeneration})`);
+			return "pushed";
+		} catch (e) {
+			if (e instanceof ConflictError || e instanceof NotFoundError) return fallback();
+			if (e instanceof ApiError && (e.status === 400 || e.status === 404 || e.status === 412 || e.status === 422)) {
+				return fallback(); // 并发改名 CAS / 同名占用 / 旧服务器
+			}
+			throw e;
+		}
+	}
 
 	try {
 		const out = await ctx.client.move(fromPath, toPath, tracked.revision);
@@ -334,7 +370,7 @@ async function pushDelete(ctx: SyncContext, path: string): Promise<Outcome> {
 	if (await adapter.stat(path)) return "skipped"; // 文件又回来了（如撤销删除），交给 upsert 流程
 
 	try {
-		await ctx.client.remove(path, tracked.revision);
+		await removeRemote(ctx, path, tracked.revision);
 		ctx.store.delete(path);
 		ctx.log(`push: deleted ${path}`);
 		return "pushed";

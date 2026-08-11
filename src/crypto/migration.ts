@@ -8,16 +8,18 @@
  * - 绝不先删明文再传密文；只有密文下载回验（解密 + hash 一致）后才 purge
  * - 任何失败都可以重新执行（断点续传：已加密的文件跳过重传）
  */
-import { ConflictError, NotFoundError } from "../api/client";
+import { ApiError, ConflictError, NotFoundError } from "../api/client";
 import { SyncContext } from "../sync/context";
 import { e2eeBinding } from "../sync/transfer";
 import { sha256Hex } from "../utils/hash";
 import {
+	canonicalPathHmac,
 	createVaultKeyDoc,
 	decryptFile,
 	decryptFileV3,
 	encryptFile,
 	encryptFileV3,
+	encryptMeta,
 	FileKeyBinding,
 	isEncryptedPayload,
 	isLegacyEnvelope,
@@ -190,6 +192,74 @@ async function migratePath(
 		generation,
 	});
 	await ctx.client.purgeHistory(path, res.revision);
+}
+
+/**
+ * 元数据加密迁移（v9.3 三期，协议 v5）：把服务器上的明文路径全部替换为
+ * 伪名（=fileId）+ LSM1 加密元数据。内容零重新加密（LSE3 已把内容与路径解耦）。
+ *
+ * 红线：
+ * - 前置：E2EE 已启用且解锁、无待推送/未解决冲突、所有 HEAD 均为 LSE3
+ *  （否则服务器逐文件 409，提示先跑「升级加密信封」）
+ * - 断点续传：单文件失败可重新执行整个命令续传（migrate-file 幂等）
+ * - complete 是明文路径抹除的单向点：服务器验证全量伪名化后才执行，
+ *   并强制所有客户端下轮 snapshot 对账
+ */
+export async function encryptMetadata(
+	ctx: SyncContext,
+	onProgress: (p: MigrationProgress) => void,
+): Promise<{ migrated: number; total: number }> {
+	if (!ctx.e2ee.enabled) throw new Error("请先启用端到端加密");
+	const bind = e2eeBinding(ctx);
+	if (!bind) throw new Error("缺少 vaultId/keyEpoch 绑定材料，请先完成一次正常同步后重试");
+	if (ctx.queue.size > 0 || ctx.store.conflictPaths().length > 0) {
+		throw new Error("存在未完成的同步或未解决的冲突，请处理后重试");
+	}
+	const keys = await ctx.e2ee.metaKeys();
+
+	// 1. 进入 migrating（幂等；服务器要求 encryptionState=encrypted）
+	const st = await ctx.client.metaTransition("begin");
+	ctx.store.state.bootstrap.metaState = st.metaState;
+	await ctx.store.save();
+
+	// 2. 以服务器快照为权威清单逐文件迁移
+	const snap = await ctx.client.snapshot();
+	let migrated = 0;
+	let done = 0;
+	for (const f of snap.files) {
+		onProgress({ total: snap.files.length, done: done++, current: f.path });
+		if (f.fileId && f.path === f.fileId) continue; // 已迁移（断点续传）
+		if (!f.fileId) throw new Error(`服务器缺少 fileId：${f.path}（请先升级服务器到 0.12+）`);
+		const metaEnc = await encryptMeta(
+			keys,
+			{ vaultId: bind.vaultId, keyEpoch: bind.keyEpoch, fileId: f.fileId, metaGeneration: 1 },
+			{ path: f.path },
+		);
+		const canonicalHash = await canonicalPathHmac(keys, f.path);
+		let res;
+		try {
+			res = await ctx.client.migrateFileMeta(f.path, metaEnc, canonicalHash);
+		} catch (e) {
+			if (e instanceof ApiError && e.status === 409 && e.message.includes("LSE3")) {
+				throw new Error(`存在旧信封密文（${f.path}），请先执行「升级加密信封 LSE1 → LSE3」后重试`);
+			}
+			throw e;
+		}
+		const tracked = ctx.store.get(f.path);
+		if (tracked) {
+			ctx.store.set(f.path, { ...tracked, fileId: f.fileId, revision: res.revision, metaGeneration: 1 });
+		}
+		migrated++;
+		if (migrated % 10 === 0) await ctx.store.save();
+	}
+	await ctx.store.save();
+
+	// 3. 明文路径抹除（单向点；服务器再次验证全量伪名化）
+	const final = await ctx.client.metaTransition("complete", true);
+	ctx.store.state.bootstrap.metaState = final.metaState;
+	await ctx.store.save();
+	ctx.log(`meta encryption complete: ${migrated} migrated, plaintext paths erased`);
+	return { migrated, total: snap.files.length };
 }
 
 /** 统一解密：LSE3（需 fileId）与 LSE1/LSE2 兼容。 */

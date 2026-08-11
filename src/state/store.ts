@@ -24,6 +24,8 @@ export interface FileState {
 	 * HEAD 下载解出的 generation 低于此值 = 恶意服务器把旧版本当最新 → 拒绝
 	 */
 	generation?: number;
+	/** 元数据世代（v9.3 三期，meta 模式）：改名 = 世代 +1 */
+	metaGeneration?: number;
 }
 
 /** 未解决冲突的登记信息（计划书 Phase 15：Pending Conflict）。 */
@@ -214,6 +216,14 @@ export class StateStore {
 
 	paths(): string[] {
 		return Object.keys(this.state.files);
+	}
+
+	/** 按稳定文件身份反查本地路径（meta 模式伪名解析用）。 */
+	pathByFileId(fileId: string): string | undefined {
+		for (const [path, fs] of Object.entries(this.state.files)) {
+			if (fs.fileId === fileId) return path;
+		}
+		return undefined;
 	}
 
 	getConflict(path: string): PendingConflict | undefined {

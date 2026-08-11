@@ -11,7 +11,7 @@ import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
 import { keepBothVersions } from "../sync/conflict";
 import { SyncContext } from "../sync/context";
-import { trashLocal } from "../sync/pull";
+import { resolveSnapshotPaths, trashLocal } from "../sync/pull";
 import { isStaleResurrection } from "../sync/push";
 import { downloadPlain, uploadFromPlain } from "../sync/transfer";
 
@@ -40,7 +40,13 @@ export async function preflight(ctx: SyncContext): Promise<PreflightResult> {
 	const info = await ctx.client.info();
 	await ctx.refreshE2ee();
 	const snap = await ctx.client.snapshot();
-	const remoteFiles = snap.files.filter((f) => !ctx.ignores(f.path));
+	// meta 模式（v9.3 三期）：快照条目是伪名 + 加密元数据。已解锁则立即解出
+	// 真实路径；未解锁保留伪名（向导会先走解锁门，执行器再兜底解一次）
+	let files = snap.files;
+	if (files.some((f) => f.metaEnc) && ctx.e2ee.unlocked) {
+		files = await resolveSnapshotPaths(ctx, files);
+	}
+	const remoteFiles = files.filter((f) => !ctx.ignores(f.path));
 
 	const localPaths: string[] = [];
 	for (const file of ctx.app.vault.getFiles()) {
@@ -57,6 +63,19 @@ export async function preflight(ctx: SyncContext): Promise<PreflightResult> {
 		localPaths,
 		commonCount,
 		e2eeEnabled: ctx.e2ee.enabled,
+	};
+}
+
+/** 执行器兜底：确保快照路径已解密（向导解锁后调用执行器时可能仍持伪名清单）。 */
+async function ensureResolvedPre(ctx: SyncContext, pre: PreflightResult): Promise<PreflightResult> {
+	if (!pre.remoteFiles.some((f) => f.metaEnc && f.path === f.fileId)) return pre;
+	const files = await resolveSnapshotPaths(ctx, pre.remoteFiles);
+	const remoteFiles = files.filter((f) => !ctx.ignores(f.path));
+	const remoteSet = new Set(remoteFiles.map((f) => f.path));
+	return {
+		...pre,
+		remoteFiles,
+		commonCount: pre.localPaths.filter((p) => remoteSet.has(p)).length,
 	};
 }
 
@@ -81,6 +100,7 @@ export async function bootstrapRemoteWins(
 	pre: PreflightResult,
 	onProgress: OnProgress,
 ): Promise<void> {
+	pre = await ensureResolvedPre(ctx, pre);
 	const adapter = ctx.app.vault.adapter;
 	const remoteSet = new Set(pre.remoteFiles.map((f) => f.path));
 	const total = pre.remoteFiles.length + pre.localPaths.filter((p) => !remoteSet.has(p)).length;
@@ -89,7 +109,7 @@ export async function bootstrapRemoteWins(
 	let blocked = 0;
 	for (const f of pre.remoteFiles) {
 		onProgress({ done: ++done, total, current: f.path });
-		const dl = await downloadPlain(ctx, f.path);
+		const dl = await downloadPlain(ctx, f.path, serverPseudonymOf(f));
 		const stat = await adapter.stat(f.path);
 		if (stat) {
 			const localData = await adapter.readBinary(f.path);
@@ -167,6 +187,7 @@ export async function bootstrapMerge(
 	pre: PreflightResult,
 	onProgress: OnProgress,
 ): Promise<MergeResult> {
+	pre = await ensureResolvedPre(ctx, pre);
 	const adapter = ctx.app.vault.adapter;
 	const remoteSet = new Set(pre.remoteFiles.map((f) => f.path));
 	const localOnly = pre.localPaths.filter((p) => !remoteSet.has(p));
@@ -178,7 +199,7 @@ export async function bootstrapMerge(
 		onProgress({ done: ++done, total, current: f.path });
 		const stat = await adapter.stat(f.path);
 		if (!stat) {
-			const dl = await downloadPlain(ctx, f.path);
+			const dl = await downloadPlain(ctx, f.path, serverPseudonymOf(f));
 			await ensureParentFolder(adapter, f.path);
 			await adapter.writeBinary(f.path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
 			const st = await adapter.stat(f.path);
@@ -196,7 +217,7 @@ export async function bootstrapMerge(
 		}
 		const localData = await adapter.readBinary(f.path);
 		const localHash = await sha256Hex(localData);
-		const dl = await downloadPlain(ctx, f.path);
+		const dl = await downloadPlain(ctx, f.path, serverPseudonymOf(f));
 		if (localHash === dl.plainHash) {
 			ctx.store.set(f.path, {
 				hash: localHash,
@@ -266,6 +287,11 @@ export async function bootstrapMerge(
 		`bootstrap: merge (down=${result.downloaded} up=${result.uploaded} conflicts=${result.conflicts})`,
 	);
 	return result;
+}
+
+/** meta 模式下条目的服务器伪名（解密后 path 为真实路径，伪名在 fileId）。 */
+function serverPseudonymOf(f: SnapshotFile): string | undefined {
+	return f.metaEnc && f.fileId ? f.fileId : undefined;
 }
 
 /** 与三方合并引擎一致的“可文本合并”判定：仅 Markdown / 纯文本。 */

@@ -14,8 +14,10 @@ export interface BootstrapState {
 	 * 客户端发现变化即停止增量同步进入恢复合并（本地新内容绝不丢）
 	 */
 	repoEpoch?: string;
-	/** E2EE 密钥世代（v9.2）：LSE2 信封的 AAD 绑定材料，随 /info 同步 */
+	/** E2EE 密钥世代（v9.2）：LSE2/LSE3 信封的 AAD 绑定材料，随 /info 同步 */
 	keyEpoch?: number;
+	/** 元数据加密状态（v9.3 三期）：plain / migrating / encrypted，随 /info 同步 */
+	metaState?: string;
 	mode?: BootstrapMode;
 	snapshotSequence?: number;
 	completedAt?: number;

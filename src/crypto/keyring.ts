@@ -1,4 +1,4 @@
-import { importVmk, unlockVaultKey, VaultKeyDoc } from "./crypto";
+import { deriveMetaKeys, exportVmkRaw, importVmk, MetaKeys, unlockVaultKey, VaultKeyDoc } from "./crypto";
 
 /** 同步遇到密文但密钥未解锁时抛出；同步暂停，本地编辑不受影响。 */
 export class E2eeLockedError extends Error {
@@ -15,6 +15,7 @@ export class E2eeLockedError extends Error {
 export class Keyring {
 	private vmk: CryptoKey | null = null;
 	private currentDoc: VaultKeyDoc | null = null;
+	private cachedMetaKeys: MetaKeys | null = null;
 
 	get doc(): VaultKeyDoc | null {
 		return this.currentDoc;
@@ -40,13 +41,17 @@ export class Keyring {
 			doc.wrappedKey === this.currentDoc.wrappedKey &&
 			doc.salt === this.currentDoc.salt;
 		this.currentDoc = doc;
-		if (!sameKeyMaterial) this.vmk = null;
+		if (!sameKeyMaterial) {
+			this.vmk = null;
+			this.cachedMetaKeys = null;
+		}
 	}
 
 	/** 迁移流程中直接采用已解锁的密钥。 */
 	adopt(doc: VaultKeyDoc, vmk: CryptoKey): void {
 		this.currentDoc = doc;
 		this.vmk = vmk;
+		this.cachedMetaKeys = null;
 	}
 
 	async unlock(password: string): Promise<boolean> {
@@ -54,20 +59,39 @@ export class Keyring {
 		const key = await unlockVaultKey(this.currentDoc, password);
 		if (!key) return false;
 		this.vmk = key;
+		this.cachedMetaKeys = null;
 		return true;
 	}
 
 	/** 用 Trusted Device 恢复的原始 VMK 解锁（raw 由调用方负责清零）。 */
 	async unlockWithRaw(raw: Uint8Array): Promise<void> {
 		this.vmk = await importVmk(raw);
+		this.cachedMetaKeys = null;
 	}
 
 	lock(): void {
 		this.vmk = null;
+		this.cachedMetaKeys = null;
 	}
 
 	requireKey(): CryptoKey {
 		if (!this.vmk) throw new E2eeLockedError();
 		return this.vmk;
+	}
+
+	/**
+	 * 元数据密钥（v9.3 三期）：HKDF 从 VMK 派生，懒加载缓存。
+	 * VMK 原始字节仅在派生瞬间存在，用完立即清零。
+	 */
+	async metaKeys(): Promise<MetaKeys> {
+		if (!this.vmk) throw new E2eeLockedError();
+		if (this.cachedMetaKeys) return this.cachedMetaKeys;
+		const raw = await exportVmkRaw(this.vmk);
+		try {
+			this.cachedMetaKeys = await deriveMetaKeys(raw);
+		} finally {
+			raw.fill(0);
+		}
+		return this.cachedMetaKeys;
 	}
 }
