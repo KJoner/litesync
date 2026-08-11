@@ -1,4 +1,5 @@
 import { App, Modal, Notice, ObsidianProtocolData } from "obsidian";
+import { enrollDevice } from "../api/client";
 import type PrivateSyncPlugin from "../main";
 import {
 	b64urlDecode,
@@ -68,7 +69,17 @@ async function applyPairingConfig(plugin: PrivateSyncPlugin, config: PairingConf
 	}
 	if (typeof config.syncObsidian === "boolean") plugin.settings.syncObsidian = config.syncObsidian;
 	if (typeof config.ignorePatterns === "string") plugin.settings.ignorePatterns = config.ignorePatterns;
-	await plugin.setApiToken(config.apiToken);
+
+	if (config.v === 2 && config.enrollmentSecret) {
+		// v2（v9.2）：用一次性注册凭据换取本设备专属凭据——根 Token 不经过新设备
+		const cred = await enrollDevice(url, config.enrollmentSecret, plugin.settings.deviceName || "New device");
+		await plugin.setApiToken(cred.deviceToken);
+	} else if (config.apiToken) {
+		// v1（0.8.x 旧包）：先存根 Token，首轮同步会自动换发设备凭据
+		await plugin.setApiToken(config.apiToken);
+	} else {
+		throw new Error("配对包缺少凭据字段");
+	}
 	await plugin.saveSettings();
 	plugin.applySettings();
 	// 换了服务器 = 新的接入关系：重置为待接入

@@ -1,4 +1,5 @@
 import { App, Notice, Platform, PluginSettingTab, SettingDefinitionItem } from "obsidian";
+import { isLoopbackUrl } from "./api/client";
 import type PrivateSyncPlugin from "./main";
 
 export interface PluginSettings {
@@ -223,7 +224,15 @@ export class SyncSettingTab extends PluginSettingTab {
 	async setControlValue(key: string, value: unknown): Promise<void> {
 		const settings = this.plugin.settings as unknown as Record<string, unknown>;
 		switch (key) {
-			case "serverUrl":
+			case "serverUrl": {
+				const url = String(value).trim();
+				settings[key] = url;
+				// 即时提示（v9.2）：非本机的 http:// 会在同步时被硬性拒绝（Token 明文暴露）
+				if (/^http:\/\//i.test(url) && !isLoopbackUrl(url)) {
+					new Notice("注意：非本机地址必须使用 https://，当前 http:// 配置将无法同步", 8000);
+				}
+				break;
+			}
 			case "deviceName":
 				settings[key] = String(value).trim();
 				break;

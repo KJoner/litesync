@@ -62,7 +62,7 @@ export async function preflight(ctx: SyncContext): Promise<PreflightResult> {
 
 function completeBootstrap(ctx: SyncContext, pre: PreflightResult, mode: "remote-wins" | "merge" | "local-init"): void {
 	ctx.store.state.lastSequence = pre.snapshotSequence;
-	ctx.store.completeBootstrap(mode, pre.info.vaultId, pre.snapshotSequence, pre.repoEpoch);
+	ctx.store.completeBootstrap(mode, pre.info.vaultId, pre.snapshotSequence, pre.repoEpoch, pre.info.keyEpoch);
 }
 
 /** 本地初始化远端（远端为空）：标记就绪后由普通同步把本地文件全部推上去。 */

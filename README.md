@@ -78,8 +78,14 @@ is ever silently overwritten, and nothing is ever permanently deleted.
 - When end-to-end encryption is enabled, note contents are encrypted with
   AES-256-GCM **before leaving the device**; the server only stores
   ciphertext and cannot read your notes.
+- Each device holds its own least-privilege credential (v0.10): the root
+  server token is exchanged for a per-device token on first sync and never
+  stays on devices afterwards. A lost device can be revoked individually on
+  the server without rotating anything else.
 - The API token is stored in Obsidian's SecretStorage (never in plain-text
   `data.json`).
+- Non-loopback `http://` server URLs are rejected — credentials and notes
+  never travel over plain HTTP.
 - As a sync plugin, LiteSync enumerates the files in your vault to determine
   what needs syncing. File paths and contents go only to your own configured
   server, nowhere else.
@@ -87,9 +93,9 @@ is ever silently overwritten, and nothing is ever permanently deleted.
   "Copy link" for an encrypted share or a device-pairing link. LiteSync never
   reads the clipboard.
 - Device pairing never transmits your E2EE password. The pairing package
-  (server URL, API token, sync settings) is encrypted on-device; the
-  decryption key lives only in the link's `#fragment`, which browsers do not
-  send to servers.
+  (server URL, a one-time enrollment secret, sync settings — **not** the
+  root token as of v0.10) is encrypted on-device; the decryption key lives
+  only in the link's `#fragment`, which browsers do not send to servers.
 - The server component is a separate open-source project:
   <https://github.com/KJoner/litesync-server>
 

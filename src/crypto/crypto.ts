@@ -1,19 +1,31 @@
 /**
- * E2EE 密码学原语（计划书 Phase 12）。
+ * E2EE 密码学原语（计划书 Phase 12；v9.2 增加 LSE2 信封）。
  *
  * 全部基于 WebCrypto 的成熟 authenticated-encryption 实现，禁止自造算法：
  * - 密码 → PBKDF2-SHA256（600k 迭代）→ KEK
  * - 随机 32 字节 Vault Master Key（VMK），用 KEK 以 AES-256-GCM 包裹后存服务器
- * - 文件加密：AES-256-GCM，每次随机 12 字节 IV，路径绑定进 AAD（防内容串换）
+ * - 文件加密：AES-256-GCM，每次随机 12 字节 IV
  *
- * 加密文件格式（LiteSync Encrypted v1）：
- *   "LSE1"(4B) | iv(12B) | ciphertext+tag
+ * 加密文件格式：
+ *   LSE1（v1，读取兼容）："LSE1"(4B) | iv(12B) | ct+tag，AAD 只绑定 path
+ *   LSE2（v9.2，写入默认）："LSE2"(4B) | keyEpoch(u32 BE) | iv(12B) | ct+tag，
+ *     AAD 绑定 vaultId + keyEpoch + path——恶意服务器无法用其他 vault /
+ *     其他密钥世代的密文对同一路径做替换重放（同 vault 同 epoch 的
+ *     历史版本重放仍需签名 manifest 才能防住，见三阶段计划）
  */
 
 export const KDF_ITERATIONS = 600_000;
 
 const MAGIC = new Uint8Array([0x4c, 0x53, 0x45, 0x31]); // "LSE1"
+const MAGIC2 = new Uint8Array([0x4c, 0x53, 0x45, 0x32]); // "LSE2"
 const IV_LEN = 12;
+const EPOCH_LEN = 4;
+
+/** LSE2 的 AAD 绑定材料（vaultId 来自 bootstrap，keyEpoch 来自服务器状态机）。 */
+export interface FileKeyBinding {
+	vaultId: string;
+	keyEpoch: number;
+}
 
 /** 存服务器 / 本地缓存的 vault key 文档（不含任何明文密钥材料）。 */
 export interface VaultKeyDoc {
@@ -31,6 +43,10 @@ const VMK_AAD = new TextEncoder().encode("litesync/v1/vault-key");
 
 function fileAad(path: string): Uint8Array {
 	return new TextEncoder().encode(`litesync/v1/file:${path}`);
+}
+
+function fileAadV2(binding: FileKeyBinding, path: string): Uint8Array {
+	return new TextEncoder().encode(`litesync/v2/file:${binding.vaultId}:${binding.keyEpoch}:${path}`);
 }
 
 export function randomBytes(n: number): Uint8Array {
@@ -187,40 +203,98 @@ export function b64urlEncode(bytes: Uint8Array): string {
 	return b64encode(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-/** 判断字节流是否为 LiteSync 加密格式。 */
-export function isEncryptedPayload(data: ArrayBuffer): boolean {
-	if (data.byteLength < MAGIC.length + IV_LEN + 16) return false;
-	const head = new Uint8Array(data, 0, MAGIC.length);
-	for (let i = 0; i < MAGIC.length; i++) {
-		if (head[i] !== MAGIC[i]) return false;
+function hasMagic(data: ArrayBuffer, magic: Uint8Array, minTail: number): boolean {
+	if (data.byteLength < magic.length + minTail) return false;
+	const head = new Uint8Array(data, 0, magic.length);
+	for (let i = 0; i < magic.length; i++) {
+		if (head[i] !== magic[i]) return false;
 	}
 	return true;
 }
 
-/** 加密文件内容（每次随机 IV，路径作为 AAD 绑定）。 */
-export async function encryptFile(vmk: CryptoKey, path: string, plaintext: ArrayBuffer): Promise<ArrayBuffer> {
+/** 判断字节流是否为 LiteSync 加密格式（LSE1 或 LSE2）。 */
+export function isEncryptedPayload(data: ArrayBuffer): boolean {
+	return hasMagic(data, MAGIC, IV_LEN + 16) || hasMagic(data, MAGIC2, EPOCH_LEN + IV_LEN + 16);
+}
+
+/** 是否为旧版 LSE1 信封（「升级加密信封」命令用）。 */
+export function isLegacyEnvelope(data: ArrayBuffer): boolean {
+	return hasMagic(data, MAGIC, IV_LEN + 16);
+}
+
+/**
+ * 加密文件内容（每次随机 IV）。
+ * 提供 binding 时输出 LSE2（AAD 绑定 vaultId+keyEpoch+path）；
+ * 不提供时输出兼容的 LSE1（仅路径绑定；用于 binding 尚不可知的过渡场景）。
+ */
+export async function encryptFile(
+	vmk: CryptoKey,
+	path: string,
+	plaintext: ArrayBuffer,
+	binding?: FileKeyBinding,
+): Promise<ArrayBuffer> {
 	const iv = randomBytes(IV_LEN);
+	if (!binding) {
+		const ct = new Uint8Array(
+			await crypto.subtle.encrypt(
+				{ name: "AES-GCM", iv: iv as BufferSource, additionalData: fileAad(path) as BufferSource },
+				vmk,
+				plaintext,
+			),
+		);
+		const out = new Uint8Array(MAGIC.length + IV_LEN + ct.length);
+		out.set(MAGIC, 0);
+		out.set(iv, MAGIC.length);
+		out.set(ct, MAGIC.length + IV_LEN);
+		return out.buffer;
+	}
 	const ct = new Uint8Array(
 		await crypto.subtle.encrypt(
-			{ name: "AES-GCM", iv: iv as BufferSource, additionalData: fileAad(path) as BufferSource },
+			{ name: "AES-GCM", iv: iv as BufferSource, additionalData: fileAadV2(binding, path) as BufferSource },
 			vmk,
 			plaintext,
 		),
 	);
-	const out = new Uint8Array(MAGIC.length + IV_LEN + ct.length);
-	out.set(MAGIC, 0);
-	out.set(iv, MAGIC.length);
-	out.set(ct, MAGIC.length + IV_LEN);
+	const out = new Uint8Array(MAGIC2.length + EPOCH_LEN + IV_LEN + ct.length);
+	out.set(MAGIC2, 0);
+	new DataView(out.buffer).setUint32(MAGIC2.length, binding.keyEpoch >>> 0, false);
+	out.set(iv, MAGIC2.length + EPOCH_LEN);
+	out.set(ct, MAGIC2.length + EPOCH_LEN + IV_LEN);
 	return out.buffer;
 }
 
-/** 解密文件内容；密钥不符 / 数据被篡改 / 路径不匹配（AAD 校验失败）返回 null。 */
+/**
+ * 解密文件内容；密钥不符 / 数据被篡改 / AAD 不匹配返回 null。
+ * LSE2 要求 binding（vaultId 必需；binding.keyEpoch > 0 时还校验信封内的
+ * epoch 与之一致，拒绝其他密钥世代的密文重放）。
+ */
 export async function decryptFile(
 	vmk: CryptoKey,
 	path: string,
 	payload: ArrayBuffer,
+	binding?: FileKeyBinding,
 ): Promise<ArrayBuffer | null> {
-	if (!isEncryptedPayload(payload)) return null;
+	if (hasMagic(payload, MAGIC2, EPOCH_LEN + IV_LEN + 16)) {
+		if (!binding?.vaultId) return null; // 无法建立 AAD → 拒绝
+		const envelopeEpoch = new DataView(payload).getUint32(MAGIC2.length, false);
+		if (binding.keyEpoch > 0 && envelopeEpoch !== binding.keyEpoch) return null;
+		try {
+			const iv = new Uint8Array(payload, MAGIC2.length + EPOCH_LEN, IV_LEN);
+			const ct = new Uint8Array(payload, MAGIC2.length + EPOCH_LEN + IV_LEN);
+			return await crypto.subtle.decrypt(
+				{
+					name: "AES-GCM",
+					iv: iv as BufferSource,
+					additionalData: fileAadV2({ vaultId: binding.vaultId, keyEpoch: envelopeEpoch }, path) as BufferSource,
+				},
+				vmk,
+				ct,
+			);
+		} catch {
+			return null;
+		}
+	}
+	if (!hasMagic(payload, MAGIC, IV_LEN + 16)) return null;
 	try {
 		const iv = new Uint8Array(payload, MAGIC.length, IV_LEN);
 		const ct = new Uint8Array(payload, MAGIC.length + IV_LEN);

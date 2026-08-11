@@ -6,11 +6,24 @@
  * - 上传：E2EE 启用时加密 → 以密文 hash 上传（服务器只见 opaque bytes）
  */
 import { DownloadResult, UploadAction } from "../api/client";
-import { decryptFile, encryptFile, isEncryptedPayload } from "../crypto/crypto";
+import { decryptFile, encryptFile, FileKeyBinding, isEncryptedPayload } from "../crypto/crypto";
 import { E2eeLockedError } from "../crypto/keyring";
 import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
 import { SyncContext } from "./context";
+
+/**
+ * LSE2 信封的 AAD 绑定材料（v9.2）：vaultId 来自 bootstrap，keyEpoch 来自
+ * 服务器状态机（协议检查时同步）。任一缺失（如 v0.9 升级后的首轮）返回
+ * undefined → 加密回退 LSE1，下一轮补齐后自动切 LSE2。
+ */
+export function e2eeBinding(ctx: SyncContext): FileKeyBinding | undefined {
+	const b = ctx.store.state.bootstrap;
+	if (b.remoteVaultId && (b.keyEpoch ?? 0) > 0) {
+		return { vaultId: b.remoteVaultId, keyEpoch: b.keyEpoch! };
+	}
+	return undefined;
+}
 
 export interface PlainDownload {
 	/** 解密后的明文内容 */
@@ -31,8 +44,8 @@ async function decode(ctx: SyncContext, path: string, dl: DownloadResult): Promi
 	if (isEncryptedPayload(dl.data)) {
 		// 遇到密文但本设备未解锁 → 暂停同步，绝不把密文当明文写入 Vault
 		if (!ctx.e2ee.unlocked) throw new E2eeLockedError();
-		const dec = await decryptFile(ctx.e2ee.requireKey(), path, dl.data);
-		if (dec === null) throw new Error(`无法解密 ${path}（密钥不匹配或数据被篡改）`);
+		const dec = await decryptFile(ctx.e2ee.requireKey(), path, dl.data, e2eeBinding(ctx));
+		if (dec === null) throw new Error(`无法解密 ${path}（密钥不匹配、数据被篡改或密钥世代不符）`);
 		plain = dec;
 	} else if (ctx.e2ee.enabled) {
 		// 加密降级防护（v9）：E2EE 已启用时服务器绝不应返回明文——
@@ -92,7 +105,7 @@ export async function uploadFromPlain(
 ): Promise<UploadOutcome> {
 	let payload = plain;
 	if (ctx.e2ee.enabled) {
-		payload = await encryptFile(ctx.e2ee.requireKey(), path, plain);
+		payload = await encryptFile(ctx.e2ee.requireKey(), path, plain, e2eeBinding(ctx));
 	}
 	const cipherHash = await sha256Hex(payload);
 	const res = await ctx.client.upload(path, baseRevision, cipherHash, payload, mtime, action);

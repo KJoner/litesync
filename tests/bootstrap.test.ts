@@ -100,6 +100,25 @@ test("pairing: 配对包加解密往返；错误密钥与篡改均失败", async
 	assert.equal(await decryptPairingConfig(secret, tampered), null);
 });
 
+test("pairing v2（v9.2）：只携带一次性注册凭据，不含任何根 Token", async () => {
+	const config: PairingConfig = {
+		v: 2,
+		serverUrl: "https://sync.example.com",
+		enrollmentSecret: "enrollment-secret-0123456789abcdef",
+		syncIntervalSeconds: 120,
+	};
+	const secret = newPairSecret();
+	const ct = await encryptPairingConfig(secret, config);
+	const back = await decryptPairingConfig(secret, ct);
+	assert.deepEqual(back, config);
+
+	// 校验规则：v2 必须有 enrollmentSecret；v1 必须有 apiToken；混搭无效字段拒绝
+	const bad1 = await encryptPairingConfig(secret, { v: 2, serverUrl: "https://x" } as PairingConfig);
+	assert.equal(await decryptPairingConfig(secret, bad1), null);
+	const bad2 = await encryptPairingConfig(secret, { v: 1, serverUrl: "https://x" } as PairingConfig);
+	assert.equal(await decryptPairingConfig(secret, bad2), null);
+});
+
 test("pairing: 配对链接构造/解析往返；secret 只在 fragment", () => {
 	const secret = newPairSecret();
 	const id = "0123456789abcdef0123456789abcdef";

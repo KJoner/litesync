@@ -11,6 +11,7 @@ import {
 	encryptFile,
 	encryptShare,
 	isEncryptedPayload,
+	isLegacyEnvelope,
 	randomBytes,
 	unlockVaultKey,
 } from "../src/crypto/crypto";
@@ -97,6 +98,58 @@ test("二进制内容加密往返", async () => {
 	const payload = await encryptFile(vmk, "img.png", plain.buffer as ArrayBuffer);
 	const dec = await decryptFile(vmk, "img.png", payload);
 	assert.deepEqual(new Uint8Array(dec!), plain);
+});
+
+// ---------- LSE2 信封（v9.2） ----------
+
+const BINDING = { vaultId: "aabbccdd00112233", keyEpoch: 1 };
+
+test("LSE2: 往返一致，magic 正确，可被识别为加密格式", async () => {
+	const { vmk } = await createVaultKeyDoc("pw-lse2");
+	const plain = buf("# LSE2 内容\n中英混排 test.\n");
+	const payload = await encryptFile(vmk, "Notes/n.md", plain, BINDING);
+	assert.equal(isEncryptedPayload(payload), true);
+	assert.equal(isLegacyEnvelope(payload), false);
+	assert.deepEqual(Array.from(new Uint8Array(payload, 0, 4)), [0x4c, 0x53, 0x45, 0x32]); // "LSE2"
+
+	const dec = await decryptFile(vmk, "Notes/n.md", payload, BINDING);
+	assert.notEqual(dec, null);
+	assert.equal(new TextDecoder().decode(dec!), new TextDecoder().decode(plain));
+});
+
+test("LSE2: AAD 绑定 vaultId → 其他 vault 的密文重放被拒绝", async () => {
+	const { vmk } = await createVaultKeyDoc("pw");
+	const payload = await encryptFile(vmk, "a.md", buf("secret"), BINDING);
+	assert.equal(await decryptFile(vmk, "a.md", payload, { ...BINDING, vaultId: "other-vault" }), null);
+	// 无 binding（无法建立 AAD）→ 拒绝
+	assert.equal(await decryptFile(vmk, "a.md", payload), null);
+});
+
+test("LSE2: keyEpoch 绑定 → 其他密钥世代的密文重放被拒绝", async () => {
+	const { vmk } = await createVaultKeyDoc("pw");
+	const old = await encryptFile(vmk, "a.md", buf("epoch-1 content"), { ...BINDING, keyEpoch: 1 });
+	// 当前世代已是 2：信封头写着 1 → 直接拒绝（不做解密尝试）
+	assert.equal(await decryptFile(vmk, "a.md", old, { ...BINDING, keyEpoch: 2 }), null);
+	// 世代未知（0/未采纳）时按信封头解（升级过渡期）
+	assert.notEqual(await decryptFile(vmk, "a.md", old, { ...BINDING, keyEpoch: 0 }), null);
+});
+
+test("LSE2: 路径 AAD 绑定与篡改检测仍然生效", async () => {
+	const { vmk } = await createVaultKeyDoc("pw");
+	const payload = await encryptFile(vmk, "Notes/A.md", buf("secret A"), BINDING);
+	assert.equal(await decryptFile(vmk, "Notes/B.md", payload, BINDING), null);
+	const tampered = new Uint8Array(payload.slice(0));
+	tampered[tampered.length - 1] ^= 0x01;
+	assert.equal(await decryptFile(vmk, "Notes/A.md", tampered.buffer, BINDING), null);
+});
+
+test("LSE1 兼容：旧信封仍可解密（升级过渡），isLegacyEnvelope 可区分", async () => {
+	const { vmk } = await createVaultKeyDoc("pw");
+	const legacy = await encryptFile(vmk, "old.md", buf("legacy content")); // 无 binding → LSE1
+	assert.equal(isLegacyEnvelope(legacy), true);
+	// 带 binding 的解密调用也能解 LSE1（读取兼容）
+	const dec = await decryptFile(vmk, "old.md", legacy, BINDING);
+	assert.equal(new TextDecoder().decode(dec!), "legacy content");
 });
 
 // ---------- 分享加密（Phase 17：独立 Share Key） ----------

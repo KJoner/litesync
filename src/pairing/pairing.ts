@@ -12,11 +12,19 @@
 import { requestUrl } from "obsidian";
 import { b64decode, b64encode, b64urlEncode, randomBytes } from "../crypto/crypto";
 
-/** 配对包内容（v1）。 */
+/**
+ * 配对包内容。
+ * v1（0.8.x，导入兼容）：直接携带根 apiToken；
+ * v2（0.10+，创建默认）：只携带一次性 enrollmentSecret——新设备用它公开注册
+ * 换取自己的最小权限设备凭据，根 Token 从此不再离开服务器。
+ */
 export interface PairingConfig {
-	v: 1;
+	v: 1 | 2;
 	serverUrl: string;
-	apiToken: string;
+	/** v1：根 API Token（旧包导入后首轮同步会自动换发设备凭据） */
+	apiToken?: string;
+	/** v2：一次性设备注册凭据 */
+	enrollmentSecret?: string;
 	syncIntervalSeconds?: number;
 	syncObsidian?: boolean;
 	ignorePatterns?: string;
@@ -74,10 +82,10 @@ export async function decryptPairingConfig(
 			raw.slice(12),
 		);
 		const config = JSON.parse(new TextDecoder().decode(plain)) as PairingConfig;
-		if (config.v !== 1 || typeof config.serverUrl !== "string" || typeof config.apiToken !== "string") {
-			return null;
-		}
-		return config;
+		if (typeof config.serverUrl !== "string") return null;
+		if (config.v === 1 && typeof config.apiToken === "string") return config;
+		if (config.v === 2 && typeof config.enrollmentSecret === "string") return config;
+		return null;
 	} catch {
 		return null;
 	}

@@ -27,6 +27,7 @@ export class SyncManager {
 	private protocolOk = false;
 	private protocolWarned = false;
 	private stateCorruptWarned = false;
+	private credentialChecked = false;
 
 	constructor(private ctx: SyncContext) {}
 
@@ -117,11 +118,26 @@ export class SyncManager {
 					this.onStatus("offline", msg);
 					return;
 				}
-				// v0.8 升级设备第一次见到 epoch：补记录
+				// v0.8 升级设备第一次见到 epoch / vaultId：补记录（首见即固定身份）
+				let adopted = false;
 				if (!savedEpoch && info.repoEpoch && this.ctx.store.bootstrapReady) {
 					this.ctx.store.state.bootstrap.repoEpoch = info.repoEpoch;
-					await this.ctx.store.save();
+					adopted = true;
 				}
+				if (!saved && info.vaultId && this.ctx.store.bootstrapReady) {
+					this.ctx.store.state.bootstrap.remoteVaultId = info.vaultId;
+					adopted = true;
+				}
+				// E2EE 密钥世代（v9.2）：LSE2 信封的 AAD 绑定材料，跟随服务器状态机
+				if (info.keyEpoch !== undefined && this.ctx.store.state.bootstrap.keyEpoch !== info.keyEpoch) {
+					this.ctx.store.state.bootstrap.keyEpoch = info.keyEpoch;
+					adopted = true;
+				}
+				if (adopted) await this.ctx.store.save();
+
+				// 设备级凭据（v9.2）：仍在用根 Token 时自动换发本设备专属凭据，
+				// 根 Token 从此不再存在于任何设备（丢失设备可单独撤销）
+				await this.ensureDeviceCredential();
 				this.protocolOk = true;
 			}
 
@@ -178,6 +194,23 @@ export class SyncManager {
 				this.runAgain = false;
 				void this.sync("follow-up");
 			}
+		}
+	}
+
+	/** 根 Token → 设备凭据自动换发（失败不阻塞同步，下次会话重试）。 */
+	private async ensureDeviceCredential(): Promise<void> {
+		if (this.credentialChecked || !this.ctx.updateApiToken) return;
+		this.credentialChecked = true;
+		try {
+			const who = await this.ctx.client.whoami();
+			if (who.tokenType !== "root") return;
+			const cred = await this.ctx.client.createDevice(this.ctx.deviceName());
+			await this.ctx.updateApiToken(cred.deviceToken);
+			this.ctx.notify("已为本设备换发专属同步凭据（根 Token 不再保存在设备上，可在服务器上单独撤销本设备）");
+			this.ctx.log(`device credential issued: ${cred.deviceId}`);
+		} catch (e) {
+			this.credentialChecked = false; // 网络失败等：下次协议检查重试
+			this.ctx.log(`device credential exchange failed: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
 

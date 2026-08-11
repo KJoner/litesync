@@ -27,8 +27,9 @@ export interface ServerInfo {
  * 插件实现的同步协议版本（v7 起插件与服务器分仓独立发版）。
  * 破坏性协议变更时递增，与服务器 /api/v1/info 的区间做兼容性判定。
  * v2（0.9.0）：repoEpoch、tombstone 拒绝 base 0、E2EE 状态机、vault-key CAS。
+ * v3（0.10.0）：设备级凭据与配对包 v2（enrollment）、LSE2 加密信封。
  */
-export const PLUGIN_PROTOCOL_VERSION = 2;
+export const PLUGIN_PROTOCOL_VERSION = 3;
 
 /** 协议不兼容时返回给用户的提示；兼容返回 null。 */
 export function protocolError(info: ServerInfo): string | null {
@@ -342,6 +343,62 @@ export class ApiClient {
 		if (res.status !== 200) throw new ApiError(res.status, `share revoke failed: HTTP ${res.status}`);
 	}
 
+	// ---------- 设备级凭据（v9.2，协议 v3） ----------
+
+	/** 当前凭据身份：root（.env 根 Token）或 device（设备凭据）。 */
+	async whoami(): Promise<{ tokenType: "root" | "device"; deviceId?: string; scopes?: string }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/whoami`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200) throw new ApiError(res.status, `whoami failed: HTTP ${res.status}`);
+		return res.json as { tokenType: "root" | "device"; deviceId?: string; scopes?: string };
+	}
+
+	/** 根 Token 直接创建设备凭据（首台设备自注册；token 明文只返回一次）。 */
+	async createDevice(name: string): Promise<{ deviceId: string; deviceToken: string }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/devices`,
+			method: "POST",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify({ name }),
+			throw: false,
+		});
+		if (res.status !== 200)
+			throw new ApiError(res.status, `device create failed: HTTP ${res.status}${serverErrText(res.text)}`);
+		return res.json as { deviceId: string; deviceToken: string };
+	}
+
+	/** 生成一次性注册凭据（配对包 v2 携带；secret 只返回一次）。 */
+	async createEnrollment(ttlSeconds = 900): Promise<{ id: string; secret: string; expiresAt: number }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/enrollments`,
+			method: "POST",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify({ ttlSeconds }),
+			throw: false,
+		});
+		if (res.status !== 200)
+			throw new ApiError(res.status, `enrollment create failed: HTTP ${res.status}${serverErrText(res.text)}`);
+		return res.json as { id: string; secret: string; expiresAt: number };
+	}
+
+	/** 设备列表（不含凭据材料）。 */
+	async listDevices(): Promise<
+		Array<{ id: string; name: string; scopes: string; createdAt: number; lastSeenAt: number; revoked: boolean; current: boolean }>
+	> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/devices`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200) throw new ApiError(res.status, `device list failed: HTTP ${res.status}`);
+		return (res.json as { devices: never[] }).devices ?? [];
+	}
+
 	/** 创建一次性加密配对包（v8「添加新设备」；服务器只存密文）。 */
 	async createPairing(ciphertextB64: string, ttlSeconds = 300): Promise<{ id: string; expiresAt: number }> {
 		const res = await requestUrl({
@@ -463,6 +520,27 @@ function serverErrText(text: string): string {
 	const msg = typeof body?.error === "string" ? body.error : "";
 	const extra = typeof body?.existing === "string" ? `（与现有文件冲突：${body.existing}）` : "";
 	return msg ? ` — ${msg}${extra}` : "";
+}
+
+/**
+ * 公开设备注册（v9.2）：新设备此时还没有任何凭据，enrollment secret 即认证。
+ * 独立函数（不走 ApiClient 的 Authorization header）。
+ */
+export async function enrollDevice(
+	serverUrl: string,
+	secret: string,
+	name: string,
+): Promise<{ deviceId: string; deviceToken: string }> {
+	const res = await requestUrl({
+		url: `${serverUrl.replace(/\/+$/, "")}/enroll`,
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ secret, name }),
+		throw: false,
+	});
+	if (res.status === 404) throw new ApiError(404, "注册凭据无效或已过期，请在旧设备上重新生成配对二维码");
+	if (res.status !== 200) throw new ApiError(res.status, `device enroll failed: HTTP ${res.status}`);
+	return res.json as { deviceId: string; deviceToken: string };
 }
 
 /** 仅本机地址允许走 http://（Token 明文传输的唯一豁免场景）。 */

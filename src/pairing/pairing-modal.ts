@@ -5,9 +5,10 @@ import { PluginSettings } from "../settings";
 import { buildPairUrl, encryptPairingConfig, newPairSecret, PairingConfig } from "./pairing";
 
 /**
- * 「添加新设备」弹窗（v8）：
- * 生成一次性加密配对包并展示二维码/链接。新设备扫码（或粘贴链接）即可
- * 自动导入 Server URL + API Token + 同步设置；E2EE 密码始终手动输入。
+ * 「添加新设备」弹窗（v8；v9.2 改为设备凭据流）：
+ * 生成一次性加密配对包并展示二维码/链接。配对包只携带一次性注册凭据
+ *（enrollmentSecret）——新设备用它换取自己的最小权限设备凭据，
+ * 根 Token 与本机凭据都不会传给新设备；E2EE 密码始终手动输入。
  */
 export class AddDeviceModal extends Modal {
 	private pairingId: string | null = null;
@@ -17,7 +18,6 @@ export class AddDeviceModal extends Modal {
 		app: App,
 		private client: ApiClient,
 		private settings: PluginSettings,
-		private apiToken: string,
 	) {
 		super(app);
 	}
@@ -41,10 +41,12 @@ export class AddDeviceModal extends Modal {
 		const { contentEl } = this;
 		try {
 			const secret = newPairSecret();
+			// 一次性注册凭据（15 分钟，比配对包稍长；两者都是一次性）
+			const enrollment = await this.client.createEnrollment(900);
 			const config: PairingConfig = {
-				v: 1,
+				v: 2,
 				serverUrl: this.settings.serverUrl,
-				apiToken: this.apiToken,
+				enrollmentSecret: enrollment.secret,
 				syncIntervalSeconds: this.settings.syncIntervalSeconds,
 				syncObsidian: this.settings.syncObsidian,
 				ignorePatterns: this.settings.ignorePatterns,
@@ -75,7 +77,7 @@ export class AddDeviceModal extends Modal {
 			});
 			contentEl.createDiv({
 				cls: "litesync-history-meta",
-				text: "安全提示：E2EE 密码不会随配对包传输，需要在新设备上手动输入一次。",
+				text: "安全提示：配对包只含一次性注册凭据，新设备会获得自己的专属凭据（可单独撤销）；E2EE 密码不会随配对包传输，需要在新设备上手动输入一次。",
 			});
 		} catch (e) {
 			contentEl.empty();

@@ -8,14 +8,17 @@
  * - 绝不先删明文再传密文；只有密文下载回验（解密 + hash 一致）后才 purge
  * - 任何失败都可以重新执行（断点续传：已加密的文件跳过重传）
  */
-import { NotFoundError } from "../api/client";
+import { ConflictError, NotFoundError } from "../api/client";
 import { SyncContext } from "../sync/context";
+import { e2eeBinding } from "../sync/transfer";
 import { sha256Hex } from "../utils/hash";
 import {
 	createVaultKeyDoc,
 	decryptFile,
 	encryptFile,
+	FileKeyBinding,
 	isEncryptedPayload,
+	isLegacyEnvelope,
 	unlockVaultKey,
 	VaultKeyDoc,
 } from "./crypto";
@@ -58,12 +61,20 @@ export async function enableE2ee(
 		throw new Error("存在未完成的同步或未解决的冲突，请处理后重新启用");
 	}
 
-	const serverState = (await ctx.client.info()).encryptionState ?? "plaintext";
+	const info = await ctx.client.info();
+	const serverState = info.encryptionState ?? "plaintext";
 	let done = 0;
 	if (serverState !== "encrypted") {
 		// 3. 服务器进入 migrating（v9 状态机）：从这一刻起服务器冻结一切明文写，
 		// 其他旧设备无法在迁移期间把明文写回仓库（它们的上传会被 409 拒绝）
-		await ctx.client.e2eeTransition("begin");
+		const state = await ctx.client.e2eeTransition("begin");
+		// LSE2 绑定材料（v9.2）：迁移产生的密文直接使用新信封
+		ctx.store.state.bootstrap.keyEpoch = state.keyEpoch;
+		if (!ctx.store.state.bootstrap.remoteVaultId && info.vaultId) {
+			ctx.store.state.bootstrap.remoteVaultId = info.vaultId;
+		}
+		await ctx.store.save();
+		const binding = e2eeBinding(ctx);
 
 		// 4. 迁移清单 = 服务器一致性快照（v9）：以服务器为权威，
 		// 本地 state 缓存里没有的远端文件同样会被加密，不会有漏网明文
@@ -73,7 +84,7 @@ export async function enableE2ee(
 		// 5. 逐文件迁移：加密上传 → 下载回验 → 清理明文历史
 		for (const path of paths) {
 			onProgress({ total: paths.length, done, current: path });
-			await migratePath(ctx, vmk, path);
+			await migratePath(ctx, vmk, path, binding);
 			done++;
 			if (done % 10 === 0) await ctx.store.save();
 		}
@@ -101,7 +112,12 @@ export async function enableE2ee(
 	return done;
 }
 
-async function migratePath(ctx: SyncContext, vmk: CryptoKey, path: string): Promise<void> {
+async function migratePath(
+	ctx: SyncContext,
+	vmk: CryptoKey,
+	path: string,
+	binding: FileKeyBinding | undefined,
+): Promise<void> {
 	let raw;
 	try {
 		raw = await ctx.client.download(path);
@@ -121,7 +137,7 @@ async function migratePath(ctx: SyncContext, vmk: CryptoKey, path: string): Prom
 
 	// 断点续传：已是密文 → 验证可解密后清理明文历史即可
 	if (isEncryptedPayload(raw.data)) {
-		const dec = await decryptFile(vmk, path, raw.data);
+		const dec = await decryptFile(vmk, path, raw.data, binding);
 		if (dec === null) throw new Error(`已加密但无法用当前密钥解密: ${path}`);
 		ctx.store.set(path, {
 			hash: await sha256Hex(dec),
@@ -134,10 +150,10 @@ async function migratePath(ctx: SyncContext, vmk: CryptoKey, path: string): Prom
 		return;
 	}
 
-	// 加密并作为新 revision 上传
+	// 加密（LSE2）并作为新 revision 上传
 	const plain = raw.data;
 	const plainHash = await sha256Hex(plain);
-	const payload = await encryptFile(vmk, path, plain);
+	const payload = await encryptFile(vmk, path, plain, binding);
 	const cipherHash = await sha256Hex(payload);
 	const res = await ctx.client.upload(path, raw.revision, cipherHash, payload, raw.mtime, "upsert");
 
@@ -146,7 +162,7 @@ async function migratePath(ctx: SyncContext, vmk: CryptoKey, path: string): Prom
 	if ((await sha256Hex(check.data)) !== cipherHash) {
 		throw new Error(`密文回读与上传不一致: ${path}`);
 	}
-	const dec = await decryptFile(vmk, path, check.data);
+	const dec = await decryptFile(vmk, path, check.data, binding);
 	if (dec === null || (await sha256Hex(dec)) !== plainHash) {
 		throw new Error(`密文解密验证失败: ${path}`);
 	}
@@ -159,4 +175,61 @@ async function migratePath(ctx: SyncContext, vmk: CryptoKey, path: string): Prom
 		size: plain.byteLength,
 	});
 	await ctx.client.purgeHistory(path, res.revision);
+}
+
+/**
+ * 信封升级（v9.2）：把仓库中仍是 LSE1 信封的密文重新加密为 LSE2。
+ * 密文 → 密文的替换，无明文暴露窗口；单个文件失败（如并发修改 409）跳过，
+ * 重新执行命令即可续传。历史版本保留（LSE1 历史仍可解密，作 merge-base 用）。
+ */
+export async function upgradeEnvelopes(
+	ctx: SyncContext,
+	onProgress: (p: MigrationProgress) => void,
+): Promise<{ upgraded: number; skipped: number; total: number }> {
+	if (!ctx.e2ee.enabled) throw new Error("端到端加密未启用，无需升级信封");
+	const vmk = ctx.e2ee.requireKey();
+	const binding = e2eeBinding(ctx);
+	if (!binding) throw new Error("缺少 vaultId/keyEpoch 绑定材料，请先完成一次正常同步后重试");
+
+	const snap = await ctx.client.snapshot();
+	const paths = snap.files.map((f) => f.path).filter((p) => !ctx.ignores(p));
+	let upgraded = 0;
+	let skipped = 0;
+	let done = 0;
+	for (const path of paths) {
+		onProgress({ total: paths.length, done: done++, current: path });
+		let raw;
+		try {
+			raw = await ctx.client.download(path);
+		} catch (e) {
+			if (e instanceof NotFoundError) continue;
+			throw e;
+		}
+		if (!isLegacyEnvelope(raw.data)) continue; // 已是 LSE2
+		const plain = await decryptFile(vmk, path, raw.data);
+		if (plain === null) {
+			skipped++;
+			ctx.log(`envelope upgrade: cannot decrypt ${path}, skipped`);
+			continue;
+		}
+		const payload = await encryptFile(vmk, path, plain, binding);
+		const cipherHash = await sha256Hex(payload);
+		try {
+			const res = await ctx.client.upload(path, raw.revision, cipherHash, payload, raw.mtime, "upsert");
+			const tracked = ctx.store.get(path);
+			if (tracked) {
+				ctx.store.set(path, { ...tracked, serverHash: cipherHash, revision: res.revision });
+			}
+			upgraded++;
+		} catch (e) {
+			if (e instanceof ConflictError) {
+				skipped++; // 并发修改：正常同步会以 LSE2 重新上传，无需处理
+				continue;
+			}
+			throw e;
+		}
+	}
+	await ctx.store.save();
+	ctx.log(`envelope upgrade: ${upgraded} upgraded, ${skipped} skipped, ${paths.length} total`);
+	return { upgraded, skipped, total: paths.length };
 }

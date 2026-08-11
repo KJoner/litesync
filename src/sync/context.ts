@@ -22,6 +22,8 @@ export interface SyncContext {
 	e2ee: Keyring;
 	/** 从服务器刷新 vault key 状态（每次同步开始时调用） */
 	refreshE2ee(): Promise<void>;
+	/** 更换 API 凭据（v9.2 根 Token → 设备凭据自动换发；写入 SecretStorage） */
+	updateApiToken?: (token: string) => Promise<void>;
 }
 
 export interface SyncCounters {

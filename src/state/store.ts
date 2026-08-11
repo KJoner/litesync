@@ -235,12 +235,14 @@ export class StateStore {
 		remoteVaultId: string | undefined,
 		snapshotSequence: number,
 		repoEpoch?: string,
+		keyEpoch?: number,
 	): void {
 		this.state.bootstrap = {
 			status: "ready",
 			mode,
 			remoteVaultId,
 			repoEpoch,
+			keyEpoch,
 			snapshotSequence,
 			completedAt: Date.now(),
 		};

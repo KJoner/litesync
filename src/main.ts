@@ -10,8 +10,9 @@ import {
 } from "./crypto/device-trust";
 import { EnableE2eeModal, UnlockModal } from "./crypto/e2ee-modals";
 import { Keyring } from "./crypto/keyring";
-import { enableE2ee } from "./crypto/migration";
+import { enableE2ee, upgradeEnvelopes } from "./crypto/migration";
 import { HistoryModal } from "./history/history-view";
+import { DeviceListModal } from "./pairing/device-list-modal";
 import { PasteLinkModal, registerImportHandler } from "./pairing/import-handler";
 import { AddDeviceModal } from "./pairing/pairing-modal";
 import { DEFAULT_SETTINGS, PluginSettings, SyncSettingTab } from "./settings";
@@ -91,6 +92,18 @@ export default class PrivateSyncPlugin extends Plugin {
 			callback: () => {
 				if (this.ctx) new ShareManageModal(this.ctx, this.settings.serverUrl).open();
 			},
+		});
+		this.addCommand({
+			id: "list-devices",
+			name: "设备列表 (List devices)",
+			callback: () => {
+				if (this.client) new DeviceListModal(this.app, this.client).open();
+			},
+		});
+		this.addCommand({
+			id: "upgrade-envelopes",
+			name: "升级加密信封 LSE1 → LSE2 (Upgrade encryption envelopes)",
+			callback: () => void this.runEnvelopeUpgrade(),
 		});
 		this.addRibbonIcon("refresh-cw", "LiteSync: 立即同步", () => void this.syncNow());
 
@@ -202,6 +215,10 @@ export default class PrivateSyncPlugin extends Plugin {
 				this.keyring.setDoc(doc);
 				if (this.store) this.store.state.e2ee = doc;
 			},
+			// v9.2：根 Token → 设备凭据自动换发（SyncManager 协议检查时调用）
+			updateApiToken: async (token) => {
+				await this.setApiToken(token);
+			},
 		};
 		this.ctx = ctx;
 		this.manager = new SyncManager(ctx);
@@ -266,12 +283,40 @@ export default class PrivateSyncPlugin extends Plugin {
 			new Notice("请先在设置中填写 Server URL 和 API Token");
 			return;
 		}
-		new AddDeviceModal(this.app, this.client, this.settings, this.getApiToken()).open();
+		new AddDeviceModal(this.app, this.client, this.settings).open();
 	}
 
 	/** 「导入配对链接」：手动粘贴其他设备生成的配对链接。 */
 	openPasteLinkModal(): void {
 		new PasteLinkModal(this.app, this).open();
+	}
+
+	/** 「升级加密信封」（v9.2）：把仓库中的 LSE1 密文重新加密为 LSE2。 */
+	private async runEnvelopeUpgrade(): Promise<void> {
+		if (!this.ctx) return;
+		if (!this.keyring.enabled) {
+			new Notice("端到端加密未启用，无需升级信封");
+			return;
+		}
+		if (!this.keyring.unlocked) {
+			new Notice("请先解锁端到端加密（Unlock E2EE）");
+			return;
+		}
+		const progress = new Notice("正在升级加密信封…", 0);
+		try {
+			const r = await upgradeEnvelopes(this.ctx, (p) => {
+				progress.setMessage(`升级加密信封 ${p.done}/${p.total}：${p.current}`);
+			});
+			progress.hide();
+			new Notice(
+				r.upgraded > 0
+					? `加密信封升级完成：${r.upgraded} 个文件已升级到 LSE2${r.skipped ? `，${r.skipped} 个跳过（可重新执行续传）` : ""}`
+					: "所有文件已经是 LSE2 信封，无需升级",
+			);
+		} catch (e) {
+			progress.hide();
+			new Notice(`信封升级失败：${e instanceof Error ? e.message : String(e)}`);
+		}
 	}
 
 	/**
