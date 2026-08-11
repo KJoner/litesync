@@ -141,6 +141,21 @@ test("StateStore: 两份副本全部损坏 → corrupted 停机，绝不 startin
 	assert.equal(files.get("state-a.json"), "{broken", "corrupted 下 save 必须是 no-op");
 });
 
+test("StateStore: v9.2 旧字符串 pendingOps 规整为结构化 op（v9.3）", async () => {
+	const legacy = JSON.stringify({
+		deviceId: "dev-x",
+		lastSequence: 1,
+		files: {},
+		pendingOps: { "a.md": "upsert", "b.md": "delete", "bad.md": "unknown" },
+	});
+	const store = new StateStore(memAdapter({ "state.json": legacy }), "state.json");
+	await store.load();
+	assert.deepEqual(store.state.pendingOps, {
+		"a.md": { action: "upsert" },
+		"b.md": { action: "delete" },
+	});
+});
+
 test("StateStore: 旧版单文件 state.json 迁移到 A/B 副本", async () => {
 	const legacy = JSON.stringify({ deviceId: "dev-9", lastSequence: 33, files: {}, conflicts: {}, e2ee: null, shares: {} });
 	const adapter = memAdapter({ "state.json": legacy });
@@ -161,13 +176,16 @@ test("StateStore: pendingOps / blockedChanges 持久化（v9）", async () => {
 	const adapter = memAdapter();
 	const store = new StateStore(adapter, "state.json");
 	await store.load();
-	store.state.pendingOps = { "a.md": "upsert" };
+	store.state.pendingOps = { "a.md": { action: "upsert" }, "n.md": { action: "move", from: "o.md" } };
 	store.setBlockedChange("dir.md", "远端文件与本地文件夹同名");
 	await store.save();
 
 	const store2 = new StateStore(adapter, "state.json");
 	await store2.load();
-	assert.deepEqual(store2.state.pendingOps, { "a.md": "upsert" });
+	assert.deepEqual(store2.state.pendingOps, {
+		"a.md": { action: "upsert" },
+		"n.md": { action: "move", from: "o.md" },
+	});
 	assert.deepEqual(store2.blockedChangePaths(), ["dir.md"]);
 	store2.clearBlockedChange("dir.md");
 	assert.deepEqual(store2.blockedChangePaths(), []);

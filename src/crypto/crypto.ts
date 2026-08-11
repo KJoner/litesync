@@ -18,13 +18,39 @@ export const KDF_ITERATIONS = 600_000;
 
 const MAGIC = new Uint8Array([0x4c, 0x53, 0x45, 0x31]); // "LSE1"
 const MAGIC2 = new Uint8Array([0x4c, 0x53, 0x45, 0x32]); // "LSE2"
+const MAGIC3 = new Uint8Array([0x4c, 0x53, 0x45, 0x33]); // "LSE3"
 const IV_LEN = 12;
 const EPOCH_LEN = 4;
+const GEN_LEN = 8;
 
 /** LSE2 的 AAD 绑定材料（vaultId 来自 bootstrap，keyEpoch 来自服务器状态机）。 */
 export interface FileKeyBinding {
 	vaultId: string;
 	keyEpoch: number;
+}
+
+/**
+ * LSE3（v9.3）的 AAD 绑定材料：路径不再入 AAD——改绑稳定 fileId
+ *（E2EE 下改名不再需要重新加密内容），并绑定单调递增的 contentGeneration
+ *（恶意服务器无法把同一文件的旧版本密文当 HEAD 重放，客户端按已见 generation 拒绝回退）。
+ */
+export interface FileKeyBinding3 {
+	vaultId: string;
+	keyEpoch: number;
+	fileId: string;
+	generation: number;
+}
+
+function fileAadV3(b: FileKeyBinding3): Uint8Array {
+	return new TextEncoder().encode(`litesync/v3/file:${b.vaultId}:${b.keyEpoch}:${b.fileId}:${b.generation}`);
+}
+
+/** 生成客户端侧的稳定文件身份（16B hex；新文件在加密前就需要确定 id）。 */
+export function newFileId(): string {
+	const raw = randomBytes(16);
+	let out = "";
+	for (const b of raw) out += b.toString(16).padStart(2, "0");
+	return out;
 }
 
 /** 存服务器 / 本地缓存的 vault key 文档（不含任何明文密钥材料）。 */
@@ -212,14 +238,98 @@ function hasMagic(data: ArrayBuffer, magic: Uint8Array, minTail: number): boolea
 	return true;
 }
 
-/** 判断字节流是否为 LiteSync 加密格式（LSE1 或 LSE2）。 */
+/** 判断字节流是否为 LiteSync 加密格式（LSE1/LSE2/LSE3）。 */
 export function isEncryptedPayload(data: ArrayBuffer): boolean {
+	return (
+		hasMagic(data, MAGIC, IV_LEN + 16) ||
+		hasMagic(data, MAGIC2, EPOCH_LEN + IV_LEN + 16) ||
+		hasMagic(data, MAGIC3, EPOCH_LEN + GEN_LEN + IV_LEN + 16)
+	);
+}
+
+/** 是否为旧版信封（LSE1/LSE2，「升级加密信封」命令用；LSE3 为当前格式）。 */
+export function isLegacyEnvelope(data: ArrayBuffer): boolean {
 	return hasMagic(data, MAGIC, IV_LEN + 16) || hasMagic(data, MAGIC2, EPOCH_LEN + IV_LEN + 16);
 }
 
-/** 是否为旧版 LSE1 信封（「升级加密信封」命令用）。 */
-export function isLegacyEnvelope(data: ArrayBuffer): boolean {
-	return hasMagic(data, MAGIC, IV_LEN + 16);
+/** 是否为 LSE3 信封。 */
+export function isLse3Envelope(data: ArrayBuffer): boolean {
+	return hasMagic(data, MAGIC3, EPOCH_LEN + GEN_LEN + IV_LEN + 16);
+}
+
+/** 读取 LSE3 信封头（明文字段；真实性由解密时的 AAD 校验保证）。 */
+export function parseLse3Header(data: ArrayBuffer): { keyEpoch: number; generation: number } | null {
+	if (!isLse3Envelope(data)) return null;
+	const view = new DataView(data);
+	return {
+		keyEpoch: view.getUint32(MAGIC3.length, false),
+		generation: Number(view.getBigUint64(MAGIC3.length + EPOCH_LEN, false)),
+	};
+}
+
+/** LSE3 加密：magic | keyEpoch(u32) | generation(u64) | iv | ct+tag。 */
+export async function encryptFileV3(
+	vmk: CryptoKey,
+	binding: FileKeyBinding3,
+	plaintext: ArrayBuffer,
+): Promise<ArrayBuffer> {
+	const iv = randomBytes(IV_LEN);
+	const ct = new Uint8Array(
+		await crypto.subtle.encrypt(
+			{ name: "AES-GCM", iv: iv as BufferSource, additionalData: fileAadV3(binding) as BufferSource },
+			vmk,
+			plaintext,
+		),
+	);
+	const head = MAGIC3.length + EPOCH_LEN + GEN_LEN;
+	const out = new Uint8Array(head + IV_LEN + ct.length);
+	out.set(MAGIC3, 0);
+	const view = new DataView(out.buffer);
+	view.setUint32(MAGIC3.length, binding.keyEpoch >>> 0, false);
+	view.setBigUint64(MAGIC3.length + EPOCH_LEN, BigInt(binding.generation), false);
+	out.set(iv, head);
+	out.set(ct, head + IV_LEN);
+	return out.buffer;
+}
+
+/**
+ * LSE3 解密。AAD 由 vaultId + 信封头 keyEpoch/generation + 服务器提供的 fileId
+ * 重建——fileId 造假会直接导致 GCM 认证失败，无需额外信任服务器。
+ * expectedKeyEpoch > 0 时校验信封世代一致（拒绝跨密钥世代重放）。
+ * 成功返回 { plain, generation }（generation 已经过 AAD 认证，调用方据此做回退检查）。
+ */
+export async function decryptFileV3(
+	vmk: CryptoKey,
+	payload: ArrayBuffer,
+	vaultId: string,
+	fileId: string,
+	expectedKeyEpoch: number,
+): Promise<{ plain: ArrayBuffer; generation: number } | null> {
+	const header = parseLse3Header(payload);
+	if (header === null || !vaultId || !fileId) return null;
+	if (expectedKeyEpoch > 0 && header.keyEpoch !== expectedKeyEpoch) return null;
+	try {
+		const head = MAGIC3.length + EPOCH_LEN + GEN_LEN;
+		const iv = new Uint8Array(payload, head, IV_LEN);
+		const ct = new Uint8Array(payload, head + IV_LEN);
+		const plain = await crypto.subtle.decrypt(
+			{
+				name: "AES-GCM",
+				iv: iv as BufferSource,
+				additionalData: fileAadV3({
+					vaultId,
+					keyEpoch: header.keyEpoch,
+					fileId,
+					generation: header.generation,
+				}) as BufferSource,
+			},
+			vmk,
+			ct,
+		);
+		return { plain, generation: header.generation };
+	} catch {
+		return null;
+	}
 }
 
 /**

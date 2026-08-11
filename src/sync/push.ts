@@ -22,6 +22,12 @@ export interface PushResult {
  */
 export async function scanLocalChanges(ctx: SyncContext): Promise<void> {
 	const seen = new Set<string>();
+	// 排队中 move 的旧路径集合（v9.3）：这些路径的「tracked 但文件不在」
+	// 由 move 操作处理，扫描不得抢先补 delete（否则退化并丢失原子性）
+	const moveFroms = new Set<string>();
+	for (const [, op] of ctx.queue.entries()) {
+		if (op.action === "move" && op.from) moveFroms.add(op.from);
+	}
 
 	// 待手动删除的文件（移动端回收站失败时保留的，v6）：用户已手动删除则清除记录
 	for (const path of Object.keys(ctx.store.state.pendingDeletes)) {
@@ -32,6 +38,8 @@ export async function scanLocalChanges(ctx: SyncContext): Promise<void> {
 		const path = file.path;
 		if (ctx.ignores(path) || ctx.store.hasPendingDelete(path)) continue;
 		seen.add(path);
+		// 已排队的 move（key = 新路径）不被扫描的 upsert 覆盖
+		if (ctx.queue.getOp(path)?.action === "move") continue;
 		const tracked = ctx.store.get(path);
 		if (!tracked || tracked.mtime !== file.stat.mtime || tracked.size !== file.stat.size) {
 			ctx.queue.add(path, "upsert");
@@ -43,6 +51,7 @@ export async function scanLocalChanges(ctx: SyncContext): Promise<void> {
 		for (const path of await listHiddenFiles(ctx, ctx.app.vault.configDir)) {
 			if (ctx.ignores(path) || ctx.store.hasPendingDelete(path)) continue;
 			seen.add(path);
+			if (ctx.queue.getOp(path)?.action === "move") continue;
 			const stat = await ctx.app.vault.adapter.stat(path);
 			if (!stat) continue;
 			const tracked = ctx.store.get(path);
@@ -53,7 +62,7 @@ export async function scanLocalChanges(ctx: SyncContext): Promise<void> {
 	}
 
 	for (const path of ctx.store.paths()) {
-		if (ctx.ignores(path) || seen.has(path)) continue;
+		if (ctx.ignores(path) || seen.has(path) || moveFroms.has(path)) continue;
 		ctx.queue.add(path, "delete");
 	}
 }
@@ -83,12 +92,23 @@ async function listHiddenFiles(ctx: SyncContext, dir: string): Promise<string[]>
 export async function pushPendingChanges(ctx: SyncContext): Promise<PushResult> {
 	const result: PushResult = { pushed: 0, conflicts: 0 };
 	try {
-		for (const [path, action, gen] of ctx.queue.entries()) {
+		for (const [path, op, gen] of ctx.queue.entries()) {
 			if (ctx.ignores(path)) {
 				ctx.queue.remove(path);
 				continue;
 			}
-			const outcome = action === "upsert" ? await pushUpsert(ctx, path) : await pushDelete(ctx, path);
+			let outcome: Outcome;
+			switch (op.action) {
+				case "upsert":
+					outcome = await pushUpsert(ctx, path);
+					break;
+				case "delete":
+					outcome = await pushDelete(ctx, path);
+					break;
+				case "move":
+					outcome = await pushMove(ctx, path, op.from ?? "");
+					break;
+			}
 			if (outcome === "pushed") result.pushed++;
 			if (outcome === "conflict") result.conflicts++;
 			// lost wake-up 修复（v9）：只有 generation 未变才移除——
@@ -99,6 +119,67 @@ export async function pushPendingChanges(ctx: SyncContext): Promise<PushResult> 
 		await ctx.store.save();
 	}
 	return result;
+}
+
+/**
+ * 原子改名推送（v9.3）：服务器单事务完成「旧路径 tombstone + 新路径新行」。
+ * 任何不满足前提的情况（内容又被编辑 / E2EE / 服务器 409/404/422 /
+ * 旧服务器没有该接口）一律内联回退到 delete+upsert 语义——宁可退化，绝不丢内容。
+ */
+async function pushMove(ctx: SyncContext, toPath: string, fromPath: string): Promise<Outcome> {
+	const adapter = ctx.app.vault.adapter;
+	const tracked = fromPath ? ctx.store.get(fromPath) : undefined;
+	const stat = await adapter.stat(toPath);
+
+	const fallback = async (): Promise<Outcome> => {
+		let outcome: Outcome = "skipped";
+		if (tracked && !(await adapter.stat(fromPath))) {
+			const d = await pushDelete(ctx, fromPath);
+			if (d === "conflict") outcome = "conflict";
+		}
+		if (stat) {
+			const u = await pushUpsert(ctx, toPath);
+			if (u === "pushed" && outcome === "skipped") outcome = "pushed";
+			if (u === "conflict") outcome = "conflict";
+		}
+		return outcome;
+	};
+
+	// 前提：旧路径已同步、新路径存在、内容未变、无冲突冻结；
+	// E2EE 下要求 tracked 为 LSE3（generation 已知，密文 AAD 绑 fileId 不绑路径），
+	// 否则回退（LSE1/LSE2 密文移动后无法解密；服务器侧也会再校验一次）
+	if (!tracked || !stat || ctx.store.getConflict(fromPath) || ctx.store.getConflict(toPath)) {
+		return fallback();
+	}
+	if (ctx.e2ee.enabled && (tracked.generation === undefined || !tracked.fileId)) {
+		return fallback();
+	}
+	const data = await adapter.readBinary(toPath);
+	const hash = await sha256Hex(data);
+	if (hash !== tracked.hash) return fallback(); // 改名后又编辑：内容需要正常上传
+
+	try {
+		const out = await ctx.client.move(fromPath, toPath, tracked.revision);
+		ctx.store.delete(fromPath);
+		ctx.store.set(toPath, {
+			hash,
+			serverHash: tracked.serverHash,
+			revision: out.revision,
+			mtime: stat.mtime,
+			size: stat.size,
+			fileId: tracked.fileId,
+			generation: tracked.generation,
+		});
+		ctx.log(`push: moved ${fromPath} -> ${toPath} (rev ${out.revision})`);
+		return "pushed";
+	} catch (e) {
+		if (e instanceof ConflictError) return fallback(); // 远端变化 / 目标被占用
+		if (e instanceof NotFoundError) return fallback(); // 远端已无此文件
+		if (e instanceof ApiError && (e.status === 400 || e.status === 404 || e.status === 409 || e.status === 422)) {
+			return fallback(); // 旧服务器无该接口 / 路径碰撞 / E2EE 拒绝
+		}
+		throw e; // 网络/5xx：保留队列条目，退避重试
+	}
 }
 
 type Outcome = "pushed" | "skipped" | "conflict";
@@ -137,6 +218,8 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 			revision: out.revision,
 			mtime: stat.mtime,
 			size: stat.size,
+			fileId: out.fileId,
+			generation: out.generation,
 		});
 		ctx.log(`push: uploaded ${path} (rev ${out.revision})`);
 		return "pushed";
@@ -165,6 +248,8 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 					revision: out.revision,
 					mtime: stat.mtime,
 					size: stat.size,
+					fileId: out.fileId,
+					generation: out.generation,
 				});
 				return "pushed";
 			}
@@ -189,6 +274,8 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 						revision: dl.revision,
 						mtime: stat.mtime,
 						size: stat.size,
+						fileId: dl.fileId,
+						generation: dl.generation,
 					});
 					return "skipped";
 				}

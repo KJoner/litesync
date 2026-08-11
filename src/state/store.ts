@@ -1,6 +1,7 @@
 import { DataAdapter } from "obsidian";
 import { BootstrapMode, BootstrapState, PENDING_BOOTSTRAP } from "../bootstrap/bootstrap-types";
 import { VaultKeyDoc } from "../crypto/crypto";
+import { PendingOp } from "../sync/queue";
 import { sha256Hex } from "../utils/hash";
 import { encodeUtf8 } from "../utils/text";
 
@@ -16,6 +17,13 @@ export interface FileState {
 	revision: number;
 	mtime: number;
 	size: number;
+	/** 稳定文件身份（v9.3；LSE3 密文的 AAD 绑定它） */
+	fileId?: string;
+	/**
+	 * 该文件已见/已写的最大 contentGeneration（v9.3 抗回退重放）：
+	 * HEAD 下载解出的 generation 低于此值 = 恶意服务器把旧版本当最新 → 拒绝
+	 */
+	generation?: number;
 }
 
 /** 未解决冲突的登记信息（计划书 Phase 15：Pending Conflict）。 */
@@ -55,8 +63,8 @@ export interface PersistedState {
 	pendingDeletes: Record<string, number>;
 	/** 首次接入状态（v8）：pending 时所有同步入口被 Gate 拦截，先走接入向导 */
 	bootstrap: BootstrapState;
-	/** 待推送队列的持久化镜像（v9）：重启后未完成的上传/删除不会丢失 */
-	pendingOps: Record<string, "upsert" | "delete">;
+	/** 待推送队列的持久化镜像（v9；v9.3 起结构化，含 move）：重启后未完成的操作不丢 */
+	pendingOps: Record<string, PendingOp>;
 	/** 被阻塞的远端变更（v9）：如远端文件与本地文件夹同名；每轮同步重试 */
 	blockedChanges: Record<string, BlockedChange>;
 }
@@ -294,7 +302,7 @@ function normalizeState(raw: Partial<PersistedState>): PersistedState {
 		pendingDeletes: raw.pendingDeletes && typeof raw.pendingDeletes === "object" ? raw.pendingDeletes : {},
 		bootstrap:
 			raw.bootstrap && typeof raw.bootstrap === "object" ? raw.bootstrap : { ...PENDING_BOOTSTRAP },
-		pendingOps: raw.pendingOps && typeof raw.pendingOps === "object" ? raw.pendingOps : {},
+		pendingOps: normalizePendingOps(raw.pendingOps),
 		blockedChanges: raw.blockedChanges && typeof raw.blockedChanges === "object" ? raw.blockedChanges : {},
 	};
 	// v0.2 状态升级：当时全部为明文，serverHash 与 hash 相同
@@ -307,4 +315,19 @@ function normalizeState(raw: Partial<PersistedState>): PersistedState {
 		state.bootstrap = { status: "ready", mode: "legacy", completedAt: Date.now() };
 	}
 	return state;
+}
+
+/** pendingOps 规整：兼容 v9.2 之前的字符串形式（"upsert"/"delete"）。 */
+function normalizePendingOps(raw: unknown): Record<string, PendingOp> {
+	if (!raw || typeof raw !== "object") return {};
+	const out: Record<string, PendingOp> = {};
+	for (const [path, v] of Object.entries(raw as Record<string, unknown>)) {
+		if (v === "upsert" || v === "delete") {
+			out[path] = { action: v };
+		} else if (v && typeof v === "object" && "action" in v) {
+			const op = v as PendingOp;
+			if (op.action === "upsert" || op.action === "delete" || op.action === "move") out[path] = op;
+		}
+	}
+	return out;
 }

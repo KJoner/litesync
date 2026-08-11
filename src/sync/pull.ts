@@ -263,6 +263,8 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 				revision: dl.revision,
 				mtime: st?.mtime ?? Date.now(),
 				size: dl.plain.byteLength,
+				fileId: dl.fileId,
+				generation: dl.generation,
 			});
 			ctx.log(`pull: downloaded ${path} (rev ${dl.revision})`);
 			return "applied";

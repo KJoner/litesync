@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { isLoopbackUrl } from "../src/api/client";
-import { PendingQueue } from "../src/sync/queue";
+import { PendingOp, PendingQueue } from "../src/sync/queue";
 import { conflictPathFor } from "../src/utils/conflict-name";
 import { IgnoreMatcher } from "../src/utils/ignore";
 
@@ -104,9 +104,9 @@ test("conflictPathFor: 同一秒两次生成不同名（P1-18 碰撞防护）", 
 test("PendingQueue: generation 防 lost wake-up（v9 P1-10）", () => {
 	const q = new PendingQueue();
 	q.add("note.md", "upsert");
-	const [[path, action, gen]] = q.entries();
+	const [[path, op, gen]] = q.entries();
 	assert.equal(path, "note.md");
-	assert.equal(action, "upsert");
+	assert.equal(op.action, "upsert");
 	// 上传期间用户又编辑 → 重新入队拿到新 generation
 	q.add("note.md", "upsert");
 	// 旧上传完成回调用旧 gen 移除 → 必须无效
@@ -118,22 +118,42 @@ test("PendingQueue: generation 防 lost wake-up（v9 P1-10）", () => {
 	assert.equal(q.size, 0);
 });
 
-test("PendingQueue: 持久化镜像与恢复（v9）", () => {
+test("PendingQueue: 持久化镜像与恢复（v9；v9.3 结构化 + 旧格式兼容）", () => {
 	const q = new PendingQueue();
-	let mirror: Record<string, string> = {};
+	let mirror: Record<string, PendingOp> = {};
 	q.onChange = (e) => {
 		mirror = e;
 	};
 	q.add("a.md", "upsert");
 	q.add("b.md", "delete");
-	assert.deepEqual(mirror, { "a.md": "upsert", "b.md": "delete" });
+	q.addMove("new.md", "old.md");
+	assert.deepEqual(mirror, {
+		"a.md": { action: "upsert" },
+		"b.md": { action: "delete" },
+		"new.md": { action: "move", from: "old.md" },
+	});
 	q.remove("a.md");
-	assert.deepEqual(mirror, { "b.md": "delete" });
+	assert.equal(mirror["a.md"], undefined);
 
-	// 重启恢复
+	// 重启恢复：结构化 + v9.2 旧字符串格式混合
 	const q2 = new PendingQueue();
-	q2.restore({ "b.md": "delete", "c.md": "upsert" });
-	assert.equal(q2.size, 2);
+	q2.restore({
+		"b.md": "delete",
+		"c.md": { action: "upsert" },
+		"new.md": { action: "move", from: "old.md" },
+	});
+	assert.equal(q2.size, 3);
+	assert.deepEqual(q2.getOp("b.md"), { action: "delete" });
+	assert.deepEqual(q2.getOp("new.md"), { action: "move", from: "old.md" });
+});
+
+test("PendingQueue: move 条目被后续 upsert 覆盖（退化为 delete+upsert 的入口）", () => {
+	const q = new PendingQueue();
+	q.addMove("new.md", "old.md");
+	assert.equal(q.getOp("new.md")?.action, "move");
+	// 改名后立即编辑：modify 事件的 upsert 覆盖 move（旧路径由扫描兜底补 delete）
+	q.add("new.md", "upsert");
+	assert.deepEqual(q.getOp("new.md"), { action: "upsert" });
 });
 
 test("PendingQueue: 按路径去重，后到动作覆盖", () => {
@@ -143,8 +163,8 @@ test("PendingQueue: 按路径去重，后到动作覆盖", () => {
 	q.add("b.md", "upsert");
 	assert.equal(q.size, 2);
 	const entries = q.toRecord();
-	assert.equal(entries["a.md"], "delete");
-	assert.equal(entries["b.md"], "upsert");
+	assert.equal(entries["a.md"].action, "delete");
+	assert.equal(entries["b.md"].action, "upsert");
 	// entries() 是快照，不清空队列
 	assert.equal(q.size, 2);
 	q.remove("a.md");

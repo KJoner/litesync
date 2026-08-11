@@ -15,10 +15,13 @@ import { sha256Hex } from "../utils/hash";
 import {
 	createVaultKeyDoc,
 	decryptFile,
+	decryptFileV3,
 	encryptFile,
+	encryptFileV3,
 	FileKeyBinding,
 	isEncryptedPayload,
 	isLegacyEnvelope,
+	isLse3Envelope,
 	unlockVaultKey,
 	VaultKeyDoc,
 } from "./crypto";
@@ -137,23 +140,33 @@ async function migratePath(
 
 	// 断点续传：已是密文 → 验证可解密后清理明文历史即可
 	if (isEncryptedPayload(raw.data)) {
-		const dec = await decryptFile(vmk, path, raw.data, binding);
+		const dec = await decryptAny(vmk, path, raw.data, binding, raw.fileId);
 		if (dec === null) throw new Error(`已加密但无法用当前密钥解密: ${path}`);
 		ctx.store.set(path, {
-			hash: await sha256Hex(dec),
+			hash: await sha256Hex(dec.plain),
 			serverHash,
 			revision: raw.revision,
 			mtime: tracked?.mtime ?? Date.now(),
-			size: dec.byteLength,
+			size: dec.plain.byteLength,
+			fileId: raw.fileId,
+			generation: dec.generation,
 		});
 		await ctx.client.purgeHistory(path, raw.revision);
 		return;
 	}
 
-	// 加密（LSE2）并作为新 revision 上传
+	// 加密（LSE3：fileId 来自服务器为明文时代分配的稳定身份，generation 从 1 开始）
+	// binding 不可用时回退 LSE1（升级过渡；正常情况下 begin 之后一定可用）
 	const plain = raw.data;
 	const plainHash = await sha256Hex(plain);
-	const payload = await encryptFile(vmk, path, plain, binding);
+	let payload: ArrayBuffer;
+	let generation: number | undefined;
+	if (binding && raw.fileId) {
+		generation = 1;
+		payload = await encryptFileV3(vmk, { ...binding, fileId: raw.fileId, generation }, plain);
+	} else {
+		payload = await encryptFile(vmk, path, plain, binding);
+	}
 	const cipherHash = await sha256Hex(payload);
 	const res = await ctx.client.upload(path, raw.revision, cipherHash, payload, raw.mtime, "upsert");
 
@@ -162,8 +175,8 @@ async function migratePath(
 	if ((await sha256Hex(check.data)) !== cipherHash) {
 		throw new Error(`密文回读与上传不一致: ${path}`);
 	}
-	const dec = await decryptFile(vmk, path, check.data, binding);
-	if (dec === null || (await sha256Hex(dec)) !== plainHash) {
+	const dec = await decryptAny(vmk, path, check.data, binding, check.fileId ?? raw.fileId);
+	if (dec === null || (await sha256Hex(dec.plain)) !== plainHash) {
 		throw new Error(`密文解密验证失败: ${path}`);
 	}
 
@@ -173,14 +186,33 @@ async function migratePath(
 		revision: res.revision,
 		mtime: tracked?.mtime ?? Date.now(),
 		size: plain.byteLength,
+		fileId: res.fileId ?? raw.fileId,
+		generation,
 	});
 	await ctx.client.purgeHistory(path, res.revision);
 }
 
+/** 统一解密：LSE3（需 fileId）与 LSE1/LSE2 兼容。 */
+async function decryptAny(
+	vmk: CryptoKey,
+	path: string,
+	payload: ArrayBuffer,
+	binding: FileKeyBinding | undefined,
+	fileId: string | undefined,
+): Promise<{ plain: ArrayBuffer; generation?: number } | null> {
+	if (isLse3Envelope(payload)) {
+		if (!binding?.vaultId || !fileId) return null;
+		return decryptFileV3(vmk, payload, binding.vaultId, fileId, binding.keyEpoch);
+	}
+	const plain = await decryptFile(vmk, path, payload, binding);
+	return plain === null ? null : { plain };
+}
+
 /**
- * 信封升级（v9.2）：把仓库中仍是 LSE1 信封的密文重新加密为 LSE2。
+ * 信封升级（v9.2 引入；v9.3 起目标格式为 LSE3）：把仓库中仍是 LSE1/LSE2 的
+ * 密文重新加密为 LSE3（fileId-AAD + generation 抗回退重放，改名不再需重加密）。
  * 密文 → 密文的替换，无明文暴露窗口；单个文件失败（如并发修改 409）跳过，
- * 重新执行命令即可续传。历史版本保留（LSE1 历史仍可解密，作 merge-base 用）。
+ * 重新执行命令即可续传。历史版本保留（旧信封历史仍可解密，作 merge-base 用）。
  */
 export async function upgradeEnvelopes(
 	ctx: SyncContext,
@@ -192,44 +224,56 @@ export async function upgradeEnvelopes(
 	if (!binding) throw new Error("缺少 vaultId/keyEpoch 绑定材料，请先完成一次正常同步后重试");
 
 	const snap = await ctx.client.snapshot();
-	const paths = snap.files.map((f) => f.path).filter((p) => !ctx.ignores(p));
+	const files = snap.files.filter((f) => !ctx.ignores(f.path));
 	let upgraded = 0;
 	let skipped = 0;
 	let done = 0;
-	for (const path of paths) {
-		onProgress({ total: paths.length, done: done++, current: path });
+	for (const f of files) {
+		onProgress({ total: files.length, done: done++, current: f.path });
 		let raw;
 		try {
-			raw = await ctx.client.download(path);
+			raw = await ctx.client.download(f.path);
 		} catch (e) {
 			if (e instanceof NotFoundError) continue;
 			throw e;
 		}
-		if (!isLegacyEnvelope(raw.data)) continue; // 已是 LSE2
-		const plain = await decryptFile(vmk, path, raw.data);
-		if (plain === null) {
+		if (!isLegacyEnvelope(raw.data)) continue; // 已是 LSE3（或明文仓库不应到这）
+		const fileId = raw.fileId ?? f.fileId;
+		if (!fileId) {
 			skipped++;
-			ctx.log(`envelope upgrade: cannot decrypt ${path}, skipped`);
 			continue;
 		}
-		const payload = await encryptFile(vmk, path, plain, binding);
+		const plain = await decryptFile(vmk, f.path, raw.data, binding);
+		if (plain === null) {
+			skipped++;
+			ctx.log(`envelope upgrade: cannot decrypt ${f.path}, skipped`);
+			continue;
+		}
+		const tracked = ctx.store.get(f.path);
+		const generation = (tracked?.fileId === fileId ? (tracked?.generation ?? 0) : 0) + 1;
+		const payload = await encryptFileV3(vmk, { ...binding, fileId, generation }, plain);
 		const cipherHash = await sha256Hex(payload);
 		try {
-			const res = await ctx.client.upload(path, raw.revision, cipherHash, payload, raw.mtime, "upsert");
-			const tracked = ctx.store.get(path);
+			const res = await ctx.client.upload(f.path, raw.revision, cipherHash, payload, raw.mtime, "upsert");
 			if (tracked) {
-				ctx.store.set(path, { ...tracked, serverHash: cipherHash, revision: res.revision });
+				ctx.store.set(f.path, {
+					...tracked,
+					serverHash: cipherHash,
+					revision: res.revision,
+					fileId,
+					generation,
+				});
 			}
 			upgraded++;
 		} catch (e) {
 			if (e instanceof ConflictError) {
-				skipped++; // 并发修改：正常同步会以 LSE2 重新上传，无需处理
+				skipped++; // 并发修改：正常同步会以 LSE3 重新上传，无需处理
 				continue;
 			}
 			throw e;
 		}
 	}
 	await ctx.store.save();
-	ctx.log(`envelope upgrade: ${upgraded} upgraded, ${skipped} skipped, ${paths.length} total`);
-	return { upgraded, skipped, total: paths.length };
+	ctx.log(`envelope upgrade: ${upgraded} upgraded, ${skipped} skipped, ${files.length} total`);
+	return { upgraded, skipped, total: files.length };
 }

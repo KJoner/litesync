@@ -28,8 +28,9 @@ export interface ServerInfo {
  * 破坏性协议变更时递增，与服务器 /api/v1/info 的区间做兼容性判定。
  * v2（0.9.0）：repoEpoch、tombstone 拒绝 base 0、E2EE 状态机、vault-key CAS。
  * v3（0.10.0）：设备级凭据与配对包 v2（enrollment）、LSE2 加密信封。
+ * v4（0.11.0）：LSE3 信封（fileId-AAD + contentGeneration 抗回退重放）、E2EE 原子 MOVE。
  */
-export const PLUGIN_PROTOCOL_VERSION = 3;
+export const PLUGIN_PROTOCOL_VERSION = 4;
 
 /** 协议不兼容时返回给用户的提示；兼容返回 null。 */
 export function protocolError(info: ServerInfo): string | null {
@@ -71,6 +72,8 @@ export interface SnapshotFile {
 	hash: string;
 	size: number;
 	mtime: number;
+	/** 稳定文件身份（0.11.0+） */
+	fileId?: string;
 }
 
 export interface UploadOk {
@@ -79,6 +82,8 @@ export interface UploadOk {
 	hash: string;
 	size: number;
 	sequence: number;
+	/** 稳定文件身份（0.11.0+；LSE3 密文的 AAD 绑定它） */
+	fileId?: string;
 }
 
 /** 409 响应中携带的服务器当前状态。 */
@@ -100,6 +105,8 @@ export interface DownloadResult {
 	hash: string;
 	size: number;
 	mtime: number;
+	/** 稳定文件身份（0.11.0+）；历史版本返回写入当时的身份，旧版本可能为空 */
+	fileId?: string;
 }
 
 /** 历史版本元数据（GET /api/v1/history）。 */
@@ -238,6 +245,7 @@ export class ApiClient {
 			hash: header(res.headers, "x-content-hash") ?? "",
 			size: num(header(res.headers, "x-file-size")),
 			mtime: num(header(res.headers, "x-file-mtime")),
+			fileId: header(res.headers, "x-file-id") || undefined,
 		};
 	}
 
@@ -248,6 +256,7 @@ export class ApiClient {
 		data: ArrayBuffer,
 		mtime: number,
 		action: UploadAction = "upsert",
+		fileId?: string,
 	): Promise<UploadOk> {
 		const res = await requestUrl({
 			url: `${this.base()}/api/v1/file`,
@@ -259,6 +268,7 @@ export class ApiClient {
 				"X-Content-Hash": hash,
 				"X-File-Mtime": String(Math.round(mtime)),
 				"X-Action": action,
+				...(fileId ? { "X-File-Id": fileId } : {}),
 			}),
 			body: data,
 			throw: false,
@@ -301,6 +311,7 @@ export class ApiClient {
 			hash: header(res.headers, "x-content-hash") ?? "",
 			size: num(header(res.headers, "x-file-size")),
 			mtime: num(header(res.headers, "x-file-mtime")),
+			fileId: header(res.headers, "x-file-id") || undefined,
 		};
 	}
 
@@ -487,6 +498,29 @@ export class ApiClient {
 		});
 		if (res.status !== 200) throw new ApiError(res.status, `history purge failed: HTTP ${res.status}`);
 		return num((res.json as Record<string, unknown>)?.removed);
+	}
+
+	/**
+	 * 原子改名（v9.3，明文模式）：服务器单事务完成旧路径 tombstone + 新路径新行。
+	 * 409 → ConflictError（远端已变化/目标占用）；其余非 200 → ApiError，
+	 * 调用方回退 delete+upsert 语义。
+	 */
+	async move(
+		fromPath: string,
+		toPath: string,
+		baseRevision: number,
+	): Promise<{ revision: number; tombstoneRevision: number; sequence: number }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/file/move`,
+			method: "POST",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify({ fromPath, toPath, baseRevision }),
+			throw: false,
+		});
+		if (res.status === 409) throw new ConflictError(parseConflict(res.text, fromPath));
+		if (res.status !== 200)
+			throw new ApiError(res.status, `move ${fromPath} -> ${toPath} failed: HTTP ${res.status}${serverErrText(res.text)}`);
+		return res.json as { revision: number; tombstoneRevision: number; sequence: number };
 	}
 
 	async remove(path: string, baseRevision: number): Promise<void> {

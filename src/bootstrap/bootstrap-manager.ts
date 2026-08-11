@@ -102,6 +102,8 @@ export async function bootstrapRemoteWins(
 					revision: dl.revision,
 					mtime: stat.mtime,
 					size: stat.size,
+					fileId: dl.fileId,
+					generation: dl.generation,
 				});
 				continue;
 			}
@@ -124,6 +126,8 @@ export async function bootstrapRemoteWins(
 			revision: dl.revision,
 			mtime: st?.mtime ?? Date.now(),
 			size: dl.plain.byteLength,
+			fileId: dl.fileId,
+			generation: dl.generation,
 		});
 	}
 
@@ -184,6 +188,8 @@ export async function bootstrapMerge(
 				revision: dl.revision,
 				mtime: st?.mtime ?? Date.now(),
 				size: dl.plain.byteLength,
+				fileId: dl.fileId,
+				generation: dl.generation,
 			});
 			result.downloaded++;
 			continue;
@@ -198,6 +204,8 @@ export async function bootstrapMerge(
 				revision: dl.revision,
 				mtime: stat.mtime,
 				size: stat.size,
+				fileId: dl.fileId,
+				generation: dl.generation,
 			});
 			continue;
 		}
@@ -244,6 +252,8 @@ export async function bootstrapMerge(
 			revision: out.revision,
 			mtime: stat.mtime,
 			size: stat.size,
+			fileId: out.fileId,
+			generation: out.generation,
 		});
 		result.uploaded++;
 	}

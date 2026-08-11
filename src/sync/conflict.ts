@@ -56,6 +56,8 @@ export async function keepBothVersions(
 			revision: dl.revision,
 			mtime: stat?.mtime ?? Date.now(),
 			size: dl.plain.byteLength,
+			fileId: dl.fileId,
+			generation: dl.generation,
 		});
 	} else {
 		ctx.log(`keepBoth: local changed during download of ${path}, keeping current content`);

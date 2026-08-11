@@ -470,19 +470,38 @@ export default class PrivateSyncPlugin extends Plugin {
 		this.registerEvent(
 			this.app.vault.on("rename", (f, oldPath) => {
 				if (this.manager?.applyingRemote) return;
-				// rename = 旧路径 delete + 新路径 upsert（第一版协议，见计划书第 23 节）
+				// v9.3：旧路径已 tracked → 原子 MOVE。E2EE 下要求 tracked 为 LSE3
+				//（generation 已知；LSE3 的 AAD 绑 fileId 不绑路径，改名无需重新加密），
+				// 其余（LSE1/LSE2 密文 / 未同步过）维持 delete+upsert
+				const canMove = (from: string): boolean => {
+					const t = this.store?.get(from);
+					if (!t) return false;
+					return !this.keyring.enabled || (t.generation !== undefined && !!t.fileId);
+				};
 				if (f instanceof TFolder) {
 					for (const path of this.store?.paths() ?? []) {
-						if (path.startsWith(oldPath + "/")) this.queue.add(path, "delete");
-					}
-					for (const file of this.app.vault.getFiles()) {
-						if (file.path.startsWith(f.path + "/") && !this.ignoreMatcher?.ignores(file.path)) {
-							this.queue.add(file.path, "upsert");
+						if (!path.startsWith(oldPath + "/")) continue;
+						const newPath = f.path + "/" + path.slice(oldPath.length + 1);
+						if (!this.ignoreMatcher?.ignores(newPath) && canMove(path)) {
+							this.queue.addMove(newPath, path);
+						} else {
+							this.queue.add(path, "delete");
 						}
 					}
+					for (const file of this.app.vault.getFiles()) {
+						if (!file.path.startsWith(f.path + "/") || this.ignoreMatcher?.ignores(file.path)) continue;
+						if (this.queue.getOp(file.path)?.action === "move") continue; // 不覆盖已排队的 move
+						this.queue.add(file.path, "upsert");
+					}
 				} else {
-					if (!this.ignoreMatcher?.ignores(oldPath)) this.queue.add(oldPath, "delete");
-					if (!this.ignoreMatcher?.ignores(f.path)) this.queue.add(f.path, "upsert");
+					const ignoredOld = this.ignoreMatcher?.ignores(oldPath) ?? false;
+					const ignoredNew = this.ignoreMatcher?.ignores(f.path) ?? false;
+					if (!ignoredOld && !ignoredNew && canMove(oldPath)) {
+						this.queue.addMove(f.path, oldPath);
+					} else {
+						if (!ignoredOld) this.queue.add(oldPath, "delete");
+						if (!ignoredNew) this.queue.add(f.path, "upsert");
+					}
 				}
 				this.scheduleDebounced();
 			}),

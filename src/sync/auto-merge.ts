@@ -69,6 +69,8 @@ export async function attemptAutoMerge(
 					revision: remote.revision,
 					mtime: stat?.mtime ?? Date.now(),
 					size: localData.byteLength,
+					fileId: remote.fileId,
+					generation: remote.generation,
 				});
 				return "merged";
 			}
@@ -106,6 +108,8 @@ export async function attemptAutoMerge(
 					revision: out.revision,
 					mtime: stat?.mtime ?? Date.now(),
 					size: mergedData.byteLength,
+					fileId: out.fileId,
+					generation: out.generation,
 				});
 				ctx.notify(`已自动合并: ${path}`);
 				ctx.log(`auto-merge: ${path} → rev ${out.revision} (attempt ${attempt + 1})`);

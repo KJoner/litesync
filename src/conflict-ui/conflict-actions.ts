@@ -103,6 +103,8 @@ export async function saveResolution(
 		revision: out.revision,
 		mtime: stat?.mtime ?? Date.now(),
 		size: data.byteLength,
+		fileId: out.fileId,
+		generation: out.generation,
 	});
 	ctx.store.clearConflict(path);
 	await ctx.store.save();

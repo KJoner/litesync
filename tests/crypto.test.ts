@@ -9,9 +9,14 @@ import {
 	decryptFile,
 	decryptShare,
 	encryptFile,
+	decryptFileV3,
+	encryptFileV3,
 	encryptShare,
 	isEncryptedPayload,
 	isLegacyEnvelope,
+	isLse3Envelope,
+	newFileId,
+	parseLse3Header,
 	randomBytes,
 	unlockVaultKey,
 } from "../src/crypto/crypto";
@@ -109,7 +114,8 @@ test("LSE2: 往返一致，magic 正确，可被识别为加密格式", async ()
 	const plain = buf("# LSE2 内容\n中英混排 test.\n");
 	const payload = await encryptFile(vmk, "Notes/n.md", plain, BINDING);
 	assert.equal(isEncryptedPayload(payload), true);
-	assert.equal(isLegacyEnvelope(payload), false);
+	// v9.3 起 LSE2 也属于旧信封（升级目标为 LSE3）
+	assert.equal(isLegacyEnvelope(payload), true);
 	assert.deepEqual(Array.from(new Uint8Array(payload, 0, 4)), [0x4c, 0x53, 0x45, 0x32]); // "LSE2"
 
 	const dec = await decryptFile(vmk, "Notes/n.md", payload, BINDING);
@@ -150,6 +156,60 @@ test("LSE1 兼容：旧信封仍可解密（升级过渡），isLegacyEnvelope �
 	// 带 binding 的解密调用也能解 LSE1（读取兼容）
 	const dec = await decryptFile(vmk, "old.md", legacy, BINDING);
 	assert.equal(new TextDecoder().decode(dec!), "legacy content");
+});
+
+// ---------- LSE3 信封（v9.3：fileId-AAD + contentGeneration） ----------
+
+const FILE_ID = "0123456789abcdef0123456789abcdef";
+const B3 = { vaultId: "aabbccdd00112233", keyEpoch: 2, fileId: FILE_ID, generation: 7 };
+
+test("LSE3: 往返一致；信封头可解析；isLegacyEnvelope=false", async () => {
+	const { vmk } = await createVaultKeyDoc("pw-lse3");
+	const plain = buf("# LSE3\n改名不再需要重新加密。\n");
+	const payload = await encryptFileV3(vmk, B3, plain);
+	assert.equal(isEncryptedPayload(payload), true);
+	assert.equal(isLse3Envelope(payload), true);
+	assert.equal(isLegacyEnvelope(payload), false);
+	assert.deepEqual(parseLse3Header(payload), { keyEpoch: 2, generation: 7 });
+
+	const dec = await decryptFileV3(vmk, payload, B3.vaultId, B3.fileId, B3.keyEpoch);
+	assert.notEqual(dec, null);
+	assert.equal(dec!.generation, 7);
+	assert.equal(new TextDecoder().decode(dec!.plain), new TextDecoder().decode(plain));
+});
+
+test("LSE3: AAD 绑定 fileId → 换 fileId（跨文件密文重放）被拒绝；路径无关", async () => {
+	const { vmk } = await createVaultKeyDoc("pw");
+	const payload = await encryptFileV3(vmk, B3, buf("secret"));
+	// 恶意服务器把 A 文件的密文说成 B 文件 → fileId 不符 → GCM 认证失败
+	assert.equal(await decryptFileV3(vmk, payload, B3.vaultId, "ffff6789abcdef0123456789abcdef01", B3.keyEpoch), null);
+	// vaultId 不符同样拒绝
+	assert.equal(await decryptFileV3(vmk, payload, "other-vault", B3.fileId, B3.keyEpoch), null);
+	// 解密与路径完全无关（这正是 E2EE 下 MOVE 无需重加密的原因）
+	assert.notEqual(await decryptFileV3(vmk, payload, B3.vaultId, B3.fileId, B3.keyEpoch), null);
+});
+
+test("LSE3: 信封头 generation 被篡改 → AAD 认证失败（头字段不可伪造）", async () => {
+	const { vmk } = await createVaultKeyDoc("pw");
+	const payload = new Uint8Array((await encryptFileV3(vmk, B3, buf("content"))).slice(0));
+	// generation u64 在 offset 8..16：改成 8
+	new DataView(payload.buffer).setBigUint64(8, 8n, false);
+	assert.deepEqual(parseLse3Header(payload.buffer)!.generation, 8);
+	assert.equal(await decryptFileV3(vmk, payload.buffer, B3.vaultId, B3.fileId, B3.keyEpoch), null);
+});
+
+test("LSE3: keyEpoch 校验（expected>0 时必须一致；0 = 过渡期按信封头）", async () => {
+	const { vmk } = await createVaultKeyDoc("pw");
+	const payload = await encryptFileV3(vmk, B3, buf("x"));
+	assert.equal(await decryptFileV3(vmk, payload, B3.vaultId, B3.fileId, 3), null);
+	assert.notEqual(await decryptFileV3(vmk, payload, B3.vaultId, B3.fileId, 0), null);
+});
+
+test("newFileId: 32 位 hex 且不重复", () => {
+	const a = newFileId();
+	const b = newFileId();
+	assert.match(a, /^[0-9a-f]{32}$/);
+	assert.notEqual(a, b);
 });
 
 // ---------- 分享加密（Phase 17：独立 Share Key） ----------
