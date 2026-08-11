@@ -131,6 +131,18 @@ export default class PrivateSyncPlugin extends Plugin {
 		const pluginDir = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
 		this.store = new StateStore(this.app.vault.adapter, `${pluginDir}/state.json`);
 		await this.store.load();
+		// 状态损坏停机（v9）：不初始化同步，提示用户处理（SyncManager 侧另有硬性兜底）
+		if (this.store.corrupted) {
+			new Notice(
+				"LiteSync：本地同步状态文件损坏（state-a/state-b.json 均无法读取），同步已停止。\n请勿删除这两个文件，可从备份恢复或联系支持渠道处理",
+				0,
+			);
+		}
+		// 队列持久化（v9 P1-10）：镜像到 state.pendingOps，重启后未完成的上传/删除不丢
+		this.queue.onChange = (entries) => {
+			if (this.store) this.store.state.pendingOps = entries;
+		};
+		this.queue.restore(this.store.state.pendingOps);
 
 		// API Token：读取 SecretStorage（旧版 data.json 明文值迁入后抹除）
 		await this.loadOrMigrateApiToken();

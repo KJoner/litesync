@@ -104,6 +104,9 @@ export interface ParsedPairUrl {
 export function parsePairUrl(url: string): ParsedPairUrl | null {
 	try {
 		const u = new URL(url.trim());
+		// 安全红线（v9）：配对包里有 API Token，非 loopback 地址一律要求 https
+		if (u.protocol === "http:" && !isLoopbackHost(u.hostname)) return null;
+		if (u.protocol !== "http:" && u.protocol !== "https:") return null;
 		const m = /^\/p\/([0-9a-f]+)$/i.exec(u.pathname);
 		if (!m) return null;
 		const secret = new URLSearchParams(u.hash.slice(1)).get("secret");
@@ -112,6 +115,12 @@ export function parsePairUrl(url: string): ParsedPairUrl | null {
 	} catch {
 		return null;
 	}
+}
+
+/** 仅本机地址允许 http://（与 ApiClient 同一规则）。 */
+export function isLoopbackHost(host: string): boolean {
+	const h = host.toLowerCase();
+	return h === "localhost" || h === "::1" || h === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
 }
 
 /** 消费配对包（公开接口：新设备此时还没有 Token）。返回密文；失效返回 null。 */

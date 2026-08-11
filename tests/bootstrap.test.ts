@@ -116,4 +116,10 @@ test("pairing: 配对链接构造/解析往返；secret 只在 fragment", () => 
 	assert.equal(parsePairUrl("https://sync.example.com/p/" + id), null);
 	assert.equal(parsePairUrl("https://sync.example.com/share/xyz#secret=aa"), null);
 	assert.equal(parsePairUrl("not a url"), null);
+
+	// v9 P1-15：配对包含 Token，非 loopback 的 http:// 一律拒绝；loopback 放行（本机调试）
+	assert.equal(parsePairUrl("http://sync.example.com/p/" + id + "#secret=aa"), null);
+	assert.equal(parsePairUrl("http://192.168.1.10:8080/p/" + id + "#secret=aa"), null);
+	assert.ok(parsePairUrl("http://127.0.0.1:8080/p/" + id + "#secret=aa"));
+	assert.ok(parsePairUrl("http://localhost:8080/p/" + id + "#secret=aa"));
 });

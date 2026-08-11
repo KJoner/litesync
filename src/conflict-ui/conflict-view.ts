@@ -2,7 +2,7 @@ import { Modal, Notice } from "obsidian";
 import { ConflictError } from "../api/client";
 import { assembleResolution } from "../merge/three-way";
 import { SyncContext } from "../sync/context";
-import { keepBothForConflict, loadConflict, saveResolution } from "./conflict-actions";
+import { keepBothForConflict, loadConflict, LocalChangedError, saveResolution } from "./conflict-actions";
 import { listPendingConflicts, LoadedConflict } from "./conflict-state";
 
 /** 未解决冲突列表（计划书 Phase 15）。 */
@@ -81,7 +81,13 @@ export class ResolverModal extends Modal {
 		// 加载后可能发现其实可以干净合并（远端变化后冲突消失）
 		if (this.loaded.merge.clean) {
 			try {
-				await saveResolution(this.ctx, this.path, this.loaded.merge.mergedText, this.loaded.remoteRevision);
+				await saveResolution(
+					this.ctx,
+					this.path,
+					this.loaded.merge.mergedText,
+					this.loaded.remoteRevision,
+					this.loaded.localHash,
+				);
 				new Notice(`冲突已自动消除: ${this.path}`);
 				this.ctx.onConflictsChanged();
 				this.close();
@@ -241,7 +247,7 @@ export class ResolverModal extends Modal {
 			return;
 		}
 		try {
-			const rev = await saveResolution(this.ctx, this.path, text, this.loaded!.remoteRevision);
+			const rev = await saveResolution(this.ctx, this.path, text, this.loaded!.remoteRevision, this.loaded!.localHash);
 			new Notice(`合并完成: ${this.path} → Revision ${rev}`);
 			this.ctx.onConflictsChanged();
 			this.close();
@@ -249,6 +255,11 @@ export class ResolverModal extends Modal {
 			if (e instanceof ConflictError) {
 				// Race Protection：远端在处理期间又变化 → 重新加载最新内容重新 merge
 				new Notice("远端在处理期间又发生了变化，已重新加载最新版本，请重新确认合并");
+				this.contentEl.setText("重新加载中…");
+				await this.reload();
+			} else if (e instanceof LocalChangedError) {
+				// 本地 CAS（v9）：处理期间本地文件被编辑 → 重新加载，绝不覆盖
+				new Notice("本地文件在处理期间被修改，已重新加载，请重新确认合并");
 				this.contentEl.setText("重新加载中…");
 				await this.reload();
 			} else {

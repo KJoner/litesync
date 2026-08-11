@@ -11,13 +11,24 @@ export interface ServerInfo {
 	minProtocolVersion?: number;
 	/** 同步仓库的稳定标识（0.8.0+）：URL 不变但 vaultId 变化 = 服务器被重装/换库 */
 	vaultId?: string;
+	/**
+	 * sequence 空间的世代（0.9.0+）：服务器从备份恢复后旋转。
+	 * epoch 变化时旧游标全部作废，客户端必须进入恢复合并而不是继续增量同步
+	 */
+	repoEpoch?: string;
+	/** 权威全局时钟（0.9.0+）：不再依赖可裁剪的 changes 表 */
+	headSequence?: number;
+	/** E2EE 状态机（0.9.0+）：plaintext / migrating / encrypted */
+	encryptionState?: string;
+	keyEpoch?: number;
 }
 
 /**
  * 插件实现的同步协议版本（v7 起插件与服务器分仓独立发版）。
  * 破坏性协议变更时递增，与服务器 /api/v1/info 的区间做兼容性判定。
+ * v2（0.9.0）：repoEpoch、tombstone 拒绝 base 0、E2EE 状态机、vault-key CAS。
  */
-export const PLUGIN_PROTOCOL_VERSION = 1;
+export const PLUGIN_PROTOCOL_VERSION = 2;
 
 /** 协议不兼容时返回给用户的提示；兼容返回 null。 */
 export function protocolError(info: ServerInfo): string | null {
@@ -47,6 +58,9 @@ export interface ChangesResponse {
 	/** 服务器已裁剪掉本游标之前的 changes：必须走 snapshot 全量对账 */
 	resyncRequired?: boolean;
 	minSequence?: number;
+	/** sequence 世代（0.9.0+）：与本地保存值不一致时必须停止增量同步 */
+	repoEpoch?: string;
+	headSequence?: number;
 }
 
 /** snapshot 文件元数据（全量对账用）。 */
@@ -72,6 +86,11 @@ export interface RemoteFileState {
 	revision: number;
 	hash: string;
 	deleted: boolean;
+	/**
+	 * tombstone 冲突时删除前最后一个版本的内容 hash（0.9.0+）：
+	 * 客户端据此区分「陈旧副本复活」与「同名新内容重建」
+	 */
+	priorHash?: string;
 }
 
 export interface DownloadResult {
@@ -149,6 +168,11 @@ export class ApiClient {
 	private base(): string {
 		const url = this.getConfig().serverUrl.trim().replace(/\/+$/, "");
 		if (!url) throw new ApiError(0, "server URL is not configured");
+		// 安全红线（v9）：Token 与内容绝不允许走明文 HTTP 出本机——
+		// 仅 loopback（本机调试）放行 http://，其余一律要求 https://
+		if (/^http:\/\//i.test(url) && !isLoopbackUrl(url)) {
+			throw new ApiError(0, "非本机地址必须使用 https://（当前 Server URL 是 http://，Token 会被明文暴露）");
+		}
 		return url;
 	}
 
@@ -184,7 +208,7 @@ export class ApiClient {
 	}
 
 	/** 当前所有未删除文件的元数据（changes 被裁剪后的全量对账）。 */
-	async snapshot(): Promise<{ sequence: number; files: SnapshotFile[] }> {
+	async snapshot(): Promise<{ sequence: number; files: SnapshotFile[]; repoEpoch?: string }> {
 		const res = await requestUrl({
 			url: `${this.base()}/api/v1/snapshot`,
 			method: "GET",
@@ -192,7 +216,7 @@ export class ApiClient {
 			throw: false,
 		});
 		if (res.status !== 200) throw new ApiError(res.status, `snapshot failed: HTTP ${res.status}`);
-		return res.json as { sequence: number; files: SnapshotFile[] };
+		return res.json as { sequence: number; files: SnapshotFile[]; repoEpoch?: string };
 	}
 
 	async download(path: string): Promise<DownloadResult> {
@@ -239,7 +263,10 @@ export class ApiClient {
 			throw: false,
 		});
 		if (res.status === 409) throw new ConflictError(parseConflict(res.text, path));
-		if (res.status !== 200) throw new ApiError(res.status, `upload ${path} failed: HTTP ${res.status}`);
+		if (res.status !== 200) {
+			// 422（路径碰撞）等携带说明的错误：把服务器信息带给用户
+			throw new ApiError(res.status, `upload ${path} failed: HTTP ${res.status}${serverErrText(res.text)}`);
+		}
 		return res.json as UploadOk;
 	}
 
@@ -341,6 +368,11 @@ export class ApiClient {
 
 	/** 获取服务器上的加密 vault key 文档；未启用 E2EE 时返回 null。 */
 	async getVaultKey(): Promise<VaultKeyDoc | null> {
+		return (await this.getVaultKeyWithFingerprint())?.doc ?? null;
+	}
+
+	/** 获取 vault key 文档及其 CAS 指纹（replace 时必须原样传回，0.9.0+）。 */
+	async getVaultKeyWithFingerprint(): Promise<{ doc: VaultKeyDoc; fingerprint: string } | null> {
 		const res = await requestUrl({
 			url: `${this.base()}/api/v1/vault-key`,
 			method: "GET",
@@ -349,19 +381,43 @@ export class ApiClient {
 		});
 		if (res.status === 404) return null;
 		if (res.status !== 200) throw new ApiError(res.status, `vault-key get failed: HTTP ${res.status}`);
-		return res.json as VaultKeyDoc;
+		return {
+			doc: res.json as VaultKeyDoc,
+			fingerprint: header(res.headers, "x-vault-key-fingerprint") ?? "",
+		};
 	}
 
-	/** 上传加密 vault key 文档。已存在且未 replace 时服务器返回 409。 */
-	async putVaultKey(doc: VaultKeyDoc, replace: boolean): Promise<void> {
+	/**
+	 * 上传加密 vault key 文档。已存在且未 replace 时服务器返回 409；
+	 * replace 必须携带当前文档指纹（CAS），指纹不符服务器返回 412——
+	 * 防止并发迁移把别的设备刚写入的 key 文档无条件覆盖掉。
+	 */
+	async putVaultKey(doc: VaultKeyDoc, replace: boolean, expectedFingerprint = ""): Promise<void> {
 		const res = await requestUrl({
 			url: `${this.base()}/api/v1/vault-key${replace ? "?replace=true" : ""}`,
 			method: "PUT",
-			headers: this.headers({ "Content-Type": "application/json" }),
+			headers: this.headers({
+				"Content-Type": "application/json",
+				...(expectedFingerprint ? { "X-Expected-Fingerprint": expectedFingerprint } : {}),
+			}),
 			body: JSON.stringify(doc),
 			throw: false,
 		});
-		if (res.status !== 200) throw new ApiError(res.status, `vault-key put failed: HTTP ${res.status}`);
+		if (res.status !== 200)
+			throw new ApiError(res.status, `vault-key put failed: HTTP ${res.status}${serverErrText(res.text)}`);
+	}
+
+	/** E2EE 状态机（0.9.0+）：begin 冻结明文写 / complete 全量验证后启用 / abort 回退。 */
+	async e2eeTransition(action: "begin" | "complete" | "abort"): Promise<{ encryptionState: string; keyEpoch: number }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/e2ee/${action}`,
+			method: "POST",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200)
+			throw new ApiError(res.status, `e2ee ${action} failed: HTTP ${res.status}${serverErrText(res.text)}`);
+		return res.json as { encryptionState: string; keyEpoch: number };
 	}
 
 	/** 清理某路径 beforeRevision 之前的历史版本（E2EE 迁移：密文验证后清明文）。 */
@@ -397,7 +453,29 @@ function parseConflict(text: string, path: string): RemoteFileState {
 		revision: num(body?.revision),
 		hash: typeof body?.hash === "string" ? body.hash : "",
 		deleted: body?.deleted === true,
+		priorHash: typeof body?.priorHash === "string" ? body.priorHash : undefined,
 	};
+}
+
+/** 提取服务器错误响应中的说明文字（附加到 ApiError message）。 */
+function serverErrText(text: string): string {
+	const body = tryJson(text);
+	const msg = typeof body?.error === "string" ? body.error : "";
+	const extra = typeof body?.existing === "string" ? `（与现有文件冲突：${body.existing}）` : "";
+	return msg ? ` — ${msg}${extra}` : "";
+}
+
+/** 仅本机地址允许走 http://（Token 明文传输的唯一豁免场景）。 */
+export function isLoopbackUrl(url: string): boolean {
+	const m = /^https?:\/\/(\[[^\]]+\]|[^/:?#]+)/i.exec(url.trim());
+	if (!m) return false;
+	const host = m[1].toLowerCase();
+	return (
+		host === "localhost" ||
+		host === "[::1]" ||
+		host === "127.0.0.1" ||
+		/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
+	);
 }
 
 function tryJson(text: string): Record<string, unknown> | null {

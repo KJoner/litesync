@@ -9,6 +9,7 @@ import { DownloadResult, UploadAction } from "../api/client";
 import { decryptFile, encryptFile, isEncryptedPayload } from "../crypto/crypto";
 import { E2eeLockedError } from "../crypto/keyring";
 import { sha256Hex } from "../utils/hash";
+import { ensureParentFolder } from "../utils/path";
 import { SyncContext } from "./context";
 
 export interface PlainDownload {
@@ -33,6 +34,11 @@ async function decode(ctx: SyncContext, path: string, dl: DownloadResult): Promi
 		const dec = await decryptFile(ctx.e2ee.requireKey(), path, dl.data);
 		if (dec === null) throw new Error(`无法解密 ${path}（密钥不匹配或数据被篡改）`);
 		plain = dec;
+	} else if (ctx.e2ee.enabled) {
+		// 加密降级防护（v9）：E2EE 已启用时服务器绝不应返回明文——
+		// 出现即说明有旧客户端明文写入或服务器内容被替换，必须硬失败停止同步，
+		// 而不是把可疑明文写进 Vault（迁移完成后所有 HEAD 都已验证为密文）
+		throw new Error(`E2EE 已启用但服务器返回了明文内容：${path}（可能存在未升级设备的明文写入，已停止同步）`);
 	}
 	return { plain, plainHash: await sha256Hex(plain), cipherHash, revision: dl.revision, mtime: dl.mtime };
 }
@@ -52,6 +58,27 @@ export interface UploadOutcome {
 	/** 实际上传到服务器的内容 hash（E2EE 下为密文 hash） */
 	cipherHash: string;
 	sequence: number;
+}
+
+/**
+ * 本地 Compare-And-Swap 写入（v9 TOCTOU 修复）：目标文件自决策时刻起未变
+ *（hash 一致，或决策时与当前都不存在）才写入远端内容；
+ * 否则返回 false，调用方必须转入冲突处理，绝不覆盖用户刚写下的内容。
+ */
+export async function writeIfLocalUnchanged(
+	ctx: SyncContext,
+	path: string,
+	data: ArrayBuffer,
+	expectedLocalHash: string | null,
+	mtime?: number,
+): Promise<boolean> {
+	const adapter = ctx.app.vault.adapter;
+	const stat = await adapter.stat(path);
+	const currentHash = stat ? await sha256Hex(await adapter.readBinary(path)) : null;
+	if (currentHash !== expectedLocalHash) return false;
+	await ensureParentFolder(adapter, path);
+	await adapter.writeBinary(path, data, mtime !== undefined && mtime > 0 ? { mtime } : undefined);
+	return true;
 }
 
 /** 上传明文内容（E2EE 启用时自动加密）。 */

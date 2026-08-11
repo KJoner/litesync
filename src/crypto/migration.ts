@@ -58,22 +58,44 @@ export async function enableE2ee(
 		throw new Error("存在未完成的同步或未解决的冲突，请处理后重新启用");
 	}
 
-	// 3. 逐文件迁移：加密上传 → 下载回验 → 清理明文历史
-	const paths = ctx.store.paths().filter((p) => !ctx.ignores(p));
+	const serverState = (await ctx.client.info()).encryptionState ?? "plaintext";
 	let done = 0;
-	for (const path of paths) {
-		onProgress({ total: paths.length, done, current: path });
-		await migratePath(ctx, vmk, path);
-		done++;
-		if (done % 10 === 0) await ctx.store.save();
-	}
-	await ctx.store.save();
+	if (serverState !== "encrypted") {
+		// 3. 服务器进入 migrating（v9 状态机）：从这一刻起服务器冻结一切明文写，
+		// 其他旧设备无法在迁移期间把明文写回仓库（它们的上传会被 409 拒绝）
+		await ctx.client.e2eeTransition("begin");
 
-	// 4. 全部验证完成 → 标记 enabled（同一密钥材料，只翻转标志位）
-	const finalDoc: VaultKeyDoc = { ...doc, enabled: true };
-	await ctx.client.putVaultKey(finalDoc, true);
-	ctx.e2ee.adopt(finalDoc, vmk);
-	ctx.store.state.e2ee = finalDoc;
+		// 4. 迁移清单 = 服务器一致性快照（v9）：以服务器为权威，
+		// 本地 state 缓存里没有的远端文件同样会被加密，不会有漏网明文
+		const snap = await ctx.client.snapshot();
+		const paths = snap.files.map((f) => f.path).filter((p) => !ctx.ignores(p));
+
+		// 5. 逐文件迁移：加密上传 → 下载回验 → 清理明文历史
+		for (const path of paths) {
+			onProgress({ total: paths.length, done, current: path });
+			await migratePath(ctx, vmk, path);
+			done++;
+			if (done % 10 === 0) await ctx.store.save();
+		}
+		await ctx.store.save();
+
+		// 6. 服务器切换到 encrypted：服务端会再次验证所有 HEAD 均为 LSE1 密文，
+		// 有任何明文残留都会拒绝——「标记已加密但仓库里还有明文」不可能发生
+		await ctx.client.e2eeTransition("complete");
+	}
+
+	// 7. 标记 key 文档 enabled（CAS：携带当前指纹，绝不盲目覆盖并发写入的文档）
+	const cur = await ctx.client.getVaultKeyWithFingerprint();
+	if (!cur) throw new Error("vault key 文档丢失，请重新启用");
+	if (!cur.doc.enabled) {
+		const finalDoc: VaultKeyDoc = { ...cur.doc, enabled: true };
+		await ctx.client.putVaultKey(finalDoc, true, cur.fingerprint);
+		ctx.e2ee.adopt(finalDoc, vmk);
+		ctx.store.state.e2ee = finalDoc;
+	} else {
+		ctx.e2ee.adopt(cur.doc, vmk);
+		ctx.store.state.e2ee = cur.doc;
+	}
 	await ctx.store.save();
 	ctx.log(`e2ee: migration complete, ${done} files encrypted`);
 	return done;

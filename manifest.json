@@ -1,10 +1,10 @@
 {
-  "id": "litesync",
-  "name": "LiteSync",
-  "version": "0.8.1",
-  "minAppVersion": "1.13.0",
-  "description": "Sync your vault with your own self-hosted LiteSync server. End-to-end encryption, version history, and automatic three-way merge.",
-  "author": "KJoner",
-  "authorUrl": "https://github.com/KJoner",
-  "isDesktopOnly": false
+	"id": "litesync",
+	"name": "LiteSync",
+	"version": "0.9.0",
+	"minAppVersion": "1.13.0",
+	"description": "Sync your vault with your own self-hosted LiteSync server. End-to-end encryption, version history, and automatic three-way merge.",
+	"author": "KJoner",
+	"authorUrl": "https://github.com/KJoner",
+	"isDesktopOnly": false
 }

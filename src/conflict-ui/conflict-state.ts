@@ -9,6 +9,8 @@ export interface LoadedConflict {
 	/** 打开 Resolver 时刻的远端 revision（Save Merge 必须以它为 baseRevision） */
 	remoteRevision: number;
 	localText: string;
+	/** 打开 Resolver 时刻本地内容的 hash（Save 时本地 CAS 用，v9） */
+	localHash: string;
 	remoteText: string;
 	/** base 版本不可用（已被 GC 等）时为 null，此时整体作为一个冲突段处理 */
 	baseText: string | null;

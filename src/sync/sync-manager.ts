@@ -26,6 +26,7 @@ export class SyncManager {
 	/** 协议兼容性检查通过（每次插件加载只检查一次；不兼容时每轮同步都会重新确认） */
 	private protocolOk = false;
 	private protocolWarned = false;
+	private stateCorruptWarned = false;
 
 	constructor(private ctx: SyncContext) {}
 
@@ -57,6 +58,18 @@ export class SyncManager {
 
 		const counters: SyncCounters = { pulled: 0, pushed: 0, conflicts: 0 };
 		try {
+			// 状态损坏停机（v9 P0-6）：A/B 副本全部损坏时绝不「从零开始」同步——
+			// 空状态会把陈旧本地文件当新文件上传（复活已删内容、制造假冲突）
+			if (this.ctx.store.corrupted) {
+				const msg = "本地同步状态文件损坏（两份副本均无法读取），同步已停止；请检查插件目录中的 state-a/state-b.json 或重新接入";
+				if (!this.stateCorruptWarned) {
+					this.stateCorruptWarned = true;
+					this.ctx.notify(msg);
+				}
+				this.ctx.log(`sync blocked (${reason}): state corrupted`);
+				this.onStatus("offline", msg);
+				return;
+			}
 			// Bootstrap Gate 硬保护（v8）：未接入的设备绝不执行任何同步
 			//（向导由 main 侧入口负责弹出，这里只兜底阻断）
 			if (!this.ctx.store.bootstrapReady) {
@@ -90,6 +103,24 @@ export class SyncManager {
 					this.ctx.log(`sync blocked: vaultId changed ${saved} -> ${info.vaultId}`);
 					this.onStatus("offline", msg);
 					return;
+				}
+				// repoEpoch 保护（v9）：服务器从备份恢复后旋转 epoch，旧游标全部作废
+				// → 停止增量同步，重新接入（选「安全合并」保留本地 post-backup 内容）
+				const savedEpoch = this.ctx.store.state.bootstrap.repoEpoch;
+				if (savedEpoch && info.repoEpoch && info.repoEpoch !== savedEpoch) {
+					this.ctx.store.resetBootstrap();
+					await this.ctx.store.save();
+					const msg =
+						"服务器数据已从备份恢复（repoEpoch 变化），已暂停同步；请重新运行接入向导并选择「安全合并」，本地较新的内容不会丢失";
+					this.ctx.notify(msg);
+					this.ctx.log(`sync blocked: repoEpoch changed ${savedEpoch} -> ${info.repoEpoch}`);
+					this.onStatus("offline", msg);
+					return;
+				}
+				// v0.8 升级设备第一次见到 epoch：补记录
+				if (!savedEpoch && info.repoEpoch && this.ctx.store.bootstrapReady) {
+					this.ctx.store.state.bootstrap.repoEpoch = info.repoEpoch;
+					await this.ctx.store.save();
 				}
 				this.protocolOk = true;
 			}

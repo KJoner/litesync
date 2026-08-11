@@ -9,6 +9,11 @@ export interface BootstrapState {
 	status: "pending" | "ready";
 	/** 完成接入时服务器的 vaultId；同一 URL 上 vaultId 变化 = 服务器被重装/换库 */
 	remoteVaultId?: string;
+	/**
+	 * 完成接入时服务器的 repoEpoch（v9）：服务器从备份恢复后会旋转 epoch，
+	 * 客户端发现变化即停止增量同步进入恢复合并（本地新内容绝不丢）
+	 */
+	repoEpoch?: string;
 	mode?: BootstrapMode;
 	snapshotSequence?: number;
 	completedAt?: number;

@@ -6,7 +6,7 @@ import { ensureParentFolder } from "../utils/path";
 import { attemptAutoMerge } from "./auto-merge";
 import { keepBothVersions } from "./conflict";
 import { SyncContext } from "./context";
-import { downloadPlain, uploadFromPlain } from "./transfer";
+import { downloadPlain, uploadFromPlain, versionPlain } from "./transfer";
 
 export interface PushResult {
 	pushed: number;
@@ -83,7 +83,7 @@ async function listHiddenFiles(ctx: SyncContext, dir: string): Promise<string[]>
 export async function pushPendingChanges(ctx: SyncContext): Promise<PushResult> {
 	const result: PushResult = { pushed: 0, conflicts: 0 };
 	try {
-		for (const [path, action] of ctx.queue.entries()) {
+		for (const [path, action, gen] of ctx.queue.entries()) {
 			if (ctx.ignores(path)) {
 				ctx.queue.remove(path);
 				continue;
@@ -91,7 +91,9 @@ export async function pushPendingChanges(ctx: SyncContext): Promise<PushResult> 
 			const outcome = action === "upsert" ? await pushUpsert(ctx, path) : await pushDelete(ctx, path);
 			if (outcome === "pushed") result.pushed++;
 			if (outcome === "conflict") result.conflicts++;
-			ctx.queue.remove(path);
+			// lost wake-up 修复（v9）：只有 generation 未变才移除——
+			// 上传期间用户又保存了同一文件时，新入队的条目必须留在队列里
+			ctx.queue.remove(path, gen);
 		}
 	} finally {
 		await ctx.store.save();
@@ -142,7 +144,20 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 		if (e instanceof ConflictError) {
 			const server = e.server;
 			if (server.deleted) {
-				// 服务器上是删除墓碑 → 基于墓碑 revision 重新创建
+				// tombstone 复活防护（v9）：曾同步过（tracked 存在）是 edit-vs-delete，
+				// 数据安全优先保留本地；从未跟踪（base 0）则必须先排除「陈旧副本回传」
+				if (!tracked) {
+					const stale = await isStaleResurrection(ctx, path, hash, server);
+					if (stale) {
+						ctx.store.setPendingDelete(path);
+						ctx.notify(
+							`检测到已删除文件的陈旧副本，不会重新上传：${path}\n` +
+								`（该内容在其他设备上已被删除；如确需恢复请修改后再保存，或手动删除本地文件）`,
+						);
+						return "skipped";
+					}
+				}
+				// 基于墓碑 revision 显式重建（同名新内容 / 本地编辑胜出）
 				const out = await uploadFromPlain(ctx, path, data, server.revision, stat.mtime);
 				ctx.store.set(path, {
 					hash,
@@ -197,6 +212,29 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 			return "skipped";
 		}
 		throw e;
+	}
+}
+
+/**
+ * 判断「base 0 上传撞上 tombstone」是否为陈旧副本复活（P0-5）。
+ * - 明文模式：服务器 409 携带删除前内容 hash（priorHash），直接比对；
+ * - E2EE：密文 hash 不可比 → 下载删除前的历史版本解密后按明文比对；
+ * - 历史已被裁剪无从判断时按「同名新内容」放行（宁可多同步，不静默丢内容）。
+ */
+export async function isStaleResurrection(
+	ctx: SyncContext,
+	path: string,
+	plainHash: string,
+	server: { revision: number; priorHash?: string },
+): Promise<boolean> {
+	if (!ctx.e2ee.enabled) return server.priorHash !== undefined && server.priorHash === plainHash;
+	try {
+		// tombstone revision = N，删除前最后一个内容版本 = N-1
+		const prior = await versionPlain(ctx, path, server.revision - 1);
+		return prior.plainHash === plainHash;
+	} catch (e) {
+		if (e instanceof E2eeLockedError) throw e;
+		return false; // 历史不可用：无法证明是陈旧副本 → 按新内容处理
 	}
 }
 

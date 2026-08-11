@@ -2,7 +2,7 @@ import { NotFoundError } from "../api/client";
 import { smartThreeWayMerge } from "../merge/smart-merge";
 import { keepBothVersions } from "../sync/conflict";
 import { SyncContext } from "../sync/context";
-import { downloadPlain, uploadFromPlain, versionPlain } from "../sync/transfer";
+import { downloadPlain, uploadFromPlain, versionPlain, writeIfLocalUnchanged } from "../sync/transfer";
 import { sha256Hex } from "../utils/hash";
 import { decodeUtf8Strict, encodeUtf8 } from "../utils/text";
 import { LoadedConflict } from "./conflict-state";
@@ -34,10 +34,13 @@ export async function loadConflict(ctx: SyncContext, path: string): Promise<Load
 
 	const adapter = ctx.app.vault.adapter;
 	let localText = "";
+	let localHash = "";
 	if (await adapter.stat(path)) {
-		const t = decodeUtf8Strict(await adapter.readBinary(path));
+		const data = await adapter.readBinary(path);
+		const t = decodeUtf8Strict(data);
 		if (t === null) throw new Error("本地内容不是 UTF-8 文本");
 		localText = t;
+		localHash = await sha256Hex(data);
 	}
 
 	let baseText: string | null = null;
@@ -59,30 +62,41 @@ export async function loadConflict(ctx: SyncContext, path: string): Promise<Load
 		pending,
 		remoteRevision: remote.revision,
 		localText,
+		localHash,
 		remoteText,
 		baseText,
 		merge,
 	};
 }
 
+/** Resolver 打开期间本地文件又被编辑：必须重新加载确认，绝不覆盖。 */
+export class LocalChangedError extends Error {
+	constructor(path: string) {
+		super(`本地文件在处理期间被修改: ${path}`);
+		this.name = "LocalChangedError";
+	}
+}
+
 /**
  * 保存合并结果：以打开 Resolver 时的远端 revision 作为 baseRevision 上传（action=merge）。
- * 期间远端再次变化 → 服务器 409 → 抛 ConflictError，调用方必须重新加载再 merge，
- * 任何 Resolver 都不能绕开 revision 校验。
+ * 期间远端再次变化 → 服务器 409 → 抛 ConflictError，调用方必须重新加载再 merge；
+ * 期间本地再次变化 → 本地 CAS 失败 → 抛 LocalChangedError（v9），同样必须重新加载。
+ * 任何 Resolver 都不能绕开这两道校验。
  */
 export async function saveResolution(
 	ctx: SyncContext,
 	path: string,
 	finalText: string,
 	remoteRevision: number,
+	expectedLocalHash: string,
 ): Promise<number> {
 	const data = encodeUtf8(finalText);
 	const hash = await sha256Hex(data);
 	const out = await uploadFromPlain(ctx, path, data, remoteRevision, Date.now(), "merge");
 
-	const adapter = ctx.app.vault.adapter;
-	await adapter.writeBinary(path, data);
-	const stat = await adapter.stat(path);
+	const wrote = await writeIfLocalUnchanged(ctx, path, data, expectedLocalHash === "" ? null : expectedLocalHash);
+	if (!wrote) throw new LocalChangedError(path);
+	const stat = await ctx.app.vault.adapter.stat(path);
 	ctx.store.set(path, {
 		hash,
 		serverHash: out.cipherHash,

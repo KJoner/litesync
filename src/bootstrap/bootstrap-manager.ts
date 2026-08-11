@@ -6,17 +6,20 @@
  * - 只触碰 LiteSync 同步范围内的文件（忽略规则、插件目录、配置目录照常排除）
  * - 完成后 lastSequence 对齐快照 sequence，无缝进入普通增量同步
  */
-import { ServerInfo, SnapshotFile } from "../api/client";
+import { ConflictError, ServerInfo, SnapshotFile } from "../api/client";
 import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
 import { keepBothVersions } from "../sync/conflict";
 import { SyncContext } from "../sync/context";
 import { trashLocal } from "../sync/pull";
+import { isStaleResurrection } from "../sync/push";
 import { downloadPlain, uploadFromPlain } from "../sync/transfer";
 
 export interface PreflightResult {
 	info: ServerInfo;
 	snapshotSequence: number;
+	/** 快照对应的 repoEpoch（v9）：完成接入时与游标一起保存 */
+	repoEpoch?: string;
 	remoteFiles: SnapshotFile[];
 	localPaths: string[];
 	commonCount: number;
@@ -49,6 +52,7 @@ export async function preflight(ctx: SyncContext): Promise<PreflightResult> {
 	return {
 		info,
 		snapshotSequence: snap.sequence,
+		repoEpoch: snap.repoEpoch ?? info.repoEpoch,
 		remoteFiles,
 		localPaths,
 		commonCount,
@@ -58,7 +62,7 @@ export async function preflight(ctx: SyncContext): Promise<PreflightResult> {
 
 function completeBootstrap(ctx: SyncContext, pre: PreflightResult, mode: "remote-wins" | "merge" | "local-init"): void {
 	ctx.store.state.lastSequence = pre.snapshotSequence;
-	ctx.store.completeBootstrap(mode, pre.info.vaultId, pre.snapshotSequence);
+	ctx.store.completeBootstrap(mode, pre.info.vaultId, pre.snapshotSequence, pre.repoEpoch);
 }
 
 /** 本地初始化远端（远端为空）：标记就绪后由普通同步把本地文件全部推上去。 */
@@ -82,6 +86,7 @@ export async function bootstrapRemoteWins(
 	const total = pre.remoteFiles.length + pre.localPaths.filter((p) => !remoteSet.has(p)).length;
 	let done = 0;
 
+	let blocked = 0;
 	for (const f of pre.remoteFiles) {
 		onProgress({ done: ++done, total, current: f.path });
 		const dl = await downloadPlain(ctx, f.path);
@@ -100,8 +105,15 @@ export async function bootstrapRemoteWins(
 				});
 				continue;
 			}
-			// 本地内容不同：先进回收站再写远端版本（绝不永久删除）
-			await trashLocal(ctx.app, f.path);
+			// 本地内容不同：先进回收站再写远端版本（绝不永久删除）。
+			// P0-3 修复：回收站失败时绝不覆盖——本地这份可能是该内容的唯一副本，
+			// 保留原文件并登记 blocked，普通同步的冲突流程接手（本地新内容不会丢）
+			if (!(await trashLocal(ctx.app, f.path))) {
+				blocked++;
+				ctx.store.setBlockedChange(f.path, "bootstrap remote-wins：回收站不可用，未覆盖本地内容");
+				ctx.notify(`无法移入回收站，已保留本地内容（未被远端覆盖）：${f.path}`);
+				continue;
+			}
 		}
 		await ensureParentFolder(adapter, f.path);
 		await adapter.writeBinary(f.path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
@@ -130,7 +142,7 @@ export async function bootstrapRemoteWins(
 
 	completeBootstrap(ctx, pre, "remote-wins");
 	await ctx.store.save();
-	ctx.log(`bootstrap: remote-wins (remote=${pre.remoteFiles.length})`);
+	ctx.log(`bootstrap: remote-wins (remote=${pre.remoteFiles.length}, blocked=${blocked})`);
 }
 
 export interface MergeResult {
@@ -207,9 +219,27 @@ export async function bootstrapMerge(
 		const stat = await adapter.stat(path);
 		if (!stat) continue;
 		const data = await adapter.readBinary(path);
-		const out = await uploadFromPlain(ctx, path, data, 0, stat.mtime);
+		const hash = await sha256Hex(data);
+		let out;
+		try {
+			out = await uploadFromPlain(ctx, path, data, 0, stat.mtime);
+		} catch (e) {
+			// v9 tombstone 防复活：该路径在服务器上是删除墓碑。
+			// 陈旧副本（内容与删除前一致）→ 不上传、登记 pendingDelete；
+			// 同名新内容 → 基于墓碑 revision 显式重建
+			if (e instanceof ConflictError && e.server.deleted) {
+				if (await isStaleResurrection(ctx, path, hash, e.server)) {
+					ctx.store.setPendingDelete(path);
+					ctx.notify(`检测到已删除文件的陈旧副本，不会重新上传：${path}`);
+					continue;
+				}
+				out = await uploadFromPlain(ctx, path, data, e.server.revision, stat.mtime);
+			} else {
+				throw e;
+			}
+		}
 		ctx.store.set(path, {
-			hash: await sha256Hex(data),
+			hash,
 			serverHash: out.cipherHash,
 			revision: out.revision,
 			mtime: stat.mtime,

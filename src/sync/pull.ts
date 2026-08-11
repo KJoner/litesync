@@ -1,15 +1,45 @@
 import { App, Platform } from "obsidian";
 import { NotFoundError, RemoteChange } from "../api/client";
 import { sha256Hex } from "../utils/hash";
-import { ensureParentFolder } from "../utils/path";
 import { attemptAutoMerge } from "./auto-merge";
 import { keepBothVersions } from "./conflict";
 import { SyncContext } from "./context";
-import { downloadPlain } from "./transfer";
+import { downloadPlain, writeIfLocalUnchanged } from "./transfer";
 
 export interface PullResult {
 	applied: number;
 	conflicts: number;
+}
+
+/** 服务器 repoEpoch 与本地保存值不一致（灾备恢复后）时抛出，中止本轮同步。 */
+export class RepoEpochChangedError extends Error {
+	constructor() {
+		super("服务器 sequence 世代（repoEpoch）已变化，本设备需要重新接入");
+		this.name = "RepoEpochChangedError";
+	}
+}
+
+/**
+ * epoch 防护（v9）：服务器从备份恢复后 repoEpoch 会被旋转，旧游标全部作废。
+ * 发现变化：重置 bootstrap → 用户通过接入向导选择「安全合并」重新对齐
+ *（本地 post-backup 的新内容全部保留，两侧差异走冲突流程，绝不静默丢弃）。
+ */
+async function guardRepoEpoch(ctx: SyncContext, serverEpoch: string | undefined): Promise<void> {
+	if (!serverEpoch) return;
+	const saved = ctx.store.state.bootstrap.repoEpoch;
+	if (!saved) {
+		// v0.8 升级上来的设备第一次见到 epoch：记录之
+		ctx.store.state.bootstrap.repoEpoch = serverEpoch;
+		return;
+	}
+	if (saved !== serverEpoch) {
+		ctx.store.resetBootstrap();
+		await ctx.store.save();
+		ctx.notify(
+			"服务器数据已从备份恢复（repoEpoch 变化），自动同步已暂停；\n请重新运行接入向导并选择「安全合并」，本地较新的内容不会丢失",
+		);
+		throw new RepoEpochChangedError();
+	}
 }
 
 /**
@@ -20,12 +50,25 @@ export interface PullResult {
 export async function pullRemoteChanges(ctx: SyncContext): Promise<PullResult> {
 	const result: PullResult = { applied: 0, conflicts: 0 };
 	try {
+		await retryBlockedChanges(ctx, result);
 		for (;;) {
 			const resp = await ctx.client.changes(ctx.store.state.lastSequence, 500);
+			await guardRepoEpoch(ctx, resp.repoEpoch);
 			if (resp.resyncRequired) {
 				// 服务器已裁剪掉旧 changes：走 snapshot 全量对账重建游标（绝不漏删改）
 				ctx.log(
 					`resync required (cursor ${ctx.store.state.lastSequence} < min ${resp.minSequence ?? 0})`,
+				);
+				const r = await resyncFromSnapshot(ctx);
+				result.applied += r.applied;
+				result.conflicts += r.conflicts;
+				break;
+			}
+			// 防御：同一 epoch 内服务器 head 落后于本地游标（正常协议下不应发生）
+			// → 不再盲等，走 snapshot 对账把游标锚回真实状态
+			if (resp.changes.length === 0 && resp.latestSequence < ctx.store.state.lastSequence) {
+				ctx.log(
+					`server head ${resp.latestSequence} < cursor ${ctx.store.state.lastSequence}, forcing snapshot reconcile`,
 				);
 				const r = await resyncFromSnapshot(ctx);
 				result.applied += r.applied;
@@ -53,7 +96,28 @@ export async function pullRemoteChanges(ctx: SyncContext): Promise<PullResult> {
 	return result;
 }
 
-type Outcome = "applied" | "skipped" | "conflict";
+/**
+ * 重试被阻塞的远端变更（v9：skipped 不再等于永久放弃）。
+ * 例：远端文件与本地文件夹同名——用户移走文件夹后，这里会把该文件补下载回来，
+ * 即使服务器不再产生新的 change。
+ */
+async function retryBlockedChanges(ctx: SyncContext, result: PullResult): Promise<void> {
+	for (const path of ctx.store.blockedChangePaths()) {
+		const stat = await ctx.app.vault.adapter.stat(path);
+		if (stat?.type === "folder") continue; // 阻塞条件仍在
+		const outcome = await applyRemoteChange(ctx, {
+			sequence: ctx.store.state.lastSequence,
+			path,
+			action: "upsert",
+			revision: 0,
+		});
+		if (outcome !== "blocked") ctx.store.clearBlockedChange(path);
+		if (outcome === "applied") result.applied++;
+		if (outcome === "conflict") result.conflicts++;
+	}
+}
+
+type Outcome = "applied" | "skipped" | "conflict" | "blocked";
 
 /**
  * snapshot 全量对账：把「快照 vs 本地状态缓存」的差异合成为等价的远端变更，
@@ -62,6 +126,7 @@ type Outcome = "applied" | "skipped" | "conflict";
 async function resyncFromSnapshot(ctx: SyncContext): Promise<PullResult> {
 	const result: PullResult = { applied: 0, conflicts: 0 };
 	const snap = await ctx.client.snapshot();
+	await guardRepoEpoch(ctx, snap.repoEpoch);
 	const snapPaths = new Set(snap.files.map((f) => f.path));
 
 	// 已跟踪但快照中不存在 → 远端已删除
@@ -112,8 +177,11 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 	const adapter = ctx.app.vault.adapter;
 	const stat = await adapter.stat(path);
 	if (stat?.type === "folder") {
-		ctx.notify(`跳过：远端文件与本地文件夹同名 ${path}`);
-		return "skipped";
+		// v9：不再静默 ACK——持久化 blocked 记录，每轮同步重试，
+		// 用户移走同名文件夹后即使没有新 change 也能补回该文件
+		ctx.store.setBlockedChange(path, "远端文件与本地文件夹同名");
+		ctx.notify(`已暂缓：远端文件与本地文件夹同名 ${path}\n移走该文件夹后会自动补齐`);
+		return "blocked";
 	}
 	const tracked = ctx.store.get(path);
 
@@ -176,7 +244,7 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 	const localChanged = stat !== null && (!tracked || localHash !== tracked.hash);
 
 	if (!stat || !localChanged) {
-		// 本地不存在，或本地自上次同步后未修改 → 直接采用远端版本
+		// 本地不存在，或本地自上次同步后未修改 → 采用远端版本
 		let dl;
 		try {
 			dl = await downloadPlain(ctx, path);
@@ -184,18 +252,27 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 			if (e instanceof NotFoundError) return "skipped"; // 已被后续 change 删除
 			throw e;
 		}
-		await ensureParentFolder(adapter, path);
-		await adapter.writeBinary(path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
-		const st = await adapter.stat(path);
-		ctx.store.set(path, {
-			hash: dl.plainHash,
-			serverHash: dl.cipherHash,
-			revision: dl.revision,
-			mtime: st?.mtime ?? Date.now(),
-			size: dl.plain.byteLength,
-		});
-		ctx.log(`pull: downloaded ${path} (rev ${dl.revision})`);
-		return "applied";
+		// 本地 CAS（v9 TOCTOU 修复）：下载是网络等待，期间用户可能恰好编辑了
+		// 这个文件（且事件因 applyingRemote 被忽略）——写入前必须确认本地
+		// 仍是决策时刻的内容，否则用户刚敲下的新内容会被远端版本静默覆盖
+		if (await writeIfLocalUnchanged(ctx, path, dl.plain, localHash, dl.mtime)) {
+			const st = await adapter.stat(path);
+			ctx.store.set(path, {
+				hash: dl.plainHash,
+				serverHash: dl.cipherHash,
+				revision: dl.revision,
+				mtime: st?.mtime ?? Date.now(),
+				size: dl.plain.byteLength,
+			});
+			ctx.log(`pull: downloaded ${path} (rev ${dl.revision})`);
+			return "applied";
+		}
+		// 下载期间本地出现了新内容/被删除 → 绝不覆盖：
+		// 重新读取现场，落入下方「双方都改」的合并/兜底流程
+		ctx.log(`pull: local changed during download of ${path}, rerouting to merge`);
+		const curStat = await adapter.stat(path);
+		if (!curStat) return "skipped"; // 下载期间被删除：交给扫描的 delete 流程
+		localData = await adapter.readBinary(path);
 	}
 
 	// 本地与远端都改了 → 先尝试三方自动合并（仅 Markdown 文本）

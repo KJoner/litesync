@@ -15,7 +15,7 @@ import { FileState } from "../state/store";
 import { sha256Hex } from "../utils/hash";
 import { decodeUtf8Strict, encodeUtf8 } from "../utils/text";
 import { SyncContext } from "./context";
-import { downloadPlain, uploadFromPlain, versionPlain } from "./transfer";
+import { downloadPlain, uploadFromPlain, versionPlain, writeIfLocalUnchanged } from "./transfer";
 
 export type AutoMergeOutcome = "merged" | "pending" | "fallback";
 
@@ -92,9 +92,14 @@ export async function attemptAutoMerge(
 			try {
 				// Race Protection：必须以下载到的 remote revision 作为 baseRevision
 				const out = await uploadFromPlain(ctx, path, mergedData, remote.revision, Date.now(), "merge");
-				const adapter = ctx.app.vault.adapter;
-				await adapter.writeBinary(path, mergedData);
-				const stat = await adapter.stat(path);
+				// 本地 CAS（v9 TOCTOU 修复）：合并/上传期间用户又编辑了该文件 →
+				// 不覆盖本地、也不更新 tracked；下一轮扫描会以新内容再走一次合并
+				const wrote = await writeIfLocalUnchanged(ctx, path, mergedData, localHash);
+				if (!wrote) {
+					ctx.log(`auto-merge: local changed during merge of ${path}, keeping newer local content`);
+					return "merged"; // 合并结果已在服务器上；本地新编辑由下一轮同步处理
+				}
+				const stat = await ctx.app.vault.adapter.stat(path);
 				ctx.store.set(path, {
 					hash: mergedHash,
 					serverHash: out.cipherHash,

@@ -1,6 +1,13 @@
 import { App, Modal, Notice, ObsidianProtocolData } from "obsidian";
 import type PrivateSyncPlugin from "../main";
-import { b64urlDecode, consumePairing, decryptPairingConfig, PairingConfig, parsePairUrl } from "./pairing";
+import {
+	b64urlDecode,
+	consumePairing,
+	decryptPairingConfig,
+	isLoopbackHost,
+	PairingConfig,
+	parsePairUrl,
+} from "./pairing";
 
 /**
  * obsidian://litesync-import 处理器（v8 新设备导入）。
@@ -50,7 +57,12 @@ export async function handleImportParams(
 }
 
 async function applyPairingConfig(plugin: PrivateSyncPlugin, config: PairingConfig): Promise<void> {
-	plugin.settings.serverUrl = config.serverUrl.trim().replace(/\/+$/, "");
+	const url = config.serverUrl.trim().replace(/\/+$/, "");
+	// 安全红线（v9）：配对包携带 Token，非 loopback 的 http:// 配置一律拒绝导入
+	if (/^http:\/\//i.test(url) && !isLoopbackHost(new URL(url).hostname)) {
+		throw new Error("配对配置中的 Server URL 使用了非本机的 http:// 地址，已拒绝导入（Token 会被明文暴露）");
+	}
+	plugin.settings.serverUrl = url;
 	if (typeof config.syncIntervalSeconds === "number") {
 		plugin.settings.syncIntervalSeconds = config.syncIntervalSeconds;
 	}
