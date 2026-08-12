@@ -3,6 +3,7 @@ import { NotFoundError, RemoteChange, SnapshotFile } from "../api/client";
 import { decryptMeta } from "../crypto/crypto";
 import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
+import { requireFileId } from "../utils/validate";
 import { attemptAutoMerge } from "./auto-merge";
 import { keepBothVersions } from "./conflict";
 import { SyncContext } from "./context";
@@ -19,7 +20,7 @@ async function resolveMetaChange(
 	ctx: SyncContext,
 	change: RemoteChange,
 ): Promise<{ realPath: string; serverPath: string } | "skip" | null> {
-	const pseudonym = change.path;
+	const pseudonym = requireFileId(change.path, `change@${change.sequence}.path`);
 	const known = ctx.store.pathByFileId(pseudonym);
 	if (known !== undefined) return { realPath: known, serverPath: pseudonym };
 	if (change.action === "delete") return "skip"; // 本地从未有过
@@ -53,8 +54,10 @@ async function applyMetaRename(ctx: SyncContext, realPath: string, pseudonym: st
 	const dec = await decryptMeta(keys, meta.metaEnc, bind.remoteVaultId ?? "", pseudonym);
 	if (dec === null) throw new Error(`无法解密文件元数据（${pseudonym}）`);
 	const newPath = dec.meta.path;
+	// 身份字段一律经 store.update/rename 保留（LS-121-C04）：改名不改 fileId、
+	// 不改 contentGeneration，也不改服务器伪名
 	if (newPath === realPath) {
-		ctx.store.set(realPath, { ...tracked, metaGeneration: dec.metaGeneration });
+		ctx.store.update(realPath, { metaGeneration: dec.metaGeneration, serverPseudonym: pseudonym });
 		return "skipped";
 	}
 	const adapter = ctx.app.vault.adapter;
@@ -65,14 +68,12 @@ async function applyMetaRename(ctx: SyncContext, realPath: string, pseudonym: st
 	}
 	if (!(await adapter.stat(realPath))) {
 		// 本地原文件不在（可能刚被用户移走）：只更新状态键，内容由扫描收敛
-		ctx.store.delete(realPath);
-		ctx.store.set(newPath, { ...tracked, metaGeneration: dec.metaGeneration });
+		ctx.store.rename(realPath, newPath, { metaGeneration: dec.metaGeneration, serverPseudonym: pseudonym });
 		return "applied";
 	}
 	await ensureParentFolder(adapter, newPath);
 	await adapter.rename(realPath, newPath);
-	ctx.store.delete(realPath);
-	ctx.store.set(newPath, { ...tracked, metaGeneration: dec.metaGeneration });
+	ctx.store.rename(realPath, newPath, { metaGeneration: dec.metaGeneration, serverPseudonym: pseudonym });
 	ctx.log(`pull: renamed ${realPath} -> ${newPath} (metaGen ${dec.metaGeneration})`);
 	return "applied";
 }
@@ -231,7 +232,12 @@ async function resyncFromSnapshot(ctx: SyncContext): Promise<PullResult> {
 		const tracked = ctx.store.get(f.path);
 		if (tracked && tracked.serverHash === f.hash) {
 			if (tracked.revision !== f.revision || tracked.metaGeneration !== f.metaGeneration) {
-				ctx.store.set(f.path, { ...tracked, revision: f.revision, metaGeneration: f.metaGeneration });
+				ctx.store.update(f.path, {
+					revision: f.revision,
+					metaGeneration: f.metaGeneration,
+					fileId: f.fileId,
+					serverPseudonym: f.serverPseudonym,
+				});
 			}
 			continue;
 		}
@@ -352,7 +358,7 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 	// upsert
 	// 服务器该内容本设备已知（例如自己刚推送的变更）→ 只推进 revision
 	if (tracked && change.hash && change.hash === tracked.serverHash) {
-		ctx.store.set(path, { ...tracked, revision: change.revision });
+		ctx.store.update(path, { revision: change.revision, serverPseudonym: serverPath });
 		return "skipped";
 	}
 
@@ -366,12 +372,13 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 
 	// 本地明文与远端内容一致（明文模式的快速路径）→ 只更新状态
 	if (localHash !== null && change.hash && localHash === change.hash) {
-		ctx.store.set(path, {
+		ctx.store.update(path, {
 			hash: localHash,
 			serverHash: change.hash,
 			revision: change.revision,
 			mtime: stat?.mtime ?? Date.now(),
 			size: stat?.size ?? localData!.byteLength,
+			serverPseudonym: serverPath,
 		});
 		return "skipped";
 	}
@@ -392,7 +399,7 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 		// 仍是决策时刻的内容，否则用户刚敲下的新内容会被远端版本静默覆盖
 		if (await writeIfLocalUnchanged(ctx, path, dl.plain, localHash, dl.mtime)) {
 			const st = await adapter.stat(path);
-			ctx.store.set(path, {
+			ctx.store.update(path, {
 				hash: dl.plainHash,
 				serverHash: dl.cipherHash,
 				revision: dl.revision,
@@ -401,6 +408,7 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 				fileId: dl.fileId,
 				generation: dl.generation,
 				metaGeneration: dl.metaGeneration ?? change.metaGeneration,
+				serverPseudonym: serverPath,
 			});
 			ctx.log(`pull: downloaded ${path} (rev ${dl.revision})`);
 			return "applied";

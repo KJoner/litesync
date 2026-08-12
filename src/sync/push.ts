@@ -181,8 +181,13 @@ async function pushMove(ctx: SyncContext, toPath: string, fromPath: string): Pro
 			);
 			const canonicalHash = await canonicalPathHmac(keys, toPath);
 			const out = await ctx.client.updateFileMeta(tracked.fileId, tracked.metaGeneration, metaEnc, canonicalHash);
-			ctx.store.delete(fromPath);
-			ctx.store.set(toPath, { ...tracked, mtime: stat.mtime, size: stat.size, metaGeneration: out.metaGeneration });
+			// 改名只动元数据：fileId / contentGeneration / 伪名全部原样保留（LS-121-C04）
+			ctx.store.rename(fromPath, toPath, {
+				mtime: stat.mtime,
+				size: stat.size,
+				metaGeneration: out.metaGeneration,
+				serverPseudonym: tracked.fileId,
+			});
 			ctx.log(`push: meta-renamed ${fromPath} -> ${toPath} (metaGen ${out.metaGeneration})`);
 			return "pushed";
 		} catch (e) {
@@ -196,15 +201,12 @@ async function pushMove(ctx: SyncContext, toPath: string, fromPath: string): Pro
 
 	try {
 		const out = await ctx.client.move(fromPath, toPath, tracked.revision);
-		ctx.store.delete(fromPath);
-		ctx.store.set(toPath, {
+		ctx.store.rename(fromPath, toPath, {
 			hash,
 			serverHash: tracked.serverHash,
 			revision: out.revision,
 			mtime: stat.mtime,
 			size: stat.size,
-			fileId: tracked.fileId,
-			generation: tracked.generation,
 		});
 		ctx.log(`push: moved ${fromPath} -> ${toPath} (rev ${out.revision})`);
 		return "pushed";
@@ -241,14 +243,14 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 	const tracked = ctx.store.get(path);
 	if (tracked && tracked.hash === hash) {
 		// 内容没变（例如只是 mtime 变化），刷新缓存即可
-		ctx.store.set(path, { ...tracked, mtime: stat.mtime, size: stat.size });
+		ctx.store.update(path, { mtime: stat.mtime, size: stat.size });
 		return "skipped";
 	}
 
 	const baseRevision = tracked?.revision ?? 0;
 	try {
 		const out = await uploadFromPlain(ctx, path, data, baseRevision, stat.mtime);
-		ctx.store.set(path, {
+		ctx.store.update(path, {
 			hash,
 			serverHash: out.cipherHash,
 			revision: out.revision,
@@ -256,6 +258,8 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 			size: stat.size,
 			fileId: out.fileId,
 			generation: out.generation,
+			metaGeneration: out.metaGeneration,
+			serverPseudonym: out.serverPseudonym,
 		});
 		ctx.log(`push: uploaded ${path} (rev ${out.revision})`);
 		return "pushed";
@@ -278,7 +282,7 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 				}
 				// 基于墓碑 revision 显式重建（同名新内容 / 本地编辑胜出）
 				const out = await uploadFromPlain(ctx, path, data, server.revision, stat.mtime);
-				ctx.store.set(path, {
+				ctx.store.update(path, {
 					hash,
 					serverHash: out.cipherHash,
 					revision: out.revision,
@@ -286,12 +290,14 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 					size: stat.size,
 					fileId: out.fileId,
 					generation: out.generation,
+					metaGeneration: out.metaGeneration,
+					serverPseudonym: out.serverPseudonym,
 				});
 				return "pushed";
 			}
 			if (!ctx.e2ee.enabled && server.hash === hash) {
 				// 明文模式：服务器已有相同内容（重试或他端相同修改）→ 采纳服务器 revision
-				ctx.store.set(path, {
+				ctx.store.update(path, {
 					hash,
 					serverHash: server.hash,
 					revision: server.revision,
@@ -304,7 +310,7 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 			try {
 				const dl = await downloadPlain(ctx, path);
 				if (dl.plainHash === hash) {
-					ctx.store.set(path, {
+					ctx.store.update(path, {
 						hash,
 						serverHash: dl.cipherHash,
 						revision: dl.revision,
@@ -312,12 +318,14 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 						size: stat.size,
 						fileId: dl.fileId,
 						generation: dl.generation,
+						metaGeneration: dl.metaGeneration,
 					});
 					return "skipped";
 				}
 			} catch (dlErr) {
 				if (dlErr instanceof E2eeLockedError) throw dlErr;
-				// 下载失败不阻塞冲突处理，继续走合并/兜底
+				// 下载失败（含 meta 模式伪名未知的 fail-closed）不阻塞冲突处理，
+				// 继续走合并/兜底；真实路径绝不会因此被发给服务器（LS-121-C05）
 			}
 			// 真实冲突 → 先尝试三方自动合并（仅 Markdown 文本）
 			const merged = await attemptAutoMerge(ctx, path, data, tracked);
@@ -389,12 +397,15 @@ async function pushDelete(ctx: SyncContext, path: string): Promise<Outcome> {
 			await ensureParentFolder(adapter, path);
 			await adapter.writeBinary(path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
 			const st = await adapter.stat(path);
-			ctx.store.set(path, {
+			ctx.store.update(path, {
 				hash: dl.plainHash,
 				serverHash: dl.cipherHash,
 				revision: dl.revision,
 				mtime: st?.mtime ?? Date.now(),
 				size: dl.plain.byteLength,
+				fileId: dl.fileId,
+				generation: dl.generation,
+				metaGeneration: dl.metaGeneration,
 			});
 			ctx.notify(`该文件在其他设备上已更新，已恢复: ${path}`);
 			return "conflict";

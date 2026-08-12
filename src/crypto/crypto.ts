@@ -14,6 +14,15 @@
  *     历史版本重放仍需签名 manifest 才能防住，见三阶段计划）
  */
 
+import {
+	GENERATION_MAX,
+	isFileId,
+	isKeyEpoch,
+	requireFileId,
+	requireGeneration,
+	requireKeyEpoch,
+} from "../utils/validate";
+
 export const KDF_ITERATIONS = 600_000;
 
 const MAGIC = new Uint8Array([0x4c, 0x53, 0x45, 0x31]); // "LSE1"
@@ -104,6 +113,11 @@ export async function encryptMeta(
 	binding: { vaultId: string; keyEpoch: number; fileId: string; metaGeneration: number },
 	meta: FileMeta,
 ): Promise<string> {
+	// 集中校验（LS-121-C03）：非法 keyEpoch/fileId/metaGeneration 一旦被静默截断，
+	// 写出的密文 AAD 与将来重建的 AAD 不一致 → 元数据永久不可解
+	requireKeyEpoch(binding.keyEpoch, "encryptMeta");
+	requireFileId(binding.fileId, "encryptMeta");
+	requireGeneration(binding.metaGeneration, "encryptMeta.metaGeneration");
 	const iv = randomBytes(IV_LEN);
 	const plain = new TextEncoder().encode(JSON.stringify(meta));
 	const ct = new Uint8Array(
@@ -121,7 +135,7 @@ export async function encryptMeta(
 	const out = new Uint8Array(head + IV_LEN + ct.length);
 	out.set(META_MAGIC, 0);
 	const view = new DataView(out.buffer);
-	view.setUint32(META_MAGIC.length, binding.keyEpoch >>> 0, false);
+	view.setUint32(META_MAGIC.length, binding.keyEpoch, false);
 	view.setBigUint64(META_MAGIC.length + EPOCH_LEN, BigInt(binding.metaGeneration), false);
 	out.set(iv, head);
 	out.set(ct, head + IV_LEN);
@@ -148,7 +162,12 @@ export async function decryptMeta(
 	}
 	const view = new DataView(raw.buffer, raw.byteOffset);
 	const keyEpoch = view.getUint32(META_MAGIC.length, false);
-	const metaGeneration = Number(view.getBigUint64(META_MAGIC.length + EPOCH_LEN, false));
+	const genRaw = view.getBigUint64(META_MAGIC.length + EPOCH_LEN, false);
+	// 信封头是明文字段：非法区间（keyEpoch=0 / generation 超出可精确比较范围）
+	// 一律按「不可信封套」拒绝——绝不让抗回退比较建立在被截断的数值上
+	if (!isKeyEpoch(keyEpoch) || genRaw > BigInt(GENERATION_MAX)) return null;
+	const metaGeneration = Number(genRaw);
+	if (!isFileId(fileId)) return null;
 	try {
 		const iv = raw.subarray(head, head + IV_LEN);
 		const ct = raw.subarray(head + IV_LEN);
@@ -388,10 +407,11 @@ export function isLse3Envelope(data: ArrayBuffer): boolean {
 export function parseLse3Header(data: ArrayBuffer): { keyEpoch: number; generation: number } | null {
 	if (!isLse3Envelope(data)) return null;
 	const view = new DataView(data);
-	return {
-		keyEpoch: view.getUint32(MAGIC3.length, false),
-		generation: Number(view.getBigUint64(MAGIC3.length + EPOCH_LEN, false)),
-	};
+	const keyEpoch = view.getUint32(MAGIC3.length, false);
+	const genRaw = view.getBigUint64(MAGIC3.length + EPOCH_LEN, false);
+	// 非法区间的信封头视为无效信封（LS-121-C03）：抗回退比较不接受被截断的值
+	if (!isKeyEpoch(keyEpoch) || genRaw > BigInt(GENERATION_MAX)) return null;
+	return { keyEpoch, generation: Number(genRaw) };
 }
 
 /** LSE3 加密：magic | keyEpoch(u32) | generation(u64) | iv | ct+tag。 */
@@ -400,6 +420,10 @@ export async function encryptFileV3(
 	binding: FileKeyBinding3,
 	plaintext: ArrayBuffer,
 ): Promise<ArrayBuffer> {
+	// 集中校验（LS-121-C03）：AAD 输入被截断 = 密文永久不可解 / 抗回退失效
+	requireKeyEpoch(binding.keyEpoch, "encryptFileV3");
+	requireFileId(binding.fileId, "encryptFileV3");
+	requireGeneration(binding.generation, "encryptFileV3.generation");
 	const iv = randomBytes(IV_LEN);
 	const ct = new Uint8Array(
 		await crypto.subtle.encrypt(
@@ -412,7 +436,7 @@ export async function encryptFileV3(
 	const out = new Uint8Array(head + IV_LEN + ct.length);
 	out.set(MAGIC3, 0);
 	const view = new DataView(out.buffer);
-	view.setUint32(MAGIC3.length, binding.keyEpoch >>> 0, false);
+	view.setUint32(MAGIC3.length, binding.keyEpoch, false);
 	view.setBigUint64(MAGIC3.length + EPOCH_LEN, BigInt(binding.generation), false);
 	out.set(iv, head);
 	out.set(ct, head + IV_LEN);
@@ -433,7 +457,7 @@ export async function decryptFileV3(
 	expectedKeyEpoch: number,
 ): Promise<{ plain: ArrayBuffer; generation: number } | null> {
 	const header = parseLse3Header(payload);
-	if (header === null || !vaultId || !fileId) return null;
+	if (header === null || !vaultId || !isFileId(fileId)) return null;
 	if (expectedKeyEpoch > 0 && header.keyEpoch !== expectedKeyEpoch) return null;
 	try {
 		const head = MAGIC3.length + EPOCH_LEN + GEN_LEN;
@@ -494,7 +518,7 @@ export async function encryptFile(
 	);
 	const out = new Uint8Array(MAGIC2.length + EPOCH_LEN + IV_LEN + ct.length);
 	out.set(MAGIC2, 0);
-	new DataView(out.buffer).setUint32(MAGIC2.length, binding.keyEpoch >>> 0, false);
+	new DataView(out.buffer).setUint32(MAGIC2.length, requireKeyEpoch(binding.keyEpoch, "encryptFile/LSE2"), false);
 	out.set(iv, MAGIC2.length + EPOCH_LEN);
 	out.set(ct, MAGIC2.length + EPOCH_LEN + IV_LEN);
 	return out.buffer;
@@ -514,6 +538,7 @@ export async function decryptFile(
 	if (hasMagic(payload, MAGIC2, EPOCH_LEN + IV_LEN + 16)) {
 		if (!binding?.vaultId) return null; // 无法建立 AAD → 拒绝
 		const envelopeEpoch = new DataView(payload).getUint32(MAGIC2.length, false);
+		if (!isKeyEpoch(envelopeEpoch)) return null; // 非法信封头（LS-121-C03）
 		if (binding.keyEpoch > 0 && envelopeEpoch !== binding.keyEpoch) return null;
 		try {
 			const iv = new Uint8Array(payload, MAGIC2.length + EPOCH_LEN, IV_LEN);

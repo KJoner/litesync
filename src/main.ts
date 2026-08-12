@@ -11,7 +11,7 @@ import {
 import { EnableE2eeModal, UnlockModal } from "./crypto/e2ee-modals";
 import { Keyring } from "./crypto/keyring";
 import { ConfirmMetaEncryptionModal } from "./crypto/meta-modals";
-import { enableE2ee, encryptMetadata, upgradeEnvelopes } from "./crypto/migration";
+import { abortMetadataMigration, enableE2ee, encryptMetadata, upgradeEnvelopes } from "./crypto/migration";
 import { HistoryModal } from "./history/history-view";
 import { DeviceListModal } from "./pairing/device-list-modal";
 import { PasteLinkModal, registerImportHandler } from "./pairing/import-handler";
@@ -20,9 +20,18 @@ import { DEFAULT_SETTINGS, PluginSettings, SyncSettingTab } from "./settings";
 import { ShareManageModal, ShareModal } from "./share/share-modal";
 import { StateStore } from "./state/store";
 import { SyncContext } from "./sync/context";
+import { SyncBlockedError, SyncGate } from "./sync/gate";
 import { PendingQueue } from "./sync/queue";
 import { SyncManager, SyncStatus } from "./sync/sync-manager";
 import { IgnoreMatcher } from "./utils/ignore";
+import { VaultKeyDoc } from "./crypto/crypto";
+
+/** vault key 的密钥材料是否发生变化（换库 / 轮换；影响绑定指纹）。 */
+function vaultKeyMaterialChanged(before: VaultKeyDoc | null, after: VaultKeyDoc | null): boolean {
+	if (before === null && after === null) return false;
+	if (before === null || after === null) return true;
+	return before.wrappedKey !== after.wrappedKey || before.salt !== after.salt;
+}
 
 /** 文件变化后延迟同步，避免连续输入时频繁上传。 */
 const DEBOUNCE_MS = 3000;
@@ -46,6 +55,8 @@ export default class PrivateSyncPlugin extends Plugin {
 	private intervalId: number | null = null;
 	private lastStatus: SyncStatus = "idle";
 	private keyring = new Keyring();
+	/** 同步安全 Gate（v0.12.1）：手动命令与自动同步共用的许可判断 */
+	private gate = new SyncGate();
 	/** 接入向导单例标志（v8）：避免多个同步入口重复弹窗 */
 	private wizardOpen = false;
 	/** API Token 运行时值（真实存储在 Obsidian SecretStorage） */
@@ -205,6 +216,7 @@ export default class PrivateSyncPlugin extends Plugin {
 			client: this.client,
 			store: this.store,
 			queue: this.queue,
+			gate: this.gate,
 			syncObsidian: () => this.effectiveSyncObsidian(),
 			ignores: (path) => this.ignoreMatcher?.ignores(path) ?? false,
 			deviceName: () =>
@@ -216,10 +228,16 @@ export default class PrivateSyncPlugin extends Plugin {
 			notify: (msg) => new Notice(msg, 8000),
 			onConflictsChanged: () => this.updateStatus(this.lastStatus),
 			e2ee: this.keyring,
+			credentials: () => ({ serverUrl: this.settings.serverUrl, apiToken: this.getApiToken() }),
 			refreshE2ee: async () => {
+				const before = this.keyring.doc;
 				const doc = await this.client!.getVaultKey();
 				this.keyring.setDoc(doc);
 				if (this.store) this.store.state.e2ee = doc;
+				// vault key 文档被替换（密钥轮换 / 换库）→ 本地绑定作废（LS-121-C02）
+				if (vaultKeyMaterialChanged(before, doc)) {
+					this.manager?.invalidateBinding("端到端加密密钥文档已变化");
+				}
 			},
 			// v9.2：根 Token → 设备凭据自动换发（SyncManager 协议检查时调用）
 			updateApiToken: async (token) => {
@@ -273,6 +291,7 @@ export default class PrivateSyncPlugin extends Plugin {
 	/** 重新运行接入向导（设置页入口；会把本设备重置为待接入）。 */
 	rerunBootstrapWizard(): void {
 		this.store?.resetBootstrap();
+		this.invalidateBinding("重新运行接入向导");
 		void this.store?.save();
 		this.openBootstrapWizard();
 	}
@@ -280,6 +299,7 @@ export default class PrivateSyncPlugin extends Plugin {
 	/** 重置为待接入（导入新配对配置后调用）。 */
 	resetBootstrapState(): void {
 		this.store?.resetBootstrap();
+		this.invalidateBinding("导入了新的服务器配置");
 		void this.store?.save();
 	}
 
@@ -297,9 +317,38 @@ export default class PrivateSyncPlugin extends Plugin {
 		new PasteLinkModal(this.app, this).open();
 	}
 
-	/** 「加密路径与文件名」（v9.3 三期）：确认后执行元数据加密迁移。 */
+	/** 元数据迁移是否停在 migrating（设置页据此显示「放弃迁移」入口）。 */
+	metaMigrationActive(): boolean {
+		return this.store?.state.bootstrap.metaState === "migrating";
+	}
+
+	/** 放弃元数据迁移：退回 plain（无破坏性操作）。 */
+	async abortMetaMigration(): Promise<void> {
+		if (!this.ctx) return;
+		try {
+			const state = await abortMetadataMigration(this.ctx);
+			new Notice(`已放弃路径加密迁移，仓库元数据状态：${state}`);
+		} catch (e) {
+			new Notice(`放弃迁移失败：${e instanceof Error ? e.message : String(e)}`, 10000);
+		}
+	}
+
+	/**
+	 * 「加密路径与文件名」（v9.3 三期）：确认后执行元数据加密迁移。
+	 *
+	 * v0.12.1（LS-121-C01）：默认构建里这条命令处于关闭状态，必须在设置页
+	 * 显式打开「实验功能」；即便打开，不可逆的明文抹除仍需另一个开发者开关。
+	 */
 	private confirmMetaEncryption(): void {
 		if (!this.ctx) return;
+		if (!this.settings.experimentalMetaEncryption) {
+			new Notice(
+				"「加密路径与文件名」在 v0.12.x 仍是实验功能，默认关闭。\n" +
+					"如需在测试 Vault 上试用，请到设置 → 实验功能中开启（切勿用于唯一的真实 Vault）",
+				12000,
+			);
+			return;
+		}
 		if (!this.keyring.enabled) {
 			new Notice("请先启用端到端加密");
 			return;
@@ -312,20 +361,30 @@ export default class PrivateSyncPlugin extends Plugin {
 			new Notice("路径与文件名已经是加密状态");
 			return;
 		}
-		new ConfirmMetaEncryptionModal(this.app, () => void this.runMetaEncryption()).open();
+		new ConfirmMetaEncryptionModal(this.app, this.settings.allowIrreversibleMetaErase, () => {
+			void this.runMetaEncryption();
+		}).open();
 	}
 
 	private async runMetaEncryption(): Promise<void> {
-		if (!this.ctx) return;
+		if (!this.ctx || !this.manager) return;
 		const progress = new Notice("正在加密路径与文件名…", 0);
 		try {
-			const r = await encryptMetadata(this.ctx, (p) => {
-				progress.setMessage(`加密元数据 ${p.done}/${p.total}：${p.current}`);
+			const r = await encryptMetadata(this.ctx, {
+				onProgress: (p) => {
+					progress.setMessage(`加密元数据 ${p.done}/${p.total}：${p.current}`);
+				},
+				fullSync: () => this.manager!.fullSync("pre-meta-migration"),
+				allowIrreversibleComplete: this.settings.allowIrreversibleMetaErase,
 			});
 			progress.hide();
 			new Notice(
-				`元数据加密完成：${r.migrated} 个文件的路径已伪名化，服务器上的明文路径已抹除。\n其他设备下次同步会自动对账（需 0.12+ 并解锁 E2EE）`,
-				10000,
+				r.erased
+					? `元数据加密完成：${r.migrated} 个文件的路径已伪名化，服务器上的明文路径已抹除。\n其他设备下次同步会自动对账（需 0.12+ 并解锁 E2EE）`
+					: `已伪名化 ${r.migrated} 个文件的路径（仓库状态：${r.metaState}）。\n` +
+							`v0.12.1 不执行不可逆的明文抹除：服务器上仍保留旧的明文路径记录（tombstone/历史），` +
+							`正式抹除请等待 v0.13.0 的隐私 tombstone ledger。\n随时可在设置中「放弃路径加密迁移」退回 plain。`,
+				15000,
 			);
 		} catch (e) {
 			progress.hide();
@@ -333,31 +392,34 @@ export default class PrivateSyncPlugin extends Plugin {
 		}
 	}
 
-	/** 「升级加密信封」（v9.2）：把仓库中的 LSE1 密文重新加密为 LSE2。 */
+	/** 「升级加密信封」（v9.2；v9.3 起目标为 LSE3）：把旧信封密文重新加密。 */
 	private async runEnvelopeUpgrade(): Promise<void> {
 		if (!this.ctx) return;
 		if (!this.keyring.enabled) {
 			new Notice("端到端加密未启用，无需升级信封");
 			return;
 		}
-		if (!this.keyring.unlocked) {
-			new Notice("请先解锁端到端加密（Unlock E2EE）");
-			return;
-		}
 		const progress = new Notice("正在升级加密信封…", 0);
 		try {
+			// 迁移类操作同样先等同步收敛（LS-121-C06），再由 upgradeEnvelopes 内部过 gate
+			await this.manager?.fullSync("pre-envelope-upgrade");
 			const r = await upgradeEnvelopes(this.ctx, (p) => {
 				progress.setMessage(`升级加密信封 ${p.done}/${p.total}：${p.current}`);
 			});
 			progress.hide();
 			new Notice(
 				r.upgraded > 0
-					? `加密信封升级完成：${r.upgraded} 个文件已升级到 LSE2${r.skipped ? `，${r.skipped} 个跳过（可重新执行续传）` : ""}`
-					: "所有文件已经是 LSE2 信封，无需升级",
+					? `加密信封升级完成：${r.upgraded} 个文件已升级到 LSE3${r.skipped ? `，${r.skipped} 个跳过（可重新执行续传）` : ""}`
+					: "所有文件已经是 LSE3 信封，无需升级",
 			);
 		} catch (e) {
 			progress.hide();
-			new Notice(`信封升级失败：${e instanceof Error ? e.message : String(e)}`);
+			new Notice(
+				e instanceof SyncBlockedError
+					? e.message
+					: `信封升级失败：${e instanceof Error ? e.message : String(e)}`,
+				10000,
+			);
 		}
 	}
 
@@ -443,12 +505,27 @@ export default class PrivateSyncPlugin extends Plugin {
 	}
 
 	async setApiToken(value: string): Promise<void> {
+		const changed = this.apiTokenValue !== value;
 		this.apiTokenValue = value;
 		this.app.secretStorage.setSecret(API_TOKEN_SECRET_ID, value);
+		if (changed) this.invalidateBinding("API Token 已变化");
 		if (this.settings.apiToken !== "") {
 			this.settings.apiToken = "";
 			await this.saveSettings();
 		}
+	}
+
+	/**
+	 * 立即作废绑定（v0.12.1 / LS-121-C02）。
+	 *
+	 * server URL、Token、设备身份、vault key 文档任一变化时调用：会话缓存清零、
+	 * 状态切 unbound，上传/删除/MOVE/历史恢复/分享在重新完成权威校验前全部被拒。
+	 */
+	invalidateBinding(reason: string): void {
+		this.gate.markUnbound(reason);
+		this.manager?.invalidateBinding(reason);
+		this.store?.clearBinding();
+		this.updateStatus("idle", `${reason}——需要重新校验服务器后才能继续同步`);
 	}
 
 	/** 启动时读取 Token；data.json 中的旧版明文值迁移进 SecretStorage 并抹除。 */
@@ -653,9 +730,8 @@ export default class PrivateSyncPlugin extends Plugin {
 			const migrated = await enableE2ee(
 				this.ctx!,
 				password,
-				async () => {
-					await this.manager!.sync("pre-migration");
-				},
+				// fullSync：等待当前轮 + 所有续轮 + 队列排空（LS-121-C06）
+				() => this.manager!.fullSync("pre-e2ee-migration"),
 				onProgress,
 			);
 			await this.setTrustDevice(trustDevice);

@@ -10,8 +10,10 @@
  */
 import { ApiError, ConflictError, NotFoundError } from "../api/client";
 import { SyncContext } from "../sync/context";
-import { e2eeBinding } from "../sync/transfer";
+import { requireSyncSafe } from "../sync/gate";
+import { e2eeBinding, purgeHistoryOf } from "../sync/transfer";
 import { sha256Hex } from "../utils/hash";
+import { requireFileId, requireKeyEpoch } from "../utils/validate";
 import {
 	canonicalPathHmac,
 	createVaultKeyDoc,
@@ -40,6 +42,7 @@ export async function enableE2ee(
 	fullSync: () => Promise<void>,
 	onProgress: (p: MigrationProgress) => void,
 ): Promise<number> {
+	requireSyncSafe(ctx, "启用端到端加密");
 	if (password.length < 8) throw new Error("密码至少 8 个字符");
 
 	// 1. 获取或创建 vault key（支持中断后重新执行）
@@ -60,12 +63,27 @@ export async function enableE2ee(
 	ctx.store.state.e2ee = doc;
 	await ctx.store.save();
 
-	// 2. 迁移前必须同步干净（无待推送变更、无未解决冲突）
+	// 2. 迁移前必须同步干净：fullSync 等待当前轮 + 所有续轮 + 队列排空（LS-121-C06），
+	//    绝不在「只是设置了 runAgain」的状态下开始不可逆迁移
 	await fullSync();
 	if (ctx.queue.size > 0 || ctx.store.conflictPaths().length > 0) {
 		throw new Error("存在未完成的同步或未解决的冲突，请处理后重新启用");
 	}
 
+	ctx.gate.beginMigration("端到端加密迁移");
+	try {
+		return await runE2eeMigration(ctx, vmk, onProgress);
+	} finally {
+		ctx.gate.endMigration();
+	}
+}
+
+/** enableE2ee 的迁移主体（在 migration gate 内执行，普通同步会被暂时挡住）。 */
+async function runE2eeMigration(
+	ctx: SyncContext,
+	vmk: CryptoKey,
+	onProgress: (p: MigrationProgress) => void,
+): Promise<number> {
 	const info = await ctx.client.info();
 	const serverState = info.encryptionState ?? "plaintext";
 	let done = 0;
@@ -73,8 +91,9 @@ export async function enableE2ee(
 		// 3. 服务器进入 migrating（v9 状态机）：从这一刻起服务器冻结一切明文写，
 		// 其他旧设备无法在迁移期间把明文写回仓库（它们的上传会被 409 拒绝）
 		const state = await ctx.client.e2eeTransition("begin");
-		// LSE2 绑定材料（v9.2）：迁移产生的密文直接使用新信封
-		ctx.store.state.bootstrap.keyEpoch = state.keyEpoch;
+		// LSE2/LSE3 绑定材料（v9.2）：迁移产生的密文直接使用新信封。
+		// 非法 keyEpoch 立即硬失败（LS-121-C03）——绝不写出解不开的密文
+		ctx.store.state.bootstrap.keyEpoch = requireKeyEpoch(state.keyEpoch, "e2ee/begin.keyEpoch");
 		if (!ctx.store.state.bootstrap.remoteVaultId && info.vaultId) {
 			ctx.store.state.bootstrap.remoteVaultId = info.vaultId;
 		}
@@ -144,7 +163,7 @@ async function migratePath(
 	if (isEncryptedPayload(raw.data)) {
 		const dec = await decryptAny(vmk, path, raw.data, binding, raw.fileId);
 		if (dec === null) throw new Error(`已加密但无法用当前密钥解密: ${path}`);
-		ctx.store.set(path, {
+		ctx.store.update(path, {
 			hash: await sha256Hex(dec.plain),
 			serverHash,
 			revision: raw.revision,
@@ -153,7 +172,7 @@ async function migratePath(
 			fileId: raw.fileId,
 			generation: dec.generation,
 		});
-		await ctx.client.purgeHistory(path, raw.revision);
+		await purgeHistoryOf(ctx, path, raw.revision);
 		return;
 	}
 
@@ -182,7 +201,7 @@ async function migratePath(
 		throw new Error(`密文解密验证失败: ${path}`);
 	}
 
-	ctx.store.set(path, {
+	ctx.store.update(path, {
 		hash: plainHash,
 		serverHash: cipherHash,
 		revision: res.revision,
@@ -191,7 +210,31 @@ async function migratePath(
 		fileId: res.fileId ?? raw.fileId,
 		generation,
 	});
-	await ctx.client.purgeHistory(path, res.revision);
+	await purgeHistoryOf(ctx, path, res.revision);
+}
+
+export interface MetaEncryptionOptions {
+	onProgress: (p: MigrationProgress) => void;
+	/** 等待同步彻底收敛（SyncManager.fullSync；LS-121-C06） */
+	fullSync: () => Promise<void>;
+	/**
+	 * 是否允许执行不可逆的 complete（明文路径抹除）。
+	 *
+	 * v0.12.1 默认 **false**（LS-121-C01）：当前实现无法在抹除明文的同时保住
+	 * 删除屏障（tombstone 的 path 本身就是明文），服务端也已经在 v0.12.1 起
+	 * 拒绝这种 complete。开关只为开发/测试环境保留，正式抹除要等 v0.13.0 的
+	 * 隐私 tombstone ledger。
+	 */
+	allowIrreversibleComplete: boolean;
+}
+
+export interface MetaEncryptionResult {
+	migrated: number;
+	total: number;
+	/** 结束时仓库的元数据状态：migrating = 已伪名化但尚未抹除明文（可 abort 回退） */
+	metaState: string;
+	/** 是否执行了不可逆的明文抹除 */
+	erased: boolean;
 }
 
 /**
@@ -199,67 +242,97 @@ async function migratePath(
  * 伪名（=fileId）+ LSM1 加密元数据。内容零重新加密（LSE3 已把内容与路径解耦）。
  *
  * 红线：
- * - 前置：E2EE 已启用且解锁、无待推送/未解决冲突、所有 HEAD 均为 LSE3
- *  （否则服务器逐文件 409，提示先跑「升级加密信封」）
+ * - 前置：过同步安全 gate、E2EE 已启用且解锁、fullSync 收敛、无未解决冲突、
+ *   所有 HEAD 均为 LSE3（否则服务器逐文件 409，提示先跑「升级加密信封」）
  * - 断点续传：单文件失败可重新执行整个命令续传（migrate-file 幂等）
- * - complete 是明文路径抹除的单向点：服务器验证全量伪名化后才执行，
- *   并强制所有客户端下轮 snapshot 对账
+ * - complete 是明文路径抹除的单向点。**v0.12.1 默认不执行**（LS-121-C01）：
+ *   迁移停在 migrating，可通过 abort 无损回退
  */
-export async function encryptMetadata(
-	ctx: SyncContext,
-	onProgress: (p: MigrationProgress) => void,
-): Promise<{ migrated: number; total: number }> {
+export async function encryptMetadata(ctx: SyncContext, opts: MetaEncryptionOptions): Promise<MetaEncryptionResult> {
+	const { onProgress } = opts;
+	requireSyncSafe(ctx, "加密路径与文件名");
 	if (!ctx.e2ee.enabled) throw new Error("请先启用端到端加密");
 	const bind = e2eeBinding(ctx);
 	if (!bind) throw new Error("缺少 vaultId/keyEpoch 绑定材料，请先完成一次正常同步后重试");
+
+	// 0. 迁移前必须同步干净：fullSync 会等待当前轮 + 所有续轮 + 队列排空，
+	//    绝不再出现「只是设置了 runAgain 就继续往下走」（LS-121-C06）。
+	//    注意顺序：必须在 beginMigration **之前**——迁移 gate 一旦置位，
+	//    普通同步就会被挡下，fullSync 将永远等不到收敛
+	await opts.fullSync();
 	if (ctx.queue.size > 0 || ctx.store.conflictPaths().length > 0) {
 		throw new Error("存在未完成的同步或未解决的冲突，请处理后重试");
 	}
-	const keys = await ctx.e2ee.metaKeys();
 
-	// 1. 进入 migrating（幂等；服务器要求 encryptionState=encrypted）
-	const st = await ctx.client.metaTransition("begin");
+	ctx.gate.beginMigration("路径与文件名加密迁移");
+	try {
+		const keys = await ctx.e2ee.metaKeys();
+
+		// 1. 进入 migrating（幂等；服务器要求 encryptionState=encrypted）
+		const st = await ctx.client.metaTransition("begin");
+		ctx.store.state.bootstrap.metaState = st.metaState;
+		await ctx.store.save();
+
+		// 2. 以服务器快照为权威清单逐文件迁移
+		const snap = await ctx.client.snapshot();
+		let migrated = 0;
+		let done = 0;
+		for (const f of snap.files) {
+			onProgress({ total: snap.files.length, done: done++, current: f.path });
+			if (f.fileId && f.path === f.fileId) continue; // 已迁移（断点续传）
+			const fileId = requireFileId(f.fileId, `snapshot(${f.path}).fileId`);
+			const metaEnc = await encryptMeta(
+				keys,
+				{ vaultId: bind.vaultId, keyEpoch: bind.keyEpoch, fileId, metaGeneration: 1 },
+				{ path: f.path },
+			);
+			const canonicalHash = await canonicalPathHmac(keys, f.path);
+			let res;
+			try {
+				res = await ctx.client.migrateFileMeta(f.path, metaEnc, canonicalHash);
+			} catch (e) {
+				// 机器错误码分支（LS-121-S05）：绝不再靠 message.includes 判断逻辑
+				if (e instanceof ApiError && e.is("PLAINTEXT_REJECTED")) {
+					throw new Error(`存在旧信封密文（${f.path}），请先执行「升级加密信封 LSE1 → LSE3」后重试`);
+				}
+				throw e;
+			}
+			if (ctx.store.get(f.path)) {
+				ctx.store.update(f.path, {
+					fileId,
+					revision: res.revision,
+					metaGeneration: 1,
+					serverPseudonym: res.toPath,
+				});
+			}
+			migrated++;
+			if (migrated % 10 === 0) await ctx.store.save();
+		}
+		await ctx.store.save();
+
+		// 3. 明文路径抹除（单向点）——v0.12.1 默认不执行（LS-121-C01）
+		if (!opts.allowIrreversibleComplete) {
+			ctx.log(`meta encryption: ${migrated} migrated, irreversible erase skipped (experimental build gate)`);
+			return { migrated, total: snap.files.length, metaState: st.metaState, erased: false };
+		}
+		const final = await ctx.client.metaTransition("complete", true);
+		ctx.store.state.bootstrap.metaState = final.metaState;
+		await ctx.store.save();
+		ctx.log(`meta encryption complete: ${migrated} migrated, plaintext paths erased`);
+		return { migrated, total: snap.files.length, metaState: final.metaState, erased: true };
+	} finally {
+		ctx.gate.endMigration();
+	}
+}
+
+/** 放弃元数据迁移：回到 plain（已伪名化的行保持可用，无破坏性操作）。 */
+export async function abortMetadataMigration(ctx: SyncContext): Promise<string> {
+	requireSyncSafe(ctx, "放弃路径加密迁移");
+	const st = await ctx.client.metaTransition("abort");
 	ctx.store.state.bootstrap.metaState = st.metaState;
 	await ctx.store.save();
-
-	// 2. 以服务器快照为权威清单逐文件迁移
-	const snap = await ctx.client.snapshot();
-	let migrated = 0;
-	let done = 0;
-	for (const f of snap.files) {
-		onProgress({ total: snap.files.length, done: done++, current: f.path });
-		if (f.fileId && f.path === f.fileId) continue; // 已迁移（断点续传）
-		if (!f.fileId) throw new Error(`服务器缺少 fileId：${f.path}（请先升级服务器到 0.12+）`);
-		const metaEnc = await encryptMeta(
-			keys,
-			{ vaultId: bind.vaultId, keyEpoch: bind.keyEpoch, fileId: f.fileId, metaGeneration: 1 },
-			{ path: f.path },
-		);
-		const canonicalHash = await canonicalPathHmac(keys, f.path);
-		let res;
-		try {
-			res = await ctx.client.migrateFileMeta(f.path, metaEnc, canonicalHash);
-		} catch (e) {
-			if (e instanceof ApiError && e.status === 409 && e.message.includes("LSE3")) {
-				throw new Error(`存在旧信封密文（${f.path}），请先执行「升级加密信封 LSE1 → LSE3」后重试`);
-			}
-			throw e;
-		}
-		const tracked = ctx.store.get(f.path);
-		if (tracked) {
-			ctx.store.set(f.path, { ...tracked, fileId: f.fileId, revision: res.revision, metaGeneration: 1 });
-		}
-		migrated++;
-		if (migrated % 10 === 0) await ctx.store.save();
-	}
-	await ctx.store.save();
-
-	// 3. 明文路径抹除（单向点；服务器再次验证全量伪名化）
-	const final = await ctx.client.metaTransition("complete", true);
-	ctx.store.state.bootstrap.metaState = final.metaState;
-	await ctx.store.save();
-	ctx.log(`meta encryption complete: ${migrated} migrated, plaintext paths erased`);
-	return { migrated, total: snap.files.length };
+	ctx.log(`meta migration aborted, metaState=${st.metaState}`);
+	return st.metaState;
 }
 
 /** 统一解密：LSE3（需 fileId）与 LSE1/LSE2 兼容。 */
@@ -288,11 +361,26 @@ export async function upgradeEnvelopes(
 	ctx: SyncContext,
 	onProgress: (p: MigrationProgress) => void,
 ): Promise<{ upgraded: number; skipped: number; total: number }> {
+	requireSyncSafe(ctx, "升级加密信封");
 	if (!ctx.e2ee.enabled) throw new Error("端到端加密未启用，无需升级信封");
 	const vmk = ctx.e2ee.requireKey();
 	const binding = e2eeBinding(ctx);
 	if (!binding) throw new Error("缺少 vaultId/keyEpoch 绑定材料，请先完成一次正常同步后重试");
 
+	ctx.gate.beginMigration("加密信封升级");
+	try {
+		return await runEnvelopeUpgrade(ctx, vmk, binding, onProgress);
+	} finally {
+		ctx.gate.endMigration();
+	}
+}
+
+async function runEnvelopeUpgrade(
+	ctx: SyncContext,
+	vmk: CryptoKey,
+	binding: FileKeyBinding,
+	onProgress: (p: MigrationProgress) => void,
+): Promise<{ upgraded: number; skipped: number; total: number }> {
 	const snap = await ctx.client.snapshot();
 	const files = snap.files.filter((f) => !ctx.ignores(f.path));
 	let upgraded = 0;
@@ -326,8 +414,7 @@ export async function upgradeEnvelopes(
 		try {
 			const res = await ctx.client.upload(f.path, raw.revision, cipherHash, payload, raw.mtime, "upsert");
 			if (tracked) {
-				ctx.store.set(f.path, {
-					...tracked,
+				ctx.store.update(f.path, {
 					serverHash: cipherHash,
 					revision: res.revision,
 					fileId,

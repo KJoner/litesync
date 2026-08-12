@@ -9,6 +9,7 @@ import { Modal, Notice } from "obsidian";
 import { ShareEntry } from "../api/client";
 import { b64urlEncode, encryptShare, randomBytes } from "../crypto/crypto";
 import { SyncContext } from "../sync/context";
+import { requireSyncSafe } from "../sync/gate";
 
 function shareUrl(serverUrl: string, id: string, keyB64url: string): string {
 	return `${serverUrl.replace(/\/+$/, "")}/share.html#${id}.${keyB64url}`;
@@ -57,6 +58,8 @@ export class ShareModal extends Modal {
 			btn.disabled = true;
 			btn.setText("创建中…");
 			try {
+				// 统一安全 gate（LS-121-C07）：状态损坏 / 未绑定 / 迁移中 / 未解锁一律拒绝
+				requireSyncSafe(this.ctx, "创建分享");
 				const adapter = this.ctx.app.vault.adapter;
 				if (!(await adapter.stat(this.path))) throw new Error("文件不存在");
 				const plain = await adapter.readBinary(this.path);

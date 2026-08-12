@@ -4,6 +4,7 @@ import { VaultKeyDoc } from "../crypto/crypto";
 import { PendingOp } from "../sync/queue";
 import { sha256Hex } from "../utils/hash";
 import { encodeUtf8 } from "../utils/text";
+import { isFileId, isGeneration } from "../utils/validate";
 
 /**
  * 每个已同步文件的本地状态缓存。
@@ -26,7 +27,23 @@ export interface FileState {
 	generation?: number;
 	/** 元数据世代（v9.3 三期，meta 模式）：改名 = 世代 +1 */
 	metaGeneration?: number;
+	/**
+	 * 服务器可见路径（v0.12.1）：meta 模式下为伪名（=fileId），明文模式为空。
+	 * 显式记录后，任何请求都不需要再从真实路径「猜」服务器路径。
+	 */
+	serverPseudonym?: string;
 }
+
+/**
+ * FileState 身份字段（v0.12.1 / LS-121-C04）。
+ *
+ * 这些字段一旦在某次 `store.set()` 中被漏写就等于永久丢失：
+ * fileId 丢失 → LSE3 无法解密、meta 模式退回真实路径；
+ * generation 丢失 → 抗回退重放检查失效；
+ * metaGeneration 丢失 → 改名 CAS 永远失败。
+ * 因此所有「更新已有文件」的写入都必须走 {@link StateStore.update}。
+ */
+export const FILE_IDENTITY_FIELDS = ["fileId", "generation", "metaGeneration", "serverPseudonym"] as const;
 
 /** 未解决冲突的登记信息（计划书 Phase 15：Pending Conflict）。 */
 export interface PendingConflict {
@@ -49,6 +66,21 @@ export interface BlockedChange {
 	at: number;
 }
 
+/**
+ * 本地状态所绑定的服务器与身份指纹（v0.12.1 / LS-121-C02）。
+ *
+ * server URL、Token、设备身份、vault key 文档任何一项变化，都意味着
+ * 「本地这份 state 未必还属于对面那个仓库」——必须重新走一遍权威校验
+ * （/info + 凭据 + vaultId/repoEpoch）才允许继续上传、删除、改名。
+ * Token 只存不可逆摘要的前 16 位，绝不落盘明文。
+ */
+export interface BindingFingerprint {
+	serverUrl: string;
+	tokenDigest: string;
+	deviceId: string;
+	vaultKeyDigest: string;
+}
+
 export interface PersistedState {
 	deviceId: string;
 	lastSequence: number;
@@ -69,6 +101,11 @@ export interface PersistedState {
 	pendingOps: Record<string, PendingOp>;
 	/** 被阻塞的远端变更（v9）：如远端文件与本地文件夹同名；每轮同步重试 */
 	blockedChanges: Record<string, BlockedChange>;
+	/**
+	 * 已确认的绑定指纹（v0.12.1）：null = 尚未绑定（unbound），
+	 * 任何写操作在重新完成权威校验之前都被 gate 拦截
+	 */
+	binding: BindingFingerprint | null;
 }
 
 function emptyState(): PersistedState {
@@ -83,6 +120,7 @@ function emptyState(): PersistedState {
 		bootstrap: { ...PENDING_BOOTSTRAP },
 		pendingOps: {},
 		blockedChanges: {},
+		binding: null,
 	};
 }
 
@@ -168,6 +206,18 @@ export class StateStore {
 		}
 
 		if (payload) this.state = normalizeState(payload);
+
+		// 身份字段校验（v0.12.1 / LS-121-C03）：这些值只可能由本插件写入，
+		// 出现非法格式说明状态文件被外部改写或写坏——继续同步会用错误的 AAD
+		// 加密、或让抗回退检查失效，因此按「状态损坏」停机而不是静默修正
+		const bad = firstInvalidIdentity(this.state.files);
+		if (bad !== null) {
+			console.error(`[litesync] state contains an invalid identity field (${bad}); sync halted`);
+			this.corrupted = true;
+			this.state = emptyState();
+			return;
+		}
+
 		if (!this.state.deviceId) {
 			this.state.deviceId = crypto.randomUUID();
 			await this.save();
@@ -206,8 +256,53 @@ export class StateStore {
 		return this.state.files[path];
 	}
 
+	/**
+	 * 全量替换某路径的状态（仅用于「这是一个全新对象」的场景）。
+	 * 更新已有对象请一律使用 {@link update}——否则会丢身份字段（LS-121-C04）。
+	 */
 	set(path: string, fs: FileState): void {
 		this.state.files[path] = fs;
+	}
+
+	/**
+	 * 保身份更新（v0.12.1 / LS-121-C04）。
+	 *
+	 * 与旧代码里遍地的 `store.set(path, { hash, serverHash, revision, mtime, size })`
+	 * 不同：未在 patch 中显式给出（或给出 undefined）的字段一律沿用旧值，
+	 * 因此 fileId / generation / metaGeneration / serverPseudonym 不可能被
+	 * 「顺手写一半字段」的调用悄悄抹掉。
+	 */
+	update(path: string, patch: Partial<FileState>): FileState {
+		const prev = this.state.files[path];
+		const next: FileState = {
+			hash: prev?.hash ?? "",
+			serverHash: prev?.serverHash ?? "",
+			revision: prev?.revision ?? 0,
+			mtime: prev?.mtime ?? 0,
+			size: prev?.size ?? 0,
+			...(prev?.fileId !== undefined ? { fileId: prev.fileId } : {}),
+			...(prev?.generation !== undefined ? { generation: prev.generation } : {}),
+			...(prev?.metaGeneration !== undefined ? { metaGeneration: prev.metaGeneration } : {}),
+			...(prev?.serverPseudonym !== undefined ? { serverPseudonym: prev.serverPseudonym } : {}),
+		};
+		for (const [k, v] of Object.entries(patch)) {
+			if (v === undefined) continue; // undefined 表示「本次不掌握该字段」，不是「清空」
+			(next as unknown as Record<string, unknown>)[k] = v;
+		}
+		this.state.files[path] = next;
+		return next;
+	}
+
+	/**
+	 * 改名：把状态整体搬到新路径（身份字段全部保留）。
+	 * meta 模式下伪名不随路径改变，因此 serverPseudonym/fileId 必须原样带走。
+	 */
+	rename(from: string, to: string, patch: Partial<FileState> = {}): void {
+		const prev = this.state.files[from];
+		if (prev === undefined) return;
+		delete this.state.files[from];
+		this.state.files[to] = { ...prev };
+		this.update(to, patch);
 	}
 
 	delete(path: string): void {
@@ -285,6 +380,33 @@ export class StateStore {
 		delete this.state.pendingDeletes[path];
 	}
 
+	// ---------- 绑定指纹（v0.12.1 / LS-121-C02） ----------
+
+	get binding(): BindingFingerprint | null {
+		return this.state.binding;
+	}
+
+	/** 当前状态是否绑定到给定指纹（任一字段不同 = 必须重新绑定）。 */
+	isBoundTo(fp: BindingFingerprint): boolean {
+		const b = this.state.binding;
+		return (
+			b !== null &&
+			b.serverUrl === fp.serverUrl &&
+			b.tokenDigest === fp.tokenDigest &&
+			b.deviceId === fp.deviceId &&
+			b.vaultKeyDigest === fp.vaultKeyDigest
+		);
+	}
+
+	/** 权威校验通过后固定绑定（只能由 SyncManager 的重新绑定流程调用）。 */
+	setBinding(fp: BindingFingerprint): void {
+		this.state.binding = { ...fp };
+	}
+
+	clearBinding(): void {
+		this.state.binding = null;
+	}
+
 	// ---------- 被阻塞的远端变更（v9） ----------
 
 	setBlockedChange(path: string, reason: string): void {
@@ -314,6 +436,7 @@ function normalizeState(raw: Partial<PersistedState>): PersistedState {
 			raw.bootstrap && typeof raw.bootstrap === "object" ? raw.bootstrap : { ...PENDING_BOOTSTRAP },
 		pendingOps: normalizePendingOps(raw.pendingOps),
 		blockedChanges: raw.blockedChanges && typeof raw.blockedChanges === "object" ? raw.blockedChanges : {},
+		binding: normalizeBinding(raw.binding),
 	};
 	// v0.2 状态升级：当时全部为明文，serverHash 与 hash 相同
 	for (const fs of Object.values(state.files)) {
@@ -325,6 +448,61 @@ function normalizeState(raw: Partial<PersistedState>): PersistedState {
 		state.bootstrap = { status: "ready", mode: "legacy", completedAt: Date.now() };
 	}
 	return state;
+}
+
+/**
+ * 计算当前配置对应的绑定指纹（v0.12.1 / LS-121-C02）。
+ * Token 与 vault key 只取不可逆摘要的前 16 位——足以检测变化，
+ * 又不会把凭据材料以任何可用形式写进 state.json。
+ */
+export async function computeBinding(input: {
+	serverUrl: string;
+	apiToken: string;
+	deviceId: string;
+	vaultKey: VaultKeyDoc | null;
+}): Promise<BindingFingerprint> {
+	const digest = async (label: string, value: string): Promise<string> =>
+		value === "" ? "" : (await sha256Hex(encodeUtf8(`litesync/v1/binding/${label}:${value}`))).slice(0, 16);
+	const keyMaterial = input.vaultKey ? `${input.vaultKey.salt}|${input.vaultKey.wrappedKey}` : "";
+	return {
+		serverUrl: input.serverUrl.trim().replace(/\/+$/, ""),
+		tokenDigest: await digest("token", input.apiToken),
+		deviceId: input.deviceId,
+		vaultKeyDigest: await digest("vault-key", keyMaterial),
+	};
+}
+
+/**
+ * 返回第一个非法身份字段的描述（全部合法返回 null）。
+ * 只检查「已存在」的可选字段：升级上来的老状态没有这些字段是正常的。
+ */
+function firstInvalidIdentity(files: Record<string, FileState>): string | null {
+	for (const [path, fs] of Object.entries(files)) {
+		if (fs.fileId !== undefined && !isFileId(fs.fileId)) return `${path}.fileId`;
+		if (fs.generation !== undefined && !isGeneration(fs.generation)) return `${path}.generation`;
+		if (fs.metaGeneration !== undefined && !isGeneration(fs.metaGeneration)) return `${path}.metaGeneration`;
+		if (fs.serverPseudonym !== undefined && !isFileId(fs.serverPseudonym)) return `${path}.serverPseudonym`;
+	}
+	return null;
+}
+
+/**
+ * 绑定指纹规整（v0.12.1）：字段不全 = 视为未绑定。
+ * 从 v0.12.0 及更早版本升级上来的设备天然没有这个字段——它们会在下一轮
+ * 同步的权威校验（/info + 凭据 + vaultId/repoEpoch）通过后自动补记录。
+ */
+function normalizeBinding(raw: unknown): BindingFingerprint | null {
+	if (!raw || typeof raw !== "object") return null;
+	const b = raw as Partial<BindingFingerprint>;
+	if (
+		typeof b.serverUrl !== "string" ||
+		typeof b.tokenDigest !== "string" ||
+		typeof b.deviceId !== "string" ||
+		typeof b.vaultKeyDigest !== "string"
+	) {
+		return null;
+	}
+	return { serverUrl: b.serverUrl, tokenDigest: b.tokenDigest, deviceId: b.deviceId, vaultKeyDigest: b.vaultKeyDigest };
 }
 
 /** pendingOps 规整：兼容 v9.2 之前的字符串形式（"upsert"/"delete"）。 */

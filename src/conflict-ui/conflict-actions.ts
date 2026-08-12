@@ -2,6 +2,7 @@ import { NotFoundError } from "../api/client";
 import { smartThreeWayMerge } from "../merge/smart-merge";
 import { keepBothVersions } from "../sync/conflict";
 import { SyncContext } from "../sync/context";
+import { requireSyncSafe } from "../sync/gate";
 import { downloadPlain, uploadFromPlain, versionPlain, writeIfLocalUnchanged } from "../sync/transfer";
 import { sha256Hex } from "../utils/hash";
 import { decodeUtf8Strict, encodeUtf8 } from "../utils/text";
@@ -12,6 +13,7 @@ import { LoadedConflict } from "./conflict-state";
  * 每次打开（或 409 后重载）都重新获取远端，保证 Save 基于最新 revision。
  */
 export async function loadConflict(ctx: SyncContext, path: string): Promise<LoadedConflict> {
+	requireSyncSafe(ctx, "处理同步冲突");
 	const pending = ctx.store.getConflict(path);
 	if (!pending) throw new Error("该文件已不在冲突状态");
 
@@ -90,6 +92,7 @@ export async function saveResolution(
 	remoteRevision: number,
 	expectedLocalHash: string,
 ): Promise<number> {
+	requireSyncSafe(ctx, "保存冲突合并结果");
 	const data = encodeUtf8(finalText);
 	const hash = await sha256Hex(data);
 	const out = await uploadFromPlain(ctx, path, data, remoteRevision, Date.now(), "merge");
@@ -97,7 +100,7 @@ export async function saveResolution(
 	const wrote = await writeIfLocalUnchanged(ctx, path, data, expectedLocalHash === "" ? null : expectedLocalHash);
 	if (!wrote) throw new LocalChangedError(path);
 	const stat = await ctx.app.vault.adapter.stat(path);
-	ctx.store.set(path, {
+	ctx.store.update(path, {
 		hash,
 		serverHash: out.cipherHash,
 		revision: out.revision,
@@ -105,6 +108,8 @@ export async function saveResolution(
 		size: data.byteLength,
 		fileId: out.fileId,
 		generation: out.generation,
+		metaGeneration: out.metaGeneration,
+		serverPseudonym: out.serverPseudonym,
 	});
 	ctx.store.clearConflict(path);
 	await ctx.store.save();

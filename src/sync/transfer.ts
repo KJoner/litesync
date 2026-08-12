@@ -22,6 +22,7 @@ import {
 import { E2eeLockedError } from "../crypto/keyring";
 import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
+import { optionalFileId, optionalGeneration, requireFileId, requireKeyEpoch } from "../utils/validate";
 import { SyncContext } from "./context";
 
 /** 元数据加密模式（v9.3 三期）：服务器只见伪名（=fileId），真实路径在 LSM1 里。 */
@@ -30,12 +31,43 @@ export function metaEncrypted(ctx: SyncContext): boolean {
 }
 
 /**
+ * 无法把真实路径解析为服务器伪名（v0.12.1 / LS-121-C05）。
+ *
+ * meta-encrypted 仓库里真实路径**绝不允许**出现在 URL、query、Header 或
+ * 服务端访问日志中。以前这里会「回退真实路径」，等于在一次网络请求里
+ * 把加密掉的目录结构直接泄露给服务器；现在一律硬失败，由调用方转成
+ * blocked / keep-both 等不破坏数据的处理。
+ */
+export class MetaPathUnresolvedError extends Error {
+	constructor(public realPath: string) {
+		super(
+			"元数据加密仓库中该文件还没有已知的服务器伪名，已阻止本次请求" +
+				"（绝不把真实路径发给服务器）；下一轮同步会先对账再重试",
+		);
+		this.name = "MetaPathUnresolvedError";
+	}
+}
+
+/**
  * 真实路径 → 服务器可见路径（伪名翻译）。
- * meta 模式下已跟踪文件用 fileId；未跟踪（如冲突流程不该出现）回退真实路径。
+ * meta 模式下必须使用已记录的伪名（= fileId）；未知则硬失败，绝不回退真实路径。
  */
 export function serverPathOf(ctx: SyncContext, realPath: string): string {
 	if (!metaEncrypted(ctx)) return realPath;
-	return ctx.store.get(realPath)?.fileId ?? realPath;
+	const tracked = ctx.store.get(realPath);
+	const pseudonym = tracked?.serverPseudonym ?? tracked?.fileId;
+	if (pseudonym === undefined) throw new MetaPathUnresolvedError(realPath);
+	return pseudonym;
+}
+
+/** 历史版本列表（meta 模式自动翻译伪名——真实路径绝不进 query，LS-121-C05）。 */
+export async function historyOf(ctx: SyncContext, realPath: string, serverPath?: string) {
+	return ctx.client.history(serverPath ?? serverPathOf(ctx, realPath));
+}
+
+/** 清理历史（meta 模式自动翻译伪名）。 */
+export async function purgeHistoryOf(ctx: SyncContext, realPath: string, beforeRevision: number): Promise<number> {
+	return ctx.client.purgeHistory(serverPathOf(ctx, realPath), beforeRevision);
 }
 
 export interface PlainDownload {
@@ -62,10 +94,10 @@ export interface PlainDownload {
  */
 export function e2eeBinding(ctx: SyncContext): FileKeyBinding | undefined {
 	const b = ctx.store.state.bootstrap;
-	if (b.remoteVaultId && (b.keyEpoch ?? 0) > 0) {
-		return { vaultId: b.remoteVaultId, keyEpoch: b.keyEpoch! };
-	}
-	return undefined;
+	if (!b.remoteVaultId || b.keyEpoch === undefined || b.keyEpoch === 0) return undefined;
+	// 出现了 keyEpoch 但值非法：绝不 `>>> 0` 截断、也绝不当作「未就绪」
+	// 静默回退 LSE1（那等于信封降级）——直接硬失败（LS-121-C03）
+	return { vaultId: b.remoteVaultId, keyEpoch: requireKeyEpoch(b.keyEpoch, "bootstrap.keyEpoch") };
 }
 
 interface DecodeOptions {
@@ -85,21 +117,25 @@ async function decode(
 	if (dl.hash && cipherHash !== dl.hash) {
 		throw new Error(`downloaded content hash mismatch for ${path}`);
 	}
+	// 服务器提供的身份/世代字段集中校验（LS-121-C03）：非法值立刻硬失败，
+	// 绝不带着被截断的 fileId/metaGeneration 继续解密或更新本地状态
+	const fileId = optionalFileId(dl.fileId, `download(${path}).X-File-Id`);
+	const metaGeneration = optionalGeneration(dl.metaGeneration, `download(${path}).X-Meta-Generation`);
 
 	// LSE3（v9.3）：AAD = vaultId + keyEpoch(信封头) + fileId(服务器提供) + generation(信封头)。
 	// fileId 造假 → GCM 认证直接失败；generation 经 AAD 认证后做回退检查。
 	if (isLse3Envelope(dl.data)) {
 		if (!ctx.e2ee.unlocked) throw new E2eeLockedError();
 		const bind = e2eeBinding(ctx);
-		if (!bind?.vaultId || !dl.fileId) {
+		if (!bind?.vaultId || fileId === undefined) {
 			throw new Error(`无法解密 ${path}（缺少 vaultId/fileId 绑定材料）`);
 		}
-		const dec = await decryptFileV3(ctx.e2ee.requireKey(), dl.data, bind.vaultId, dl.fileId, bind.keyEpoch);
+		const dec = await decryptFileV3(ctx.e2ee.requireKey(), dl.data, bind.vaultId, fileId, bind.keyEpoch);
 		if (dec === null) throw new Error(`无法解密 ${path}（密钥不匹配、数据被篡改或密钥世代不符）`);
 		if (opts.enforceGeneration) {
 			const tracked = ctx.store.get(path);
 			if (
-				tracked?.fileId === dl.fileId &&
+				tracked?.fileId === fileId &&
 				tracked.generation !== undefined &&
 				dec.generation < tracked.generation
 			) {
@@ -115,10 +151,10 @@ async function decode(
 			cipherHash,
 			revision: dl.revision,
 			mtime: dl.mtime,
-			fileId: dl.fileId,
+			fileId,
 			generation: dec.generation,
 			metaEnc: dl.metaEnc,
-			metaGeneration: dl.metaGeneration,
+			metaGeneration,
 		};
 	}
 
@@ -141,9 +177,9 @@ async function decode(
 		cipherHash,
 		revision: dl.revision,
 		mtime: dl.mtime,
-		fileId: dl.fileId,
+		fileId,
 		metaEnc: dl.metaEnc,
-		metaGeneration: dl.metaGeneration,
+		metaGeneration,
 	};
 }
 
@@ -205,6 +241,8 @@ export interface UploadOutcome {
 	generation?: number;
 	/** 元数据世代（meta 模式建档为 1；成功后记入 FileState） */
 	metaGeneration?: number;
+	/** 本次实际使用的服务器可见路径（meta 模式为伪名，明文模式为空） */
+	serverPseudonym?: string;
 }
 
 /** 上传明文内容（E2EE 启用时自动加密，默认 LSE3；meta 模式自动伪名 + 挂元数据）。 */
@@ -227,8 +265,11 @@ export async function uploadFromPlain(
 		const bind = e2eeBinding(ctx);
 		if (bind) {
 			const tracked = ctx.store.get(path);
-			// 新文件：id 必须在加密前确定 → 客户端预生成，随上传头交给服务器
-			const fileId = tracked?.fileId ?? newFileId();
+			// 新文件：id 必须在加密前确定 → 客户端预生成，随上传头交给服务器。
+			// 已跟踪文件沿用原身份，但先校验一遍——被改坏的 fileId 会让这份
+			// 密文的 AAD 与将来重建的 AAD 不一致，永久无法解密（LS-121-C03）
+			const fileId =
+				tracked?.fileId === undefined ? newFileId() : requireFileId(tracked.fileId, `upload(${path}).fileId`);
 			generation = (tracked?.fileId === fileId ? (tracked?.generation ?? 0) : 0) + 1;
 			payload = await encryptFileV3(
 				ctx.e2ee.requireKey(),
@@ -262,12 +303,21 @@ export async function uploadFromPlain(
 	}
 	const cipherHash = await sha256Hex(payload);
 	const res = await ctx.client.upload(serverPath, baseRevision, cipherHash, payload, mtime, action, sendFileId, meta);
+	// 服务器回报的身份必须合法；E2EE 下还必须与本地用于加密的 fileId 完全一致，
+	// 否则这份密文将来会因 AAD 不符而无法解密（LS-121-C03）
+	const confirmed = optionalFileId(res.fileId, `upload(${path}).fileId`) ?? sendFileId;
+	if (sendFileId !== undefined && confirmed !== sendFileId) {
+		throw new Error(
+			`服务器返回的 fileId 与本次加密使用的身份不一致（${path}），已停止同步以免写入无法解密的内容`,
+		);
+	}
 	return {
 		revision: res.revision,
 		cipherHash,
 		sequence: res.sequence,
-		fileId: res.fileId ?? sendFileId,
+		fileId: confirmed,
 		generation,
 		metaGeneration,
+		serverPseudonym: metaEncrypted(ctx) ? serverPath : undefined,
 	};
 }

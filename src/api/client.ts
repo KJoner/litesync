@@ -144,13 +144,42 @@ export interface ShareEntry {
 	expired: boolean;
 }
 
+/**
+ * 服务器错误码（v0.12.1 / LS-121-S05）：客户端逻辑只允许根据 `code` 分支，
+ * 绝不允许再解析 message 文案（文案会随本地化和版本变化）。
+ */
+export type ServerErrorCode =
+	| "INVALID_PATH"
+	| "INVALID_HEADER"
+	| "INVALID_BODY"
+	| "ENVELOPE_TOO_OLD"
+	| "PLAINTEXT_REJECTED"
+	| "META_REQUIRED"
+	| "META_STATE_INVALID"
+	| "STALE_META_GENERATION"
+	| "CANONICAL_COLLISION"
+	| "FILE_ID_CONFLICT"
+	| "TOMBSTONE_PLAINTEXT"
+	| "MIGRATION_LOCKED"
+	| "NOT_FOUND"
+	| "TOO_LARGE"
+	| "INTERNAL";
+
 export class ApiError extends Error {
 	constructor(
 		public status: number,
 		message: string,
+		/** 服务器返回的机器可识别错误码（旧服务器不返回时为 undefined） */
+		public code?: string,
+		/** 服务器标注该错误是否值得重试 */
+		public retryable?: boolean,
 	) {
 		super(message);
 		this.name = "ApiError";
+	}
+
+	is(code: ServerErrorCode): boolean {
+		return this.code === code;
 	}
 }
 
@@ -288,10 +317,18 @@ export class ApiClient {
 			body: data,
 			throw: false,
 		});
-		if (res.status === 409) throw new ConflictError(parseConflict(res.text, path));
+		if (res.status === 409) {
+			// 409 既可能是 revision 冲突，也可能是「信封降级被拒」（v0.12.1 S01）等
+			// 协议级拒绝——后者没有可用的服务器状态，必须按 ApiError 上抛
+			const body = tryJson(res.text);
+			if (typeof body?.code === "string" && body.code !== "CONFLICT") {
+				throw apiError(409, `upload ${path} failed`, res.text);
+			}
+			throw new ConflictError(parseConflict(res.text, path));
+		}
 		if (res.status !== 200) {
 			// 422（路径碰撞）等携带说明的错误：把服务器信息带给用户
-			throw new ApiError(res.status, `upload ${path} failed: HTTP ${res.status}${serverErrText(res.text)}`);
+			throw apiError(res.status, `upload ${path} failed`, res.text);
 		}
 		return res.json as UploadOk;
 	}
@@ -533,8 +570,7 @@ export class ApiClient {
 			throw: false,
 		});
 		if (res.status === 409) throw new ConflictError(parseConflict(res.text, fromPath));
-		if (res.status !== 200)
-			throw new ApiError(res.status, `move ${fromPath} -> ${toPath} failed: HTTP ${res.status}${serverErrText(res.text)}`);
+		if (res.status !== 200) throw apiError(res.status, `move ${fromPath} -> ${toPath} failed`, res.text);
 		return res.json as { revision: number; tombstoneRevision: number; sequence: number };
 	}
 
@@ -570,8 +606,7 @@ export class ApiClient {
 			throw: false,
 		});
 		if (res.status === 409) throw new ConflictError(parseConflict(res.text, path));
-		if (res.status !== 200)
-			throw new ApiError(res.status, `meta update failed: HTTP ${res.status}${serverErrText(res.text)}`);
+		if (res.status !== 200) throw apiError(res.status, "meta update failed", res.text);
 		return res.json as { revision: number; metaGeneration: number; sequence: number };
 	}
 
@@ -588,8 +623,7 @@ export class ApiClient {
 			body: JSON.stringify({ fromPath, metaEnc, canonicalHash }),
 			throw: false,
 		});
-		if (res.status !== 200)
-			throw new ApiError(res.status, `meta migrate failed: HTTP ${res.status}${serverErrText(res.text)}`);
+		if (res.status !== 200) throw apiError(res.status, "meta migrate failed", res.text);
 		return res.json as { fromPath: string; toPath: string; revision: number; sequence: number };
 	}
 
@@ -604,8 +638,7 @@ export class ApiClient {
 			body: action === "complete" ? JSON.stringify({ confirmErase: confirmErase === true }) : "{}",
 			throw: false,
 		});
-		if (res.status !== 200)
-			throw new ApiError(res.status, `meta ${action} failed: HTTP ${res.status}${serverErrText(res.text)}`);
+		if (res.status !== 200) throw apiError(res.status, `meta ${action} failed`, res.text);
 		return res.json as { metaState: string };
 	}
 
@@ -637,9 +670,20 @@ function parseConflict(text: string, path: string): RemoteFileState {
 /** 提取服务器错误响应中的说明文字（附加到 ApiError message）。 */
 function serverErrText(text: string): string {
 	const body = tryJson(text);
-	const msg = typeof body?.error === "string" ? body.error : "";
+	const msg = typeof body?.message === "string" ? body.message : typeof body?.error === "string" ? body.error : "";
 	const extra = typeof body?.existing === "string" ? `（与现有文件冲突：${body.existing}）` : "";
 	return msg ? ` — ${msg}${extra}` : "";
+}
+
+/** 统一构造带机器错误码的 ApiError（v0.12.1 / LS-121-S05）。 */
+function apiError(status: number, prefix: string, text: string): ApiError {
+	const body = tryJson(text);
+	return new ApiError(
+		status,
+		`${prefix}: HTTP ${status}${serverErrText(text)}`,
+		typeof body?.code === "string" ? body.code : undefined,
+		typeof body?.retryable === "boolean" ? body.retryable : undefined,
+	);
 }
 
 /**

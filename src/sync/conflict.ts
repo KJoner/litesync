@@ -3,7 +3,7 @@ import { conflictPathFor } from "../utils/conflict-name";
 import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
 import { SyncContext } from "./context";
-import { downloadPlain } from "./transfer";
+import { downloadPlain, MetaPathUnresolvedError } from "./transfer";
 
 /**
  * 冲突处理核心：保留两个版本，绝不丢弃任何一份内容。
@@ -37,6 +37,14 @@ export async function keepBothVersions(
 			await adapter.remove(conflictPath);
 			return null;
 		}
+		if (e instanceof MetaPathUnresolvedError) {
+			// meta 模式下还不知道该文件的服务器伪名（LS-121-C05）：
+			// 绝不用真实路径去请求服务器，也绝不动本地内容——登记 blocked 后重试
+			await adapter.remove(conflictPath);
+			ctx.store.setBlockedChange(path, "元数据加密仓库中尚未解析出该文件的服务器伪名");
+			ctx.notify(`已暂缓处理冲突（尚未解析出服务器伪名）：${path}\n本地内容未被修改，下轮同步会自动重试`);
+			return null;
+		}
 		// 下载失败：保留副本没有害处，但不修改原文件
 		throw e;
 	}
@@ -50,7 +58,7 @@ export async function keepBothVersions(
 	if (currentHash === localHash) {
 		await adapter.writeBinary(path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
 		const stat = await adapter.stat(path);
-		ctx.store.set(path, {
+		ctx.store.update(path, {
 			hash: dl.plainHash,
 			serverHash: dl.cipherHash,
 			revision: dl.revision,
@@ -58,6 +66,7 @@ export async function keepBothVersions(
 			size: dl.plain.byteLength,
 			fileId: dl.fileId,
 			generation: dl.generation,
+			metaGeneration: dl.metaGeneration,
 		});
 	} else {
 		ctx.log(`keepBoth: local changed during download of ${path}, keeping current content`);

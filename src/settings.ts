@@ -20,6 +20,19 @@ export interface PluginSettings {
 	trustDevice: boolean;
 	/** 设备密钥（base64，拆分包装的一半；另一半在 SecretStorage） */
 	deviceKeyB64: string;
+	/**
+	 * 实验功能：加密路径与文件名（v0.12.x 仍是 RC，LS-121-C01）。
+	 * 关闭时「加密路径与文件名」命令直接拒绝执行。
+	 */
+	experimentalMetaEncryption: boolean;
+	/**
+	 * 开发开关：允许执行不可逆的明文路径抹除（meta complete）。
+	 *
+	 * v0.12.1 默认 **关闭**，且服务端也已拒绝这种 complete——当前实现无法在
+	 * 抹除明文的同时保住删除屏障（tombstone 的 path 本身就是明文路径）。
+	 * 正式抹除要等 v0.13.0 的隐私 tombstone ledger。
+	 */
+	allowIrreversibleMetaErase: boolean;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -33,6 +46,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	debug: false,
 	trustDevice: true,
 	deviceKeyB64: "",
+	experimentalMetaEncryption: false,
+	allowIrreversibleMetaErase: false,
 };
 
 /**
@@ -204,6 +219,41 @@ export class SyncSettingTab extends PluginSettingTab {
 			},
 			{
 				type: "group",
+				heading: "实验功能（RC，勿用于唯一真实 Vault）",
+				items: [
+					{
+						name: "加密路径与文件名（实验）",
+						desc: createFragment((frag) => {
+							frag.appendText(
+								"开启后才会出现「加密路径与文件名」命令。v0.12.x 仍是 RC：请只在测试 Vault 或已完整备份的副本上使用。",
+							);
+							frag.createEl("br");
+							frag.appendText("· 迁移前的服务器备份中仍可能含有明文路径；");
+							frag.createEl("br");
+							frag.appendText("· 迁移完成后无法依赖普通回滚恢复真实路径；");
+							frag.createEl("br");
+							frag.appendText("· 所有设备都必须升级到 0.12+，旧版本无法读取此仓库。");
+						}),
+						control: { type: "toggle", key: "experimentalMetaEncryption" },
+					},
+					{
+						name: "允许不可逆的明文路径抹除（开发者）",
+						desc:
+							"v0.12.1 默认关闭，且服务端同样拒绝执行：当前实现无法在抹除明文路径的同时保住删除屏障。" +
+							"迁移会停在「已伪名化但未抹除」的可回退状态，正式抹除请等待 v0.13.0 的隐私 tombstone ledger。",
+						visible: () => plugin.settings.experimentalMetaEncryption,
+						control: { type: "toggle", key: "allowIrreversibleMetaErase" },
+					},
+					{
+						name: "放弃路径加密迁移",
+						desc: "把仓库的元数据状态从 migrating 退回 plain；已伪名化的文件保持可用，不做任何破坏性操作",
+						visible: () => plugin.metaMigrationActive(),
+						action: () => void plugin.abortMetaMigration(),
+					},
+				],
+			},
+			{
+				type: "group",
 				heading: "调试",
 				items: [
 					{
@@ -226,7 +276,11 @@ export class SyncSettingTab extends PluginSettingTab {
 		switch (key) {
 			case "serverUrl": {
 				const url = String(value).trim();
+				const changed = this.plugin.settings.serverUrl !== url;
 				settings[key] = url;
+				// 换服务器 = 本地状态未必还属于对面那个仓库（LS-121-C02）：
+				// 立即切 unbound，重新完成权威校验前禁止任何写操作
+				if (changed) this.plugin.invalidateBinding("Server URL 已变化");
 				// 即时提示（v9.2）：非本机的 http:// 会在同步时被硬性拒绝（Token 明文暴露）
 				if (/^http:\/\//i.test(url) && !isLoopbackUrl(url)) {
 					new Notice("注意：非本机地址必须使用 https://，当前 http:// 配置将无法同步", 8000);

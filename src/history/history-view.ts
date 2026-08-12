@@ -2,7 +2,8 @@ import { Modal, Notice } from "obsidian";
 import { ConflictError, NotFoundError, VersionEntry } from "../api/client";
 import { DiffTooLargeError, diffLinesView } from "../merge/diff";
 import { SyncContext } from "../sync/context";
-import { uploadFromPlain, versionPlain } from "../sync/transfer";
+import { requireSyncSafe } from "../sync/gate";
+import { historyOf, uploadFromPlain, versionPlain } from "../sync/transfer";
 import { ensureParentFolder } from "../utils/path";
 import { decodeUtf8Strict } from "../utils/text";
 
@@ -39,7 +40,11 @@ export class HistoryModal extends Modal {
 
 		let versions: VersionEntry[];
 		try {
-			versions = await this.ctx.client.history(this.path);
+			// 统一安全 gate（LS-121-C07）：状态损坏 / 未绑定 / 迁移中 / 未解锁时
+			// 一律不允许读写远端；伪名翻译（LS-121-C05）由 historyOf 负责——
+			// meta 模式下真实路径绝不进入 URL、query 或服务端访问日志
+			requireSyncSafe(this.ctx, "查看版本历史");
+			versions = await historyOf(this.ctx, this.path);
 		} catch (e) {
 			this.contentEl.setText(`加载历史失败：${e instanceof Error ? e.message : String(e)}`);
 			return;
@@ -113,6 +118,7 @@ export class HistoryModal extends Modal {
 	 */
 	private async restore(v: VersionEntry): Promise<void> {
 		try {
+			requireSyncSafe(this.ctx, "恢复历史版本");
 			const dl = await versionPlain(this.ctx, this.path, v.revision);
 
 			const tracked = this.ctx.store.get(this.path);
@@ -133,12 +139,18 @@ export class HistoryModal extends Modal {
 			await ensureParentFolder(adapter, this.path);
 			await adapter.writeBinary(this.path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
 			const stat = await adapter.stat(this.path);
-			this.ctx.store.set(this.path, {
+			// 恢复不改变文件身份（LS-121-C04）：fileId / 伪名保持不变，
+			// generation 与 metaGeneration 取本次上传返回的新值
+			this.ctx.store.update(this.path, {
 				hash: dl.plainHash,
 				serverHash: out.cipherHash,
 				revision: out.revision,
 				mtime: stat?.mtime ?? Date.now(),
 				size: dl.plain.byteLength,
+				fileId: out.fileId,
+				generation: out.generation,
+				metaGeneration: out.metaGeneration,
+				serverPseudonym: out.serverPseudonym,
 			});
 			await this.ctx.store.save();
 			new Notice(`已恢复 Revision ${v.revision} → 新版本 Revision ${out.revision}`);
@@ -156,6 +168,7 @@ export class HistoryModal extends Modal {
 
 	private async saveCopy(v: VersionEntry): Promise<void> {
 		try {
+			requireSyncSafe(this.ctx, "另存历史版本");
 			const dl = await versionPlain(this.ctx, this.path, v.revision);
 			const slash = this.path.lastIndexOf("/");
 			const dot = this.path.lastIndexOf(".");

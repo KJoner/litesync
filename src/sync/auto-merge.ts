@@ -63,7 +63,7 @@ export async function attemptAutoMerge(
 			// 两端内容其实一致（如重试 / 相同修改）→ 直接采纳远端 revision
 			if (remote.plainHash === localHash) {
 				const stat = await ctx.app.vault.adapter.stat(path);
-				ctx.store.set(path, {
+				ctx.store.update(path, {
 					hash: localHash,
 					serverHash: remote.cipherHash,
 					revision: remote.revision,
@@ -71,6 +71,7 @@ export async function attemptAutoMerge(
 					size: localData.byteLength,
 					fileId: remote.fileId,
 					generation: remote.generation,
+					metaGeneration: remote.metaGeneration,
 				});
 				return "merged";
 			}
@@ -102,7 +103,7 @@ export async function attemptAutoMerge(
 					return "merged"; // 合并结果已在服务器上；本地新编辑由下一轮同步处理
 				}
 				const stat = await ctx.app.vault.adapter.stat(path);
-				ctx.store.set(path, {
+				ctx.store.update(path, {
 					hash: mergedHash,
 					serverHash: out.cipherHash,
 					revision: out.revision,
@@ -110,6 +111,8 @@ export async function attemptAutoMerge(
 					size: mergedData.byteLength,
 					fileId: out.fileId,
 					generation: out.generation,
+					metaGeneration: out.metaGeneration,
+					serverPseudonym: out.serverPseudonym,
 				});
 				ctx.notify(`已自动合并: ${path}`);
 				ctx.log(`auto-merge: ${path} → rev ${out.revision} (attempt ${attempt + 1})`);

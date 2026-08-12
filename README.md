@@ -78,9 +78,12 @@ is ever silently overwritten, and nothing is ever permanently deleted.
 - When end-to-end encryption is enabled, note contents are encrypted with
   AES-256-GCM **before leaving the device**; the server only stores
   ciphertext and cannot read your notes.
-- Optionally (v0.12), file paths and names can be encrypted too: the server
-  only sees random pseudonyms, and real paths live inside encrypted
-  metadata. Renames become metadata-only updates.
+- Path and filename encryption is available as an **experimental (RC)**
+  feature, disabled by default in v0.12.x: the server only sees random
+  pseudonyms and real paths live inside encrypted metadata, but the
+  irreversible plaintext-path erasure step is intentionally disabled until
+  the privacy tombstone ledger lands in v0.13. Do not enable it on your only
+  real vault.
 - Each device holds its own least-privilege credential (v0.10): the root
   server token is exchanged for a per-device token on first sync and never
   stays on devices afterwards. A lost device can be revoked individually on

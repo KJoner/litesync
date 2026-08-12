@@ -116,7 +116,7 @@ export async function bootstrapRemoteWins(
 			const localHash = await sha256Hex(localData);
 			if (localHash === dl.plainHash) {
 				// 内容一致：直接建立 tracked 状态，不动文件
-				ctx.store.set(f.path, {
+				ctx.store.update(f.path, {
 					hash: localHash,
 					serverHash: dl.cipherHash,
 					revision: dl.revision,
@@ -124,6 +124,8 @@ export async function bootstrapRemoteWins(
 					size: stat.size,
 					fileId: dl.fileId,
 					generation: dl.generation,
+					metaGeneration: dl.metaGeneration,
+					serverPseudonym: serverPseudonymOf(f),
 				});
 				continue;
 			}
@@ -140,7 +142,7 @@ export async function bootstrapRemoteWins(
 		await ensureParentFolder(adapter, f.path);
 		await adapter.writeBinary(f.path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
 		const st = await adapter.stat(f.path);
-		ctx.store.set(f.path, {
+		ctx.store.update(f.path, {
 			hash: dl.plainHash,
 			serverHash: dl.cipherHash,
 			revision: dl.revision,
@@ -148,6 +150,8 @@ export async function bootstrapRemoteWins(
 			size: dl.plain.byteLength,
 			fileId: dl.fileId,
 			generation: dl.generation,
+			metaGeneration: dl.metaGeneration,
+			serverPseudonym: serverPseudonymOf(f),
 		});
 	}
 
@@ -203,7 +207,7 @@ export async function bootstrapMerge(
 			await ensureParentFolder(adapter, f.path);
 			await adapter.writeBinary(f.path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
 			const st = await adapter.stat(f.path);
-			ctx.store.set(f.path, {
+			ctx.store.update(f.path, {
 				hash: dl.plainHash,
 				serverHash: dl.cipherHash,
 				revision: dl.revision,
@@ -211,6 +215,8 @@ export async function bootstrapMerge(
 				size: dl.plain.byteLength,
 				fileId: dl.fileId,
 				generation: dl.generation,
+				metaGeneration: dl.metaGeneration,
+				serverPseudonym: serverPseudonymOf(f),
 			});
 			result.downloaded++;
 			continue;
@@ -219,7 +225,7 @@ export async function bootstrapMerge(
 		const localHash = await sha256Hex(localData);
 		const dl = await downloadPlain(ctx, f.path, serverPseudonymOf(f));
 		if (localHash === dl.plainHash) {
-			ctx.store.set(f.path, {
+			ctx.store.update(f.path, {
 				hash: localHash,
 				serverHash: dl.cipherHash,
 				revision: dl.revision,
@@ -227,6 +233,8 @@ export async function bootstrapMerge(
 				size: stat.size,
 				fileId: dl.fileId,
 				generation: dl.generation,
+				metaGeneration: dl.metaGeneration,
+				serverPseudonym: serverPseudonymOf(f),
 			});
 			continue;
 		}
@@ -267,7 +275,7 @@ export async function bootstrapMerge(
 				throw e;
 			}
 		}
-		ctx.store.set(path, {
+		ctx.store.update(path, {
 			hash,
 			serverHash: out.cipherHash,
 			revision: out.revision,
@@ -275,6 +283,8 @@ export async function bootstrapMerge(
 			size: stat.size,
 			fileId: out.fileId,
 			generation: out.generation,
+			metaGeneration: out.metaGeneration,
+			serverPseudonym: out.serverPseudonym,
 		});
 		result.uploaded++;
 	}
