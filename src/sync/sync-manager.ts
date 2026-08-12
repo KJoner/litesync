@@ -4,6 +4,7 @@ import { BindingFingerprint, computeBinding } from "../state/store";
 import { isKeyEpoch } from "../utils/validate";
 import { SyncContext, SyncCounters } from "./context";
 import { syncGateBlock } from "./gate";
+import { ensureSigningKeyRegistered, publishCheckpoint, verifyCheckpointChain } from "./checkpoint-sync";
 import { pullRemoteChanges, recoverInterruptedSwaps } from "./pull";
 import { pushPendingChanges, scanLocalChanges } from "./push";
 
@@ -187,6 +188,23 @@ export class SyncManager {
 				return;
 			}
 
+			// §9.2：首轮把本设备的签名公钥登记上去（服务器只存不用）。
+			// 失败不阻断同步——它只影响别的设备能不能验证我签的 checkpoint
+			const pub = this.ctx.signingPublicKey?.() ?? "";
+			if (pub) {
+				await ensureSigningKeyRegistered(this.ctx, pub);
+				this.ctx.onSigningKeyRegistered?.();
+			}
+
+			// §9：先确认「服务器现在给我看的这套状态，确实是我已知历史的合法延伸」，
+			// 再决定要不要按它去改本地文件。反过来等于先动手再检查——
+			// 发现问题时已经写下去了
+			if (!(await verifyCheckpointChain(this.ctx))) {
+				await this.ctx.store.save();
+				this.onStatus("offline", "检测到仓库状态异常，已停止自动同步");
+				return;
+			}
+
 			this.applyingRemote = true;
 			// §6.9：上一轮的名字互换可能停在临时名上（进程被杀 / 应用被系统回收）。
 			// 那份内容此刻只存在于插件目录里，用户看不见——先把它放回去再做别的
@@ -200,6 +218,10 @@ export class SyncManager {
 			this.applyingRemote = true;
 			const pull2 = await pullRemoteChanges(this.ctx);
 			this.applyingRemote = false;
+
+			// §9：本设备已经把远端变更全部应用完，此刻算出的对象状态才代表
+			// 「这个仓库现在的样子」。中途发布等于替一个自己都没看全的状态背书
+			await publishCheckpoint(this.ctx);
 
 			await this.ctx.store.save();
 

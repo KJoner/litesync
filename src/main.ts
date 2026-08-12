@@ -21,6 +21,7 @@ import { ShareManageModal, ShareModal } from "./share/share-modal";
 import { StateStore } from "./state/store";
 import { SyncContext } from "./sync/context";
 import { SyncBlockedError, SyncGate } from "./sync/gate";
+import { loadOrCreateSigningKey } from "./crypto/signing-key";
 import { LocalCommitter } from "./sync/local-commit";
 import { PendingQueue } from "./sync/queue";
 import { SyncManager, SyncStatus } from "./sync/sync-manager";
@@ -47,6 +48,10 @@ export default class PrivateSyncPlugin extends Plugin {
 	private store: StateStore | null = null;
 	private queue = new PendingQueue();
 	private committer!: LocalCommitter;
+	/** 本设备 checkpoint 签名私钥（base64 PKCS#8，v0.15 §9.2）；未生成时为空串 */
+	private signingKeyPkcs8 = "";
+	/** 待登记到服务器的签名公钥（登记成功后清空） */
+	private pendingSigningPublicKey = "";
 	private client: ApiClient | null = null;
 	private manager: SyncManager | null = null;
 	private ctx: SyncContext | null = null;
@@ -223,6 +228,16 @@ export default class PrivateSyncPlugin extends Plugin {
 			new Notice("移动端不同步 Obsidian 配置目录（桌面与移动端的界面配置互不兼容），普通笔记与附件不受影响");
 		}
 
+		// §9.2：本设备的 checkpoint 签名密钥。生成失败不阻断同步——
+		// 那只意味着本设备不发布 checkpoint，仍然会校验别人发布的
+		try {
+			const signing = await loadOrCreateSigningKey(this.app);
+			this.signingKeyPkcs8 = signing.privateKeyPkcs8B64;
+			this.pendingSigningPublicKey = signing.publicKeyB64;
+		} catch (e) {
+			console.debug("[litesync] signing key unavailable", e);
+		}
+
 		// §6.1：唯一的本地写入口。staging/recovery 都放在插件目录下，
 		// 那里被 IgnoreMatcher 无条件排除，永远不会被当成用户笔记同步出去
 		this.committer = new LocalCommitter(this.app, pluginDir, (m) => {
@@ -242,6 +257,9 @@ export default class PrivateSyncPlugin extends Plugin {
 			deviceName: () =>
 				this.settings.deviceName || `device-${(this.store?.state.deviceId ?? "").slice(0, 8)}`,
 			pluginDir: () => pluginDir,
+			signingKeyPkcs8: () => this.signingKeyPkcs8,
+			signingPublicKey: () => this.pendingSigningPublicKey,
+			onSigningKeyRegistered: () => void (this.pendingSigningPublicKey = ""),
 			log: (msg) => {
 				// 仅在用户显式开启 Debug 时输出；用 debug 级别不污染默认控制台
 				if (this.settings.debug) console.debug(`[litesync] ${msg}`);

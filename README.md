@@ -125,13 +125,22 @@ hard-fails on the attacks it can anchor locally:
 | Downgrade the encryption envelope | ✅ | repository-wide envelope floor, envelopes only move up |
 | Feed a path-traversal filename via crafted metadata | ✅ | decrypted paths are validated before touching disk |
 | Roll the repository back to an old backup | ✅ | repoEpoch change forces an explicit recovery merge |
-| **Withhold a file you have never seen** | ❌ | there is no local anchor for something you never had |
-| **Show device A one repository state and device B another** | ❌ | requires the signed manifest planned for v0.15 |
+| Show device A one repository state and device B another | ✅ (v0.15) | device-signed checkpoints; a fork stops sync instead of picking a side |
+| Roll back to an older repository state after you synced | ✅ (v0.15) | the trust anchor only moves forward, and every checkpoint must link to a chain you have seen |
+| **Withhold a file you have never seen** | ❌ | there is no local anchor for something you never had, and no proof that the server handed you the complete set |
 
-The last two rows are the honest gap. Until signed manifests ship, **do not**
-assume LiteSync can prove that what the server showed you is the complete and
-current repository. It can prove that nothing you have already seen was
-tampered with or rolled back.
+That last row is the honest, **structural** gap — not a missing feature.
+The accurate claim is:
+
+> A malicious server cannot roll back or swap content you have already synced
+> without being detected, and cannot keep showing different repository states
+> to different devices of yours. It can still refuse to serve you, and it can
+> still hide a file you have never seen.
+
+Signed checkpoints (v0.15) are signed by your **devices**, never by the server.
+A new device does not trust the first manifest the server offers — it receives a
+trusted anchor through device pairing, whose key travels only in the link's
+`#fragment`.
 
 ### Path and filename encryption is still RC
 

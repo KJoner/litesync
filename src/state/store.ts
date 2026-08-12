@@ -5,6 +5,7 @@ import { PendingOp } from "../sync/queue";
 import { sha256Hex } from "../utils/hash";
 import { encodeUtf8 } from "../utils/text";
 import { isFileId, isGeneration } from "../utils/validate";
+import { TrustAnchor } from "../sync/freshness";
 import { evalFailpoint, FP } from "../utils/failpoint";
 import { platformCollisionKey } from "../utils/vault-path";
 
@@ -210,6 +211,16 @@ export interface PersistedState {
 	/** 最近若干条已确认 sequence 的处置证据（v0.14.0-RC §8.8 第 10 条） */
 	sequenceEvidence: SequenceEvidence[];
 	/**
+	 * 签名 checkpoint 的信任锚（v0.15 / §9.3）。
+	 *
+	 * null = 尚未建立信任链。此时**没有** freshness 保护——这不是缺陷而是
+	 * 事实：新设备没有任何本地锚点，拿服务器给的第一个 manifest 当基准
+	 * 等于让服务器自己定义「正确的历史」。信任必须由配对流程建立。
+	 */
+	trustAnchor: TrustAnchor | null;
+	/** 已确认的 checkpoint hash 链（从旧到新，有界保留） */
+	checkpointChain: string[];
+	/**
 	 * 已确认的绑定指纹（v0.12.1）：null = 尚未绑定（unbound），
 	 * 任何写操作在重新完成权威校验之前都被 gate 拦截
 	 */
@@ -235,6 +246,8 @@ function emptyState(): PersistedState {
 		blockedChanges: {},
 		pendingSwaps: {},
 		sequenceEvidence: [],
+		trustAnchor: null,
+		checkpointChain: [],
 		binding: null,
 		recovery: null,
 	};
@@ -825,6 +838,8 @@ function normalizeState(raw: Partial<PersistedState>): PersistedState {
 		blockedChanges: normalizeBlockedChanges(raw.blockedChanges),
 		pendingSwaps: normalizePendingSwaps(raw.pendingSwaps),
 		sequenceEvidence: Array.isArray(raw.sequenceEvidence) ? raw.sequenceEvidence.slice(-SEQUENCE_EVIDENCE_LIMIT) : [],
+		trustAnchor: normalizeTrustAnchor(raw.trustAnchor),
+		checkpointChain: Array.isArray(raw.checkpointChain) ? raw.checkpointChain.slice(-64) : [],
 		binding: normalizeBinding(raw.binding),
 		recovery: raw.recovery && typeof raw.recovery === "object" ? raw.recovery : null,
 	};
@@ -937,6 +952,28 @@ function normalizeBlockedChanges(raw: unknown): Record<string, BlockedChange> {
 		};
 	}
 	return out;
+}
+
+/**
+ * 信任锚规整（v0.15 §9.3）：字段不全一律丢弃回 null。
+ *
+ * 宁可「没有信任链」也不要「半个信任链」：一个缺了公钥集合的锚会让
+ * 所有 checkpoint 都被判成 unknown-signer，用户只会看到同步莫名其妙地停了。
+ */
+function normalizeTrustAnchor(raw: unknown): TrustAnchor | null {
+	if (!raw || typeof raw !== "object") return null;
+	const a = raw as Partial<TrustAnchor>;
+	if (typeof a.repoEpoch !== "string" || typeof a.checkpointHash !== "string") return null;
+	if (typeof a.headSequence !== "number") return null;
+	if (!a.devicePublicKeys || typeof a.devicePublicKeys !== "object") return null;
+	return {
+		repoEpoch: a.repoEpoch,
+		checkpointHash: a.checkpointHash,
+		headSequence: a.headSequence,
+		devicePublicKeys: a.devicePublicKeys,
+		revokedDevices: Array.isArray(a.revokedDevices) ? a.revokedDevices : [],
+		updatedAt: typeof a.updatedAt === "number" ? a.updatedAt : 0,
+	};
 }
 
 /** pendingSwaps 规整：字段不全的记录一律丢弃（宁可不做，也不能搬错文件）。 */

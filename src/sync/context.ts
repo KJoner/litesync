@@ -23,6 +23,18 @@ export interface SyncContext {
 	deviceName(): string;
 	/** 插件自己的目录（staging / recovery / swap 都放这里，永不参与同步） */
 	pluginDir(): string;
+	/**
+	 * 本设备 checkpoint 签名私钥（base64 PKCS#8；v0.15 / §9.2）。
+	 *
+	 * 与 VMK 分离保存：签名私钥泄露只能伪造 checkpoint，读不了任何内容；
+	 * VMK 泄露能读内容，但伪造不了 checkpoint。放在一起就没有这层分隔了。
+	 * 未生成时返回空串——此时本设备不发布 checkpoint，但仍会校验别人的。
+	 */
+	signingKeyPkcs8?: () => string;
+	/** 本设备待登记的签名公钥（base64 SPKI）；登记成功后由 main 侧清空 */
+	signingPublicKey?: () => string;
+	/** 登记成功回调（main 侧据此不再重复登记） */
+	onSigningKeyRegistered?: () => void;
 	log(msg: string): void;
 	notify(msg: string): void;
 	/** pending conflicts 集合变化后调用（刷新状态栏等） */

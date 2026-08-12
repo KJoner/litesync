@@ -1,4 +1,5 @@
 import { requestUrl } from "obsidian";
+import { canonicalCheckpoint, SignedCheckpoint } from "../crypto/checkpoint";
 import { VaultKeyDoc } from "../crypto/crypto";
 
 export interface ServerInfo {
@@ -506,6 +507,73 @@ export class ApiClient {
 		return res.json as { id: string };
 	}
 
+	/**
+	 * 拉取 checkpoint 链（v0.15 / §9）。
+	 *
+	 * 服务器只是转发者：它给出的 signingKeys 与 revokedDevices 仅用于**识别**，
+	 * 绝不用于授信——信任集合由配对流程建立（§9.3）。
+	 */
+	async checkpoints(since: number): Promise<{
+		repoEpoch: string;
+		checkpoints: SignedCheckpoint[];
+		conflicting: SignedCheckpoint[];
+		signingKeys: Record<string, string>;
+		revokedDevices: string[];
+	}> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/checkpoints?since=${since}`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200) throw apiError(res.status, "checkpoints failed", res.text);
+		const body = res.json as {
+			repoEpoch: string;
+			checkpoints: RawCheckpoint[];
+			conflicting: RawCheckpoint[];
+			signingKeys: Record<string, string>;
+			revokedDevices: string[];
+		};
+		return {
+			repoEpoch: body.repoEpoch,
+			checkpoints: (body.checkpoints ?? []).map(parseCheckpoint),
+			conflicting: (body.conflicting ?? []).map(parseCheckpoint),
+			signingKeys: body.signingKeys ?? {},
+			revokedDevices: body.revokedDevices ?? [],
+		};
+	}
+
+	/** 发布本设备签名的 checkpoint。 */
+	async publishCheckpoint(cp: SignedCheckpoint): Promise<void> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/checkpoint`,
+			method: "POST",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify({
+				hash: cp.hash,
+				repoEpoch: cp.body.repoEpoch,
+				headSequence: cp.body.headSequence,
+				previousHash: cp.body.previousCheckpointHash,
+				body: canonicalCheckpoint(cp.body),
+				signature: cp.signature,
+			}),
+			throw: false,
+		});
+		if (res.status !== 200) throw apiError(res.status, "publish checkpoint failed", res.text);
+	}
+
+	/** 登记本设备的 checkpoint 签名公钥（首次接入时一次）。 */
+	async registerSigningKey(publicKeyB64: string): Promise<void> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/device/signing-key`,
+			method: "PUT",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify({ publicKey: publicKeyB64 }),
+			throw: false,
+		});
+		if (res.status !== 200) throw apiError(res.status, "register signing key failed", res.text);
+	}
+
 	async listShares(): Promise<ShareEntry[]> {
 		const res = await requestUrl({
 			url: `${this.base()}/api/v1/shares`,
@@ -1008,4 +1076,49 @@ function header(headers: Record<string, string>, name: string): string | undefin
 function num(v: unknown): number {
 	const n = typeof v === "string" ? parseInt(v, 10) : typeof v === "number" ? v : NaN;
 	return Number.isFinite(n) ? n : 0;
+}
+
+
+/** 服务器返回的 checkpoint 原始形态（body 是 canonical 原文）。 */
+interface RawCheckpoint {
+	hash: string;
+	repoEpoch: string;
+	headSequence: number;
+	previousHash: string;
+	signingDeviceId: string;
+	body: string;
+	signature: string;
+}
+
+/**
+ * 把 canonical 原文解析回结构（v0.15）。
+ *
+ * 解析出来的 body 会被重新 canonical 化用于验签，因此只要解析与序列化互为逆运算，
+ * 服务器就无法通过「改一个它以为无关紧要的字段」蒙混过关——任何差异都会让
+ * 重新算出的 canonical 与被签名的原文不同，验签直接失败。
+ */
+function parseCheckpoint(raw: RawCheckpoint): SignedCheckpoint {
+	const kv = new Map<string, string>();
+	for (const line of raw.body.split(/\r?\n/)) {
+		const i = line.indexOf("=");
+		if (i > 0) kv.set(line.slice(0, i), line.slice(i + 1));
+	}
+	const num = (k: string): number => Number(kv.get(k) ?? 0);
+	return {
+		hash: raw.hash,
+		signature: raw.signature,
+		body: {
+			version: 1,
+			vaultId: kv.get("vault") ?? "",
+			repoEpoch: kv.get("repoEpoch") ?? "",
+			formatEpoch: num("formatEpoch"),
+			keyEpoch: num("keyEpoch"),
+			headSequence: num("head"),
+			objectsRoot: kv.get("root") ?? "",
+			objectCount: num("count"),
+			previousCheckpointHash: kv.get("prev") ?? "",
+			signingDeviceId: kv.get("device") ?? "",
+			timestamp: num("ts"),
+		},
+	};
 }

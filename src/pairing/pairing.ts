@@ -28,6 +28,23 @@ export interface PairingConfig {
 	syncIntervalSeconds?: number;
 	syncObsidian?: boolean;
 	ignorePatterns?: string;
+	/**
+	 * 可信 checkpoint 锚（v0.15 / 计划书 §9.3）。
+	 *
+	 * 新设备**不能**只相信服务器给出的第一个 manifest——那等于让服务器
+	 * 自己定义「正确的历史」。配对包由已受信设备生成、经加密链接传递，
+	 * 因此它携带的锚是可信的：新设备据此拒绝任何早于该锚的状态。
+	 *
+	 * 配对包本身走的是「密钥只在链接 #fragment 里」的通道，服务器看不到，
+	 * 也就改不了这个锚。
+	 */
+	trustAnchor?: {
+		repoEpoch: string;
+		checkpointHash: string;
+		headSequence: number;
+		/** deviceId → base64 SPKI 签名公钥 */
+		devicePublicKeys: Record<string, string>;
+	};
 }
 
 const PAIRING_AAD = "litesync/v1/pairing";
