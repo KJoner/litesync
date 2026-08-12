@@ -15,10 +15,11 @@ import { test } from "node:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 
 (globalThis as unknown as { window: unknown }).window = globalThis;
 
-import { pathsCollide, tryCanonicalizeVaultPath } from "../src/utils/vault-path";
+import { pathsCollide, platformCollisionKey, tryCanonicalizeVaultPath } from "../src/utils/vault-path";
 
 const PLATFORM = process.platform;
 
@@ -208,5 +209,111 @@ test(`§8.4 实机（${PLATFORM}）：rename 到已存在的目标——LocalCom
 		}
 	} finally {
 		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// ---------- 大小写敏感文件系统（§8.4 明确要求的一格） ----------
+//
+// §8.4 同时要求覆盖「大小写敏感文件系统」与「大小写不敏感文件系统」。
+// 上面那些用例跑在本机默认的文件系统上——在 Windows 上那是大小写**不**敏感的
+// NTFS，因此敏感那一格一直没有真机证据。
+//
+// Windows 10+ 支持按目录开启大小写敏感（fsutil file setCaseSensitiveInfo，
+// 为 WSL 互操作而设计）。这让我们能在同一台机器上真正测到两种文件系统，
+// 而不是靠「Linux 大概是敏感的」这种推理。
+
+/** 尝试造一个大小写敏感的目录；做不到返回 null（非 Windows / 无权限 / 旧版本）。 */
+function caseSensitiveDir(): string | null {
+	if (PLATFORM !== "win32") return null;
+	const dir = tempVault();
+	try {
+		execFileSync("fsutil.exe", ["file", "setCaseSensitiveInfo", dir, "enable"], {
+			stdio: "pipe",
+		});
+	} catch {
+		return null;
+	}
+	// 实测确认，不信命令的退出码：写 A 读 a，读不到才算真的敏感
+	fs.writeFileSync(path.join(dir, "Probe.txt"), "x");
+	try {
+		fs.readFileSync(path.join(dir, "probe.txt"));
+		return null; // 命令说成功了但行为没变
+	} catch {
+		fs.rmSync(path.join(dir, "Probe.txt"));
+		return dir;
+	}
+}
+
+test(`§8.4 实机（${PLATFORM}）：大小写敏感文件系统上的行为`, () => {
+	const dir = caseSensitiveDir();
+	if (dir === null) {
+		// 不是跳过整条：至少把「本机默认文件系统是哪一种」记录下来，
+		// 否则这一格在报告里会看起来像没跑过
+		const dflt = tempVault();
+		console.log(
+			`  [${PLATFORM}] 无法创建大小写敏感目录；本机默认文件系统` +
+				`${collidesOnDisk(dflt, "Note.md", "note.md") ? "不敏感" : "敏感"}`,
+		);
+		return;
+	}
+
+	// 1. 这个文件系统确实是敏感的：两个名字是两个不同的文件
+	assert.equal(
+		collidesOnDisk(dir, "Note.md", "note.md"),
+		false,
+		"这个目录应当是大小写敏感的（前面已实测确认）",
+	);
+
+	// 2. 我们的规则**仍然**判它们碰撞。这是有意的保守：
+	//    碰撞键是平台无关的，按「所有受支持平台里最严的那个」取。
+	assert.equal(
+		pathsCollide("Note.md", "note.md"),
+		true,
+		"碰撞规则必须保持平台无关的保守判定",
+	);
+
+	// 3. 这个组合的含义必须说清楚：
+	//    规则更严 → 这两个文件不能同时同步，其中一个会被 blocked。
+	//    这是**能力限制**，不是数据丢失风险。
+	//
+	//    反过来才是危险的：规则说不碰撞、文件系统说是同一个文件 → 静默覆盖。
+	//    保守判定从结构上排除了那种情况——代价是敏感文件系统上少一点自由度。
+	//
+	//    为什么值得：一个用户在 Linux 上建了 Note.md 与 note.md，同步到 macOS
+	//    的那台机器时必然只能剩一个。与其让它在别的设备上静默丢失，
+	//    不如在源头就拒绝。
+	assert.equal(
+		platformCollisionKey("Note.md"),
+		platformCollisionKey("note.md"),
+		"两者的碰撞键必须相同",
+	);
+
+	fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test(`§8.4 实机（${PLATFORM}）：敏感与不敏感文件系统上，碰撞键必须一致`, () => {
+	// 同一个路径在任何文件系统上都必须得出同一个键——否则两台设备会对
+	// 「这两个文件是不是同一个」给出不同答案，而收敛就无从谈起
+	const sensitive = caseSensitiveDir();
+	const insensitive = tempVault();
+
+	for (const name of ["Note.md", "note.md", "café.md", "trailing.", "CON.md"]) {
+		const key = platformCollisionKey(name);
+		assert.equal(
+			platformCollisionKey(name),
+			key,
+			`${name} 的碰撞键必须是确定的（与运行环境无关）`,
+		);
+	}
+	// 真机对照：在这台机器的两种文件系统上，同一对名字的**磁盘行为**不同……
+	if (sensitive !== null) {
+		assert.notEqual(
+			collidesOnDisk(sensitive, "A.md", "a.md"),
+			collidesOnDisk(insensitive, "A.md", "a.md"),
+			"两种文件系统的磁盘行为本应不同；若相同，说明敏感目录没生效",
+		);
+		// ……但我们的判定必须相同
+		assert.equal(pathsCollide("A.md", "a.md"), true, "判定必须与文件系统无关");
+		fs.rmSync(sensitive, { recursive: true, force: true });
 	}
 });
