@@ -110,18 +110,7 @@ jobs:
           disable-animations: true
           script: |
             adb wait-for-device
-            adb shell 'while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 2; done'
-
-            # 等 /sdcard 真正**可写**，而不只是"已挂载"。
-            # 第一次跑时前几项返回 unwritable、后几项却成功——外部存储是在探针
-            # 执行途中才挂好的。不等这一步，测出来的是"存储还没就绪"，
-            # 不是这个文件系统的语义。
-            adb shell 'i=0; while [ $i -lt 90 ]; do
-              if echo ok > /sdcard/.litesync-ready 2>/dev/null; then
-                rm -f /sdcard/.litesync-ready; exit 0
-              fi
-              i=$((i+1)); sleep 2
-            done; echo "/sdcard 始终不可写" >&2; exit 1'
+            adb shell 'while [ "$(getprop sys.boot_completed)" != 1 ]; do sleep 2; done'
 
             # 记录我们究竟测的是哪个文件系统——这是这份证据的出处，
             # 没有它，将来回头看不知道它证的是什么
@@ -132,7 +121,7 @@ jobs:
             adb push scripts/fs-probe.sh /data/local/tmp/fs-probe.sh
             adb shell 'mkdir -p /sdcard/litesync-probe'
             echo "===== Android /sdcard 文件系统语义 ====="
-            adb shell 'sh /data/local/tmp/fs-probe.sh /sdcard/litesync-probe' | tee android-fs.txt
+            adb shell 'FS_PROBE_WAIT=180 sh /data/local/tmp/fs-probe.sh /sdcard/litesync-probe' | tee android-fs.txt
             adb shell 'rm -rf /sdcard/litesync-probe'
 
             # 硬断言：最危险的那条必须被答上来。探针没跑完、或任何一项返回

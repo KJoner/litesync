@@ -23,6 +23,33 @@ if [ -z "$DIR" ]; then
 	exit 2
 fi
 mkdir -p "$DIR" 2>/dev/null || { echo "无法创建 $DIR" >&2; exit 2; }
+
+# 等目标目录**真正可写**，而不只是"存在"。
+#
+# Android 上外部存储（/sdcard）挂载得比 boot_completed 晚：第一次在 CI 里跑时，
+# 前几项返回 unwritable、后几项却成功——存储是在探针执行途中才挂好的。
+# 那样测出来的是"存储还没就绪"，不是这个文件系统的语义，而两者会得出
+# 完全相反的结论。
+#
+# 放在探针里而不是调用方：环境有没有就绪是探针自己该处理的事，
+# 每个调用方各写一遍等待逻辑，迟早有一个写漏。
+WAIT_SECONDS="${FS_PROBE_WAIT:-120}"
+i=0
+while :; do
+	if ( printf 'x' > "$DIR/.fsprobe-ready" ) 2>/dev/null; then
+		rm -f "$DIR/.fsprobe-ready" 2>/dev/null
+		break
+	fi
+	i=$((i + 2))
+	if [ "$i" -ge "$WAIT_SECONDS" ]; then
+		echo "PROBE_ERROR=target_not_writable_after_${WAIT_SECONDS}s"
+		echo "$DIR 在 ${WAIT_SECONDS} 秒内始终不可写" >&2
+		exit 3
+	fi
+	sleep 2
+done
+echo "WAITED_FOR_WRITABLE_SECONDS=$i"
+
 WORK="$DIR/litesync-fsprobe.$$"
 mkdir -p "$WORK" || { echo "无法创建 $WORK" >&2; exit 2; }
 # shellcheck disable=SC2064
