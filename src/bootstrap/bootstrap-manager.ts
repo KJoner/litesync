@@ -38,6 +38,23 @@ type OnProgress = (p: BootstrapProgress) => void;
 /** 接入前探测：远端信息 + 快照 + E2EE 状态 + 本地文件清单。 */
 export async function preflight(ctx: SyncContext): Promise<PreflightResult> {
 	const info = await ctx.client.info();
+
+	// 权威 pending binding（v0.13.1 / 计划书 §5.1）。
+	//
+	// 一拿到服务器状态就写进 bootstrap（status 仍是 pending）：此后 bootstrap
+	// 期间的 LSE3/LSM1 加解密、伪名解析、Merge 上传都用得上正确的绑定材料。
+	// 绝不因为「正式接入状态还没写入」而回退到 LSE1、真实路径或无 fileId 上传——
+	// 那些回退会在服务器上留下无法解密的内容或泄露的路径。
+	ctx.store.setPendingBinding({
+		remoteVaultId: info.vaultId,
+		repoEpoch: info.repoEpoch,
+		keyEpoch: info.keyEpoch,
+		metaState: info.metaState,
+		formatEpoch: info.formatEpoch,
+		minimumEnvelopeVersion: info.minimumEnvelopeVersion,
+	});
+	await ctx.store.save();
+
 	await ctx.refreshE2ee();
 	const snap = await ctx.client.snapshot();
 	// meta 模式（v9.3 三期）：快照条目是伪名 + 加密元数据。已解锁则立即解出

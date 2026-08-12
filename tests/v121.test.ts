@@ -452,6 +452,7 @@ test("C01: 默认构建只做伪名化，绝不调用 complete（明文抹除）
 	const transitions: string[] = [];
 	const migrated: string[] = [];
 	const convertedTombstones: string[] = [];
+	let migratedMetaEnc = "";
 	let fullSyncCalls = 0;
 	let gateWasActiveDuringFullSync = false;
 
@@ -478,12 +479,29 @@ test("C01: 默认构建只做伪名化，绝不调用 complete（明文抹除）
 				transitions.push(action);
 				return status(action === "begin" ? "migrating" : action === "verify" ? "verifying" : "plain");
 			},
+			// 迁移前是真实路径；伪名化之后快照返回伪名 + 加密元数据，
+			// 客户端全量回验（计划书 §5.5）会亲自解一遍
 			snapshot: async () => ({
 				sequence: 3,
-				files: [{ path: "笔记/a.md", revision: 1, hash: "h", size: 1, mtime: 0, fileId: FILE_ID }],
+				files: [
+					migrated.length === 0
+						? { path: "笔记/a.md", revision: 1, hash: "h", size: 1, mtime: 0, fileId: FILE_ID }
+						: {
+								path: FILE_ID,
+								revision: 1,
+								hash: "h",
+								size: 1,
+								mtime: 0,
+								fileId: FILE_ID,
+								metaEnc: migratedMetaEnc,
+								metaGeneration: 1,
+								envelopeVersion: 3,
+							},
+				],
 			}),
-			migrateObjectMeta: async (from: string) => {
+			migrateObjectMeta: async (from: string, metaEnc: string) => {
 				migrated.push(from);
+				migratedMetaEnc = metaEnc;
 				return { fileId: FILE_ID, fromPath: from, toPath: FILE_ID, revision: 1, metaGeneration: 1 };
 			},
 			listPlaintextTombstones: async () => [

@@ -36,8 +36,6 @@ export class SyncManager {
 	private running: Promise<void> | null = null;
 	/** 最近一轮同步的失败原因（fullSync 用它向迁移流程报错，而不是静默成功） */
 	private lastError: unknown = null;
-	/** 协议兼容性检查通过（重新绑定时清零） */
-	private protocolOk = false;
 	private protocolWarned = false;
 	private stateCorruptWarned = false;
 	private credentialChecked = false;
@@ -61,12 +59,11 @@ export class SyncManager {
 	 * 作废当前绑定（v0.12.1 / LS-121-C02）。
 	 *
 	 * server URL、Token、设备身份、vault key 文档任一变化时由 main.ts 调用：
-	 * 会话缓存（protocolOk / credentialChecked）全部清零，Gate 切到 unbound，
+	 * 会话缓存（credentialChecked）清零，Gate 切到 unbound，
 	 * 于是上传、删除、MOVE、历史恢复、分享在重新完成权威校验之前一律被拒。
 	 * 绝不允许把针对原服务器建立的本地状态直接用在另一台服务器上。
 	 */
 	invalidateBinding(reason: string): void {
-		this.protocolOk = false;
 		this.credentialChecked = false;
 		this.ctx.gate.markUnbound(reason);
 		this.ctx.gate.markProtocolMismatch(null);
@@ -255,14 +252,17 @@ export class SyncManager {
 		});
 		if (!this.ctx.store.isBoundTo(want)) {
 			const prev = this.ctx.store.binding;
-			this.protocolOk = false;
 			this.credentialChecked = false;
 			this.ctx.gate.markUnbound(prev === null ? "首次绑定" : describeBindingChange(prev, want));
 			this.ctx.store.clearBinding();
 		}
 
-		if (this.protocolOk && !this.ctx.gate.isUnbound) return true;
-
+		// §5.2：仓库状态**每轮**重新校准，不再只在会话首轮读取。
+		//
+		// repoEpoch / formatEpoch / keyEpoch / metaState / encryptionState /
+		// minimumEnvelopeVersion / protocolVersion 都可能在两轮之间变化
+		//（服务器从备份恢复、别的设备完成了迁移、密钥轮换）。用会话首轮的判断
+		// 继续 pull/push，等于拿着过期的世界观改数据。
 		const info = await this.ctx.client.info();
 		const err = protocolError(info);
 		if (err) {
@@ -296,7 +296,6 @@ export class SyncManager {
 		);
 		await this.ctx.store.save();
 		this.ctx.gate.markBound();
-		this.protocolOk = true;
 		return true;
 	}
 
@@ -318,18 +317,35 @@ export class SyncManager {
 			this.onStatus("offline", msg);
 			return false;
 		}
-		// repoEpoch 保护（v9）：服务器从备份恢复后旋转 epoch，旧游标全部作废
-		// → 停止增量同步，重新接入（选「安全合并」保留本地 post-backup 内容）
+		// repoEpoch 保护（计划书 §5.6）：服务器从备份恢复后旋转 epoch。
+		//
+		// **绝不能**用恢复后的快照直接覆盖本地——备份点之后本设备产生的内容
+		// 只存在于本地。因此进入显式的灾备恢复流程：留档本地现状 → 重置为待接入
+		// → 向导以「安全合并」重新对齐（远端有本地无 → 下载；本地有远端无 → 上传；
+		// 双方不同 → 冲突/保留两份），最后建立新 epoch 下的新游标。
 		const savedEpoch = this.ctx.store.state.bootstrap.repoEpoch;
 		if (savedEpoch && info.repoEpoch && info.repoEpoch !== savedEpoch) {
+			this.ctx.store.enterRecovery({
+				reason: "repo-epoch-changed",
+				previousEpoch: savedEpoch,
+				serverEpoch: info.repoEpoch,
+				localSequence: this.ctx.store.state.lastSequence,
+				localFileCount: this.ctx.store.paths().length,
+				at: Date.now(),
+			});
 			this.ctx.store.resetBootstrap();
 			this.ctx.store.clearBinding();
 			await this.ctx.store.save();
 			const msg =
-				"服务器数据已从备份恢复（repoEpoch 变化），已暂停同步；请重新运行接入向导并选择「安全合并」，本地较新的内容不会丢失";
+				"服务器数据已从备份恢复（repoEpoch 变化），已暂停同步。\n" +
+				"请重新运行接入向导——它会进入灾备恢复合并：备份点之后本设备的内容全部保留，" +
+				"两侧差异走冲突流程，绝不静默丢弃。";
 			this.ctx.gate.markRepoEpochMismatch(msg);
 			this.ctx.notify(msg);
-			this.ctx.log(`sync blocked: repoEpoch changed ${savedEpoch} -> ${info.repoEpoch}`);
+			this.ctx.log(
+				`disaster recovery: repoEpoch ${savedEpoch} -> ${info.repoEpoch}, ` +
+					`localSequence=${this.ctx.store.state.lastSequence}`,
+			);
 			this.onStatus("offline", msg);
 			return false;
 		}
@@ -401,6 +417,11 @@ export class SyncManager {
 		) {
 			this.ctx.store.state.bootstrap.minimumEnvelopeVersion = info.minimumEnvelopeVersion;
 			adopted = true;
+		}
+		// 别的设备正在跑元数据迁移：本设备只能读、以及写已伪名化的对象
+		//（服务器侧同样冻结，这里只是让 UI 与日志能说清楚为什么慢下来）
+		if (info.migrationId && info.migrationOwnerDeviceId !== this.ctx.store.state.deviceId) {
+			this.ctx.log(`another device is migrating (${info.migrationId}); writes are restricted`);
 		}
 		if (adopted) await this.ctx.store.save();
 		return true;

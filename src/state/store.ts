@@ -1,5 +1,5 @@
 import { DataAdapter } from "obsidian";
-import { BootstrapMode, BootstrapState, PENDING_BOOTSTRAP } from "../bootstrap/bootstrap-types";
+import { BootstrapMode, BootstrapState, PENDING_BOOTSTRAP, RecoveryState, RepoBinding } from "../bootstrap/bootstrap-types";
 import { VaultKeyDoc } from "../crypto/crypto";
 import { PendingOp } from "../sync/queue";
 import { sha256Hex } from "../utils/hash";
@@ -106,6 +106,11 @@ export interface PersistedState {
 	 * 任何写操作在重新完成权威校验之前都被 gate 拦截
 	 */
 	binding: BindingFingerprint | null;
+	/**
+	 * 灾备恢复记录（v0.13.1 / 计划书 §5.6）：repoEpoch 变化时写入，
+	 * 恢复合并完成后清除。存在时接入向导走恢复流程而不是普通接入。
+	 */
+	recovery: RecoveryState | null;
 }
 
 function emptyState(): PersistedState {
@@ -121,6 +126,7 @@ function emptyState(): PersistedState {
 		pendingOps: {},
 		blockedChanges: {},
 		binding: null,
+		recovery: null,
 	};
 }
 
@@ -343,6 +349,22 @@ export class StateStore {
 		return this.state.bootstrap.status === "ready";
 	}
 
+	/**
+	 * 写入 pending binding（v0.13.1 / 计划书 §5.1）。
+	 *
+	 * preflight 一拿到服务器权威状态就调用：此后 bootstrap 期间的 LSE3/LSM1
+	 * 加解密、伪名解析、Merge 上传都能用上正确的绑定材料，
+	 * **绝不会**因为「正式状态还没写入」而回退到 LSE1 / 真实路径 / 无 fileId 上传。
+	 * status 保持 pending——同步入口仍然被 Gate 拦着。
+	 */
+	setPendingBinding(binding: RepoBinding): void {
+		this.state.bootstrap = { ...this.state.bootstrap, ...definedOnly(binding) };
+	}
+
+	/**
+	 * 接入完成：把 pending binding **原子**转为 active。
+	 * 保留 preflight already 写好的绑定字段，只补齐模式与游标并翻转 status。
+	 */
 	completeBootstrap(
 		mode: BootstrapMode,
 		remoteVaultId: string | undefined,
@@ -351,14 +373,27 @@ export class StateStore {
 		keyEpoch?: number,
 	): void {
 		this.state.bootstrap = {
+			...this.state.bootstrap,
+			...definedOnly({ remoteVaultId, repoEpoch, keyEpoch }),
 			status: "ready",
 			mode,
-			remoteVaultId,
-			repoEpoch,
-			keyEpoch,
 			snapshotSequence,
 			completedAt: Date.now(),
 		};
+	}
+
+	// ---------- 灾备恢复（v0.13.1 / 计划书 §5.6） ----------
+
+	get recovery(): RecoveryState | null {
+		return this.state.recovery;
+	}
+
+	enterRecovery(r: RecoveryState): void {
+		this.state.recovery = r;
+	}
+
+	clearRecovery(): void {
+		this.state.recovery = null;
 	}
 
 	/** 重置为待接入（vaultId/repoEpoch 变化 / 用户重跑向导 / 导入新配置时）。 */
@@ -437,6 +472,7 @@ function normalizeState(raw: Partial<PersistedState>): PersistedState {
 		pendingOps: normalizePendingOps(raw.pendingOps),
 		blockedChanges: raw.blockedChanges && typeof raw.blockedChanges === "object" ? raw.blockedChanges : {},
 		binding: normalizeBinding(raw.binding),
+		recovery: raw.recovery && typeof raw.recovery === "object" ? raw.recovery : null,
 	};
 	// v0.2 状态升级：当时全部为明文，serverHash 与 hash 相同
 	for (const fs of Object.values(state.files)) {
@@ -448,6 +484,15 @@ function normalizeState(raw: Partial<PersistedState>): PersistedState {
 		state.bootstrap = { status: "ready", mode: "legacy", completedAt: Date.now() };
 	}
 	return state;
+}
+
+/** 过滤掉 undefined：合并绑定字段时「本次不掌握」不得清空已有值。 */
+function definedOnly<T extends object>(o: T): Partial<T> {
+	const out: Record<string, unknown> = {};
+	for (const [k, v] of Object.entries(o)) {
+		if (v !== undefined) out[k] = v;
+	}
+	return out as Partial<T>;
 }
 
 /**

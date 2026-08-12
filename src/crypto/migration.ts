@@ -13,12 +13,14 @@ import { SyncContext } from "../sync/context";
 import { requireSyncSafe } from "../sync/gate";
 import { e2eeBinding, purgeHistoryOf } from "../sync/transfer";
 import { sha256Hex } from "../utils/hash";
-import { requireFileId, requireKeyEpoch } from "../utils/validate";
+import { isFileId, requireFileId, requireKeyEpoch } from "../utils/validate";
 import {
 	canonicalPathHmac,
 	createVaultKeyDoc,
 	decryptFile,
 	decryptFileV3,
+	decryptMeta,
+	MetaKeys,
 	encryptFile,
 	encryptFileV3,
 	encryptMeta,
@@ -335,7 +337,15 @@ export async function encryptMetadata(ctx: SyncContext, opts: MetaEncryptionOpti
 		adoptMetaState(ctx, status.metaState);
 		await ctx.store.save();
 
-		// 5. 预检：服务端 11 项验证器（不改状态）
+		// 5a. **客户端全量回验**（计划书 §5.5）。
+		//
+		// 服务端验证器只能看到自己的库——它无法证明「这些密文我们真的解得开」。
+		// 因此在 complete 之前，客户端必须拿 cutoff 之后的权威 Snapshot，
+		// 对**每一个** live 对象亲自解一遍元数据并核对身份与世代。
+		// 任一失败就中止：状态停在 verifying，可 abort 也可修好后重跑。
+		await verifyMigrationClientSide(ctx, keys, bind, status.cutoffSequence, onProgress);
+
+		// 5b. 服务端 11 项验证器（不改状态）
 		const check = await ctx.client.validateMetaMigration();
 		if (!check.ok) {
 			throw new MigrationValidationError(check.failures);
@@ -368,6 +378,75 @@ export async function encryptMetadata(ctx: SyncContext, opts: MetaEncryptionOpti
 	} finally {
 		ctx.gate.endMigration();
 	}
+}
+
+/**
+ * 客户端全量回验（计划书 §5.5）。
+ *
+ * 步骤：拉取权威 Snapshot → 逐对象 decryptMeta → 校验 fileId / keyEpoch /
+ * metaGeneration → 校验内容信封版本。任一失败抛错，迁移保持可续传。
+ *
+ * 为什么不能只信服务端 validator：服务器验证的是「字段看起来对不对」，
+ * 而这里验证的是「我们手上的密钥真的能解开它」。前者通过、后者失败的仓库
+ * 一旦 complete 抹掉明文，就永久读不回来了。
+ */
+async function verifyMigrationClientSide(
+	ctx: SyncContext,
+	keys: MetaKeys,
+	bind: FileKeyBinding,
+	cutoffSequence: number,
+	onProgress: (p: MigrationProgress) => void,
+): Promise<void> {
+	const snap = await ctx.client.snapshot();
+	if (snap.sequence < cutoffSequence) {
+		throw new Error(
+			`服务器快照（sequence ${snap.sequence}）早于迁移起点（${cutoffSequence}），已中止——` +
+				`请重试，不要在这种状态下抹除明文路径`,
+		);
+	}
+	const failures: string[] = [];
+	let done = 0;
+	for (const f of snap.files) {
+		onProgress({ total: snap.files.length, done: done++, current: `验证 ${f.fileId ?? "?"}` });
+
+		if (!isFileId(f.fileId)) {
+			failures.push(`非法 fileId：${String(f.fileId).slice(0, 12)}`);
+			continue;
+		}
+		if (f.path !== f.fileId) {
+			failures.push(`${f.fileId.slice(0, 8)}：服务器仍以非伪名寻址`);
+			continue;
+		}
+		if (!f.metaEnc) {
+			failures.push(`${f.fileId.slice(0, 8)}：缺少加密元数据`);
+			continue;
+		}
+		const dec = await decryptMeta(keys, f.metaEnc, bind.vaultId, f.fileId);
+		if (dec === null) {
+			// 这正是服务端验证器看不到的那一类失败
+			failures.push(`${f.fileId.slice(0, 8)}：本设备无法解密其元数据`);
+			continue;
+		}
+		if (dec.keyEpoch !== bind.keyEpoch) {
+			failures.push(`${f.fileId.slice(0, 8)}：元数据密钥世代为 ${dec.keyEpoch}，当前为 ${bind.keyEpoch}`);
+		}
+		if (f.metaGeneration !== undefined && dec.metaGeneration !== f.metaGeneration) {
+			failures.push(
+				`${f.fileId.slice(0, 8)}：metaGeneration 不一致（密文内 ${dec.metaGeneration} vs 服务器 ${f.metaGeneration}）`,
+			);
+		}
+		if (f.envelopeVersion !== undefined && f.envelopeVersion < 3) {
+			failures.push(`${f.fileId.slice(0, 8)}：内容仍是旧信封（LSE${f.envelopeVersion || "?"}）`);
+		}
+		if (failures.length >= 20) break; // 够用来定位问题了，不必刷屏
+	}
+	if (failures.length > 0) {
+		throw new Error(
+			`迁移回验未通过（${failures.length} 项），已中止且未做任何抹除；迁移可继续或放弃。` +
+				`前几项：${failures.slice(0, 10).join("；")}`,
+		);
+	}
+	ctx.log(`client-side migration verification passed: ${snap.files.length} objects`);
 }
 
 /** 采纳服务器返回的元数据状态（同时刷新 gate 相关判断依据）。 */

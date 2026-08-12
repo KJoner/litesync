@@ -295,6 +295,13 @@ interface ClientConfig {
 	 * 客户端据此丢弃游标重新对账，而不是继续用错误的寻址方式写入。
 	 */
 	formatEpoch: number;
+	/**
+	 * 客户端当前认为的 sequence 世代与密钥世代（0.13.1+ / 计划书 §5.3）。
+	 * 逐请求携带：服务器可能在两次请求之间从备份恢复或轮换密钥，
+	 * 而本设备此刻仍拿着旧判断在写入。
+	 */
+	repoEpoch: string;
+	keyEpoch: number;
 }
 
 /**
@@ -316,13 +323,16 @@ export class ApiClient {
 	}
 
 	private headers(extra?: Record<string, string>): Record<string, string> {
-		const { apiToken, deviceId, formatEpoch } = this.getConfig();
+		const { apiToken, deviceId, formatEpoch, repoEpoch, keyEpoch } = this.getConfig();
 		return {
 			Authorization: `Bearer ${apiToken}`,
 			"X-Device-ID": deviceId,
-			// 逐请求协议与格式世代校验（协议 v6 / ADR-006 §2.2、计划书 §5.3）
+			// 逐请求协议与世代校验（协议 v6 / ADR-006 §2.2、计划书 §5.3）：
+			// 服务器逐请求比对，不匹配即拒绝写入——绝不让本设备用过时的判断改数据
 			"X-LiteSync-Protocol": String(PLUGIN_PROTOCOL_VERSION),
 			...(formatEpoch > 0 ? { "X-Format-Epoch": String(formatEpoch) } : {}),
+			...(repoEpoch ? { "X-Repo-Epoch": repoEpoch } : {}),
+			...(keyEpoch > 0 ? { "X-Key-Epoch": String(keyEpoch) } : {}),
 			...extra,
 		};
 	}
@@ -750,6 +760,32 @@ export class ApiClient {
 		if (res.status === 404) throw new NotFoundError();
 		if (res.status !== 200) throw new ApiError(res.status, `meta get failed: HTTP ${res.status}`);
 		return res.json as { path: string; fileId: string; revision: number; metaEnc: string; metaGeneration: number };
+	}
+
+	/** 续租迁移（计划书 §5.4）：owner 在长迁移中周期调用。 */
+	async renewMigrationLease(): Promise<MigrationStatus> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/meta/renew`,
+			method: "POST",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: "{}",
+			throw: false,
+		});
+		if (res.status !== 200) throw apiError(res.status, "meta renew failed", res.text);
+		return res.json as MigrationStatus;
+	}
+
+	/** 显式接管租约已过期的迁移（绝不自动发生，计划书 §5.4）。 */
+	async takeoverMigration(migrationId: string): Promise<MigrationStatus> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/meta/takeover`,
+			method: "POST",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify({ migrationId }),
+			throw: false,
+		});
+		if (res.status !== 200) throw apiError(res.status, "meta takeover failed", res.text);
+		return res.json as MigrationStatus;
 	}
 
 	/** 迁移进度与状态（journal 汇总）。 */
