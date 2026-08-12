@@ -12,7 +12,14 @@ import { test } from "node:test";
 (globalThis as unknown as { window: unknown }).window = globalThis;
 
 import { DownloadResult } from "../src/api/client";
-import { createVaultKeyDoc } from "../src/crypto/crypto";
+import {
+	createVaultKeyDoc,
+	decryptShare,
+	encryptShare,
+	frameShareContent,
+	randomBytes,
+	unframeShareContent,
+} from "../src/crypto/crypto";
 import { Keyring } from "../src/crypto/keyring";
 import { StateStore } from "../src/state/store";
 import { SyncContext } from "../src/sync/context";
@@ -270,4 +277,38 @@ test("§6.8: 旧状态没有指纹时按幂等处理，不误报分叉（升级�
 		metaGeneration: 5,
 	});
 	assert.equal(assertMetaGeneration(metaCtx(store), "a.md", 5, "anything"), "idempotent");
+});
+
+// ---------------------------------------------------------------- §7.4（v0.13.3）
+
+test("§7.4: 分享显示名随内容一起加密，服务器拿不到真实文件名", async () => {
+	const content = new TextEncoder().encode("# 我的日记\n内容").buffer as ArrayBuffer;
+	const framed = frameShareContent("2026-08-12 日记.md", content);
+	const key = randomBytes(32);
+	const payload = await encryptShare(key, framed);
+
+	// 密文里不能以任何可识别的形式出现文件名
+	const raw = new TextDecoder("utf-8", { fatal: false }).decode(payload);
+	assert.ok(!raw.includes("日记"), "文件名绝不能出现在密文之外");
+
+	const plain = await decryptShare(key, payload);
+	assert.ok(plain !== null);
+	const out = unframeShareContent(plain!);
+	assert.equal(out.name, "2026-08-12 日记.md");
+	assert.deepEqual(new Uint8Array(out.content), new Uint8Array(content));
+});
+
+test("§7.4: 旧分享（无命名帧）仍能正常查看，整段都是内容", () => {
+	const content = new TextEncoder().encode("plain old share").buffer as ArrayBuffer;
+	const out = unframeShareContent(content);
+	assert.equal(out.name, null, "旧分享没有加密的名字");
+	assert.deepEqual(new Uint8Array(out.content), new Uint8Array(content));
+});
+
+test("§7.4: 帧头被截断时退化为「无名字」，绝不丢内容", () => {
+	// 伪造一个 nameLen 超出实际长度的坏帧
+	const bad = new Uint8Array([0x4c, 0x53, 0x4e, 0x31, 0xff, 0xff, 1, 2, 3]);
+	const out = unframeShareContent(bad.buffer as ArrayBuffer);
+	assert.equal(out.name, null);
+	assert.equal(out.content.byteLength, bad.byteLength, "宁可不显示名字，也不能丢掉内容");
 });

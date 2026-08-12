@@ -7,7 +7,7 @@
  */
 import { Modal, Notice } from "obsidian";
 import { ShareEntry } from "../api/client";
-import { b64urlEncode, encryptShare, randomBytes } from "../crypto/crypto";
+import { b64urlEncode, encryptShare, frameShareContent, randomBytes } from "../crypto/crypto";
 import { SyncContext } from "../sync/context";
 import { requireSyncSafe } from "../sync/gate";
 
@@ -65,10 +65,13 @@ export class ShareModal extends Modal {
 				const plain = await adapter.readBinary(this.path);
 
 				const keyRaw = randomBytes(32);
-				const payload = await encryptShare(keyRaw, plain);
+				// §7.4：显示名与内容一起加密。只放文件名（不含目录）——
+				// 分享对象本来就不需要知道发送者的目录结构
+				const displayName = this.path.slice(this.path.lastIndexOf("/") + 1);
+				const payload = await encryptShare(keyRaw, frameShareContent(displayName, plain));
 				const days = parseInt(select.value, 10);
 				const expiresAt = days > 0 ? Math.floor(Date.now() / 1000) + days * 86400 : 0;
-				const { id } = await this.ctx.client.createShare(this.path, expiresAt, payload);
+				const { id } = await this.ctx.client.createShare(expiresAt, payload);
 				const keyB64url = b64urlEncode(keyRaw);
 				keyRaw.fill(0);
 
@@ -77,6 +80,9 @@ export class ShareModal extends Modal {
 					keyB64url,
 					createdAt: Date.now(),
 					expiresAt,
+					// 标记显示名已在密文里（§7.4）：没有这个标记的旧分享，
+					// 真实路径还留在服务器上，管理界面会提示重建
+					nameEncrypted: true,
 				};
 				await this.ctx.store.save();
 
@@ -133,7 +139,15 @@ export class ShareManageModal extends Modal {
 			const row = list.createDiv({ cls: "litesync-history-row" });
 			const info = row.createDiv({ cls: "litesync-history-info" });
 			const title = info.createDiv();
-			title.createSpan({ cls: "litesync-rev", text: s.name || s.id.slice(0, 8) });
+			const local0 = this.ctx.store.state.shares[s.id];
+			// 显示名优先取本地记录（真实路径只存在本机）；服务器上的名字
+			// 现在只是个随机标签，没有展示价值
+			title.createSpan({ cls: "litesync-rev", text: local0?.path ?? s.name ?? s.id.slice(0, 8) });
+			if (local0 && local0.nameEncrypted !== true) {
+				// §7.4 的旧分享迁移方案：名字改不了（内容已加密且密钥只在链接里），
+				// 唯一干净的做法是撤销后重建
+				title.createSpan({ cls: "litesync-badge litesync-badge-delete", text: "文件名未加密" });
+			}
 			if (s.revoked) title.createSpan({ cls: "litesync-badge litesync-badge-delete", text: "已撤销" });
 			else if (s.expired) title.createSpan({ cls: "litesync-badge litesync-badge-delete", text: "已过期" });
 			else title.createSpan({ cls: "litesync-badge litesync-badge-current", text: "有效" });

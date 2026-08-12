@@ -484,14 +484,19 @@ export class ApiClient {
 		};
 	}
 
-	/** 创建分享（body 是独立 Share Key 加密后的密文；服务器拿不到 key）。 */
-	async createShare(name: string, expiresAt: number, payload: ArrayBuffer): Promise<{ id: string }> {
+	/**
+	 * 创建分享（body 是独立 Share Key 加密后的密文；服务器拿不到 key）。
+	 *
+	 * v0.13.3 §7.4：**不再发送 `X-Share-Name`**。显示名已经打进密文帧里，
+	 * 由查看页解密后展示；服务器侧只保留一个随机标签。以前把真实路径放进
+	 * Header，等于让「用户分享了哪个文件」出现在服务端日志与数据库里。
+	 */
+	async createShare(expiresAt: number, payload: ArrayBuffer): Promise<{ id: string }> {
 		const res = await requestUrl({
 			url: `${this.base()}/api/v1/share`,
 			method: "POST",
 			headers: this.headers({
 				"Content-Type": "application/octet-stream",
-				"X-Share-Name": encodeURIComponent(name),
 				"X-Share-Expires": String(expiresAt),
 			}),
 			body: payload,

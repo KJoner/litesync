@@ -1,6 +1,6 @@
 {
   "name": "litesync",
-  "version": "0.13.2",
+  "version": "0.13.3",
   "description": "Sync your vault with your own self-hosted LiteSync server.",
   "main": "main.js",
   "scripts": {

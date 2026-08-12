@@ -94,6 +94,12 @@ export interface ShareRecord {
 	keyB64url: string;
 	createdAt: number;
 	expiresAt: number;
+	/**
+	 * 显示名是否已随内容一起加密（v0.13.3 / §7.4）。
+	 * 缺失或 false = v0.13.2 及更早创建的分享，真实路径仍留在服务器上；
+	 * 管理界面会标出来，提示用户撤销后重建。
+	 */
+	nameEncrypted?: boolean;
 }
 
 /**

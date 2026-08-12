@@ -331,6 +331,47 @@ const SHARE_MAGIC = new Uint8Array([0x4c, 0x53, 0x53, 0x31]); // "LSS1"
 const SHARE_AAD = new TextEncoder().encode("litesync/v1/share");
 
 /** 用独立 Share Key（随机 32B）加密分享内容，格式 "LSS1" | iv | ct+tag。 */
+/**
+ * 分享内容的命名帧（v0.13.3 / 计划书 §7.4）。
+ *
+ *   "LSN1" | nameLen(2, BE) | name(UTF-8) | content
+ *
+ * 帧在**加密之前**构造，因此显示名与内容一起受 GCM 保护：服务器既看不到
+ * 真实文件名，也改不了它。以前真实路径是通过 `X-Share-Name` 明文交给服务器的
+ * ——那等于把「用户分享了哪个文件」直接写进了服务端日志与数据库。
+ *
+ * 旧分享（没有这个帧）由 {@link unframeShareContent} 兼容处理。
+ */
+const SHARE_NAME_MAGIC = new Uint8Array([0x4c, 0x53, 0x4e, 0x31]); // "LSN1"
+
+/** 把显示名与内容打成命名帧。 */
+export function frameShareContent(name: string, content: ArrayBuffer): ArrayBuffer {
+	const nameBytes = new TextEncoder().encode(name);
+	if (nameBytes.length > 0xffff) throw new Error("分享显示名过长");
+	const out = new Uint8Array(SHARE_NAME_MAGIC.length + 2 + nameBytes.length + content.byteLength);
+	out.set(SHARE_NAME_MAGIC, 0);
+	out[4] = (nameBytes.length >> 8) & 0xff;
+	out[5] = nameBytes.length & 0xff;
+	out.set(nameBytes, 6);
+	out.set(new Uint8Array(content), 6 + nameBytes.length);
+	return out.buffer;
+}
+
+/**
+ * 拆解命名帧；不是帧则按旧格式处理（整段都是内容，没有名字）。
+ * 解析失败一律退化为「无名字」，绝不因为帧头看着像就丢掉内容。
+ */
+export function unframeShareContent(plain: ArrayBuffer): { name: string | null; content: ArrayBuffer } {
+	if (plain.byteLength < 6) return { name: null, content: plain };
+	const head = new Uint8Array(plain, 0, 4);
+	if (!SHARE_NAME_MAGIC.every((b, i) => head[i] === b)) return { name: null, content: plain };
+	const view = new Uint8Array(plain);
+	const nameLen = (view[4] << 8) | view[5];
+	if (6 + nameLen > plain.byteLength) return { name: null, content: plain };
+	const name = new TextDecoder().decode(plain.slice(6, 6 + nameLen));
+	return { name, content: plain.slice(6 + nameLen) };
+}
+
 export async function encryptShare(keyRaw: Uint8Array, plaintext: ArrayBuffer): Promise<ArrayBuffer> {
 	const key = await crypto.subtle.importKey("raw", keyRaw as BufferSource, { name: "AES-GCM" }, false, [
 		"encrypt",
