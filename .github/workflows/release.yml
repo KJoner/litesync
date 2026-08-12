@@ -54,6 +54,13 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           draft: true
+          # 带连字符的 semver（0.17.0-rc.1 这类）自动标记为 pre-release。
+          # BRAT 靠这个标记区分 beta 与正式版：忘了勾，beta 测试包会被当成
+          # 正式版推给所有人——而 RC 的前提恰恰是「别装到真实 Vault 上」
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          # 发布说明取自仓库里的 docs/releases/<tag>.md（没有就留空，由人工填）
+          body_path: docs/releases/${{ github.ref_name }}.md
+          fail_on_unmatched_files: true
           files: |
             main.js
             manifest.json
