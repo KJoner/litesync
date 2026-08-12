@@ -70,7 +70,7 @@ note "· RENAME_OVER_EXISTING=$(val RENAME_OVER_EXISTING)（仅记录；安装�
 
 echo "-----------------------------------"
 if [ "$fail" -ne 0 ]; then
-	echo "✗ $LABEL：这一格不算通过"
+	echo "✗ ${LABEL}：这一格不算通过"
 	exit 1
 fi
-echo "✓ $LABEL：文件系统语义已取证，且与我们的碰撞规则不冲突"
+echo "✓ ${LABEL}：文件系统语义已取证，且与我们的碰撞规则不冲突"
