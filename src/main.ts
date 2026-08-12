@@ -533,10 +533,14 @@ export default class PrivateSyncPlugin extends Plugin {
 			const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
 			const path = `LiteSync 平台自检 ${stamp}.md`;
 			await this.app.vault.create(path, md);
+			const unsafe = rep.results.filter((r) => r.verdict === "unsafe").length;
+			const limited = rep.results.filter((r) => r.verdict === "limited").length;
 			new Notice(
-				rep.hasDisagreement
-					? `自检完成：发现 ${rep.results.filter((r) => !r.agrees).length} 处与预期不符，已写入「${path}」`
-					: `自检完成：全部一致，已写入「${path}」`,
+				unsafe > 0
+					? `自检完成：发现 ${unsafe} 处**不安全**，请把「${path}」反馈给开发者`
+					: limited > 0
+						? `自检完成：无不安全项，${limited} 处受限，已写入「${path}」`
+						: `自检完成：未发现问题，已写入「${path}」`,
 			);
 		} catch (e) {
 			new Notice(`平台自检失败：${e instanceof Error ? e.message : String(e)}`);

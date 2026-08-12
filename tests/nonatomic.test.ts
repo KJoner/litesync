@@ -217,7 +217,7 @@ test("§8.8-11: 探测只跑一次（每次写入都探测会拖慢移动端）"
 // 只能靠推理填。这个自检跑在插件内部、用 Obsidian 自己的 adapter，
 // 因此在移动端也能跑。下面验证它的判定逻辑，而不是某台机器的行为。
 
-test("§8.4: 自检能发现「规则说不碰撞、文件系统说是同一个文件」", async () => {
+test("§8.4: 自检测出的是**实际行为**，不是照抄规则的答案", async () => {
 	// 造一个大小写不敏感的 adapter：Note.md 与 note.md 指向同一份内容
 	const adapter = atomicAdapter();
 	const lower = (p: string) => p.toLowerCase();
@@ -243,13 +243,47 @@ test("§8.4: 自检能发现「规则说不碰撞、文件系统说是同一个�
 	const caseRow = rep.results.find((r) => r.name.includes("Note.md"));
 	assert.ok(caseRow, "必须有大小写用例");
 	assert.equal(caseRow.actual, "是", "这个 adapter 大小写不敏感，实测应当是同一个文件");
-	// 一致与否取决于 pathsCollide 的规则；关键是自检**测出了实际行为**，
-	// 而不是照抄规则的答案——照抄的话这一列永远一致，等于什么也没验证
+	// 规则也判碰撞（pathsCollide 会小写化），因此这是安全的
+	assert.equal(caseRow.verdict, "safe", "现实碰撞 + 规则也判碰撞 = 安全");
+});
+
+// 判定逻辑本身：规则**比现实宽松**才是危险，比现实更严只是多拦一次。
+//
+// 这条是 iOS 首次实测反馈出来的：原实现用「实测 == 预言」的严格相等，
+// 于是 iOS 上大小写敏感（实测不碰撞、规则判碰撞）被标成红色——
+// 而那恰恰是最安全的方向。一份大部分是红色的报告等于没有报告：
+// 真出问题的那一行会被淹掉。
+test("§8.4: 规则比现实更严判为安全，比现实宽松才判为不安全", async () => {
+	// 大小写**敏感**的 adapter：Note.md 与 note.md 是两个不同文件（如 iOS）
+	const adapter = atomicAdapter();
+	const app = { vault: { adapter } } as never;
+	const rep = await runPlatformProbe(app, ".litesync", "test");
+
+	const caseRow = rep.results.find((r) => r.name.includes("Note.md"));
+	assert.ok(caseRow);
+	assert.equal(caseRow.actual, "否", "这个 adapter 大小写敏感");
+	assert.equal(caseRow.expected, "是", "规则仍判碰撞（保守）");
 	assert.equal(
-		caseRow.actual === caseRow.expected,
-		caseRow.agrees,
-		"agrees 必须由实测与预言比较得出",
+		caseRow.verdict,
+		"safe",
+		"规则比现实更严 = 安全。判成不安全会让真正的问题淹没在噪音里",
 	);
+	assert.equal(rep.hasUnsafe, false, "不该有任何不安全项");
+});
+
+test("§8.4: 设备能创建而规则拒绝 → 受限，不是不安全", async () => {
+	// iOS 实测：CON.md / AUX.md / NUL.md 都能创建，而我们的规则拒绝它们
+	const app = { vault: { adapter: atomicAdapter() } } as never;
+	const rep = await runPlatformProbe(app, ".litesync", "test");
+
+	const con = rep.results.find((r) => r.name.includes("CON.md"));
+	assert.ok(con, "必须有保留名用例");
+	assert.equal(con.actual, "是", "内存 adapter 能创建任意名字");
+	assert.equal(con.expected, "否", "规则拒绝 Windows 保留名");
+	assert.equal(con.verdict, "limited", "这类文件同步受限，但不丢数据——不是不安全");
+	assert.match(con.note ?? "", /不会丢数据/, "必须说清楚不丢数据");
+	assert.equal(rep.hasLimited, true);
+	assert.equal(rep.hasUnsafe, false);
 });
 
 test("§8.4: 自检报告能被渲染成可直接贴出的 Markdown", async () => {
@@ -258,10 +292,11 @@ test("§8.4: 自检报告能被渲染成可直接贴出的 Markdown", async () =
 	const md = renderProbeReport(rep);
 
 	assert.match(md, /# LiteSync 平台兼容性自检/);
-	assert.match(md, /\| 用例 \| 本机实测 \| 规则预言 \| 一致 \|/, "必须是表格，便于直接贴出");
+	assert.match(md, /\| 用例 \| 本机实测 \| 规则预言 \| 判定 \|/, "必须是表格，便于直接贴出");
 	assert.match(md, /0\.17\.0/, "必须带插件版本——不同版本的结论不能混为一谈");
 	// 必须如实说明它只证明这一台设备
 	assert.match(md, /这一台设备/);
+	assert.match(md, /判定的含义/, "必须解释三种判定，否则读报告的人不知道该不该慌");
 	assert.ok(rep.results.length >= 7, `用例太少（${rep.results.length}），§8.4 的矩阵没跑全`);
 });
 
