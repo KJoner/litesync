@@ -22,12 +22,17 @@ import {
 	requireGeneration,
 	requireKeyEpoch,
 } from "../utils/validate";
+import { frame, unframe } from "./padding";
 
 export const KDF_ITERATIONS = 600_000;
 
 const MAGIC = new Uint8Array([0x4c, 0x53, 0x45, 0x31]); // "LSE1"
 const MAGIC2 = new Uint8Array([0x4c, 0x53, 0x45, 0x32]); // "LSE2"
 const MAGIC3 = new Uint8Array([0x4c, 0x53, 0x45, 0x33]); // "LSE3"
+const MAGIC4 = new Uint8Array([0x4c, 0x53, 0x45, 0x34]); // "LSE4"
+const FLAGS_LEN = 1;
+/** LSE4 flags 位 0：明文已填充到桶边界（§11.1）。 */
+export const LSE4_FLAG_PADDED = 0x01;
 const IV_LEN = 12;
 const EPOCH_LEN = 4;
 const GEN_LEN = 8;
@@ -52,6 +57,18 @@ export interface FileKeyBinding3 {
 
 function fileAadV3(b: FileKeyBinding3): Uint8Array {
 	return new TextEncoder().encode(`litesync/v3/file:${b.vaultId}:${b.keyEpoch}:${b.fileId}:${b.generation}`);
+}
+
+/**
+ * LSE4 的 AAD：在 v3 的基础上把 flags 也绑进去。
+ *
+ * 前缀是 v4 而不是 v3：两个版本的 AAD 空间必须不相交，
+ * 否则一个 LSE3 密文可以被改头换面成 LSE4（或反之）而认证仍然通过。
+ */
+function fileAadV4(b: FileKeyBinding3, flags: number): Uint8Array {
+	return new TextEncoder().encode(
+		`litesync/v4/file:${b.vaultId}:${b.keyEpoch}:${b.fileId}:${b.generation}:${flags}`,
+	);
 }
 
 /** 生成客户端侧的稳定文件身份（16B hex；新文件在加密前就需要确定 id）。 */
@@ -606,6 +623,108 @@ export async function decryptFile(
 			vmk,
 			ct,
 		);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * LSE4（v0.17 / 计划书 §11.1）：`magic | flags(u8) | keyEpoch(u32) | generation(u64) | iv | ct+tag`。
+ *
+ * 与 LSE3 的唯一区别是多一个 flags 字节，且**明文内部**是一个定长帧
+ *（真实长度 + 内容 + 填充）。填充放在密文里面，服务器因此只看得到桶大小。
+ *
+ * # 为什么要新开一个信封版本
+ *
+ * 更省事的做法是继续用 LSE3，只在明文前面塞一个长度前缀。但那样解密时
+ * 无法区分「这是填充帧」和「这个文件恰好以那几个字节开头」——
+ * 一个二进制附件迟早会撞上，然后被当成帧读，静默损坏用户数据。
+ *
+ * 版本号 4 大于现有的仓库下限 3，因此**不需要迁移**：存量 LSE3 继续可读，
+ * 新内容按用户设置决定用哪个。
+ */
+export async function encryptFileV4(
+	vmk: CryptoKey,
+	binding: FileKeyBinding3,
+	plaintext: ArrayBuffer,
+	padded: boolean,
+): Promise<ArrayBuffer> {
+	requireKeyEpoch(binding.keyEpoch, "encryptFileV4");
+	requireFileId(binding.fileId, "encryptFileV4");
+	requireGeneration(binding.generation, "encryptFileV4.generation");
+	const flags = padded ? LSE4_FLAG_PADDED : 0;
+	const framed = frame(plaintext, padded);
+	const iv = randomBytes(IV_LEN);
+	const ct = new Uint8Array(
+		await crypto.subtle.encrypt(
+			{ name: "AES-GCM", iv: iv as BufferSource, additionalData: fileAadV4(binding, flags) as BufferSource },
+			vmk,
+			framed,
+		),
+	);
+	const head = MAGIC4.length + FLAGS_LEN + EPOCH_LEN + GEN_LEN;
+	const out = new Uint8Array(head + IV_LEN + ct.length);
+	out.set(MAGIC4, 0);
+	out[MAGIC4.length] = flags;
+	const view = new DataView(out.buffer);
+	view.setUint32(MAGIC4.length + FLAGS_LEN, binding.keyEpoch, false);
+	view.setBigUint64(MAGIC4.length + FLAGS_LEN + EPOCH_LEN, BigInt(binding.generation), false);
+	out.set(iv, head);
+	out.set(ct, head + IV_LEN);
+	return out.buffer;
+}
+
+/** 是否为 LSE4 信封。 */
+export function isLse4Envelope(data: ArrayBuffer): boolean {
+	return hasMagic(data, MAGIC4, FLAGS_LEN + EPOCH_LEN + GEN_LEN + IV_LEN + 16);
+}
+
+/** 读取 LSE4 信封头（明文字段；真实性由解密时的 AAD 校验保证）。 */
+export function parseLse4Header(
+	data: ArrayBuffer,
+): { flags: number; keyEpoch: number; generation: number } | null {
+	if (!isLse4Envelope(data)) return null;
+	const view = new DataView(data);
+	const flags = view.getUint8(MAGIC4.length);
+	const keyEpoch = view.getUint32(MAGIC4.length + FLAGS_LEN, false);
+	const genRaw = view.getBigUint64(MAGIC4.length + FLAGS_LEN + EPOCH_LEN, false);
+	if (!isKeyEpoch(keyEpoch) || genRaw > BigInt(GENERATION_MAX)) return null;
+	return { flags, keyEpoch, generation: Number(genRaw) };
+}
+
+/**
+ * LSE4 解密。flags 参与 AAD，因此「把 padded 位抹掉」会导致认证失败——
+ * 服务器改不了这一位来诱使客户端把填充当内容。
+ */
+export async function decryptFileV4(
+	vmk: CryptoKey,
+	payload: ArrayBuffer,
+	vaultId: string,
+	fileId: string,
+	expectedKeyEpoch: number,
+): Promise<{ plain: ArrayBuffer; generation: number } | null> {
+	const header = parseLse4Header(payload);
+	if (header === null || !vaultId || !isFileId(fileId)) return null;
+	if (expectedKeyEpoch > 0 && header.keyEpoch !== expectedKeyEpoch) return null;
+	try {
+		const head = MAGIC4.length + FLAGS_LEN + EPOCH_LEN + GEN_LEN;
+		const iv = new Uint8Array(payload, head, IV_LEN);
+		const ct = new Uint8Array(payload, head + IV_LEN);
+		const framed = await crypto.subtle.decrypt(
+			{
+				name: "AES-GCM",
+				iv: iv as BufferSource,
+				additionalData: fileAadV4(
+					{ vaultId, keyEpoch: header.keyEpoch, fileId, generation: header.generation },
+					header.flags,
+				) as BufferSource,
+			},
+			vmk,
+			ct,
+		);
+		const plain = unframe(framed);
+		if (plain === null) return null;
+		return { plain, generation: header.generation };
 	} catch {
 		return null;
 	}

@@ -379,6 +379,7 @@ test("§8.6-2 前置: formatEpoch 回退 → 停机等人工确认，绝不自�
 		credentials: () => ({ serverUrl: "https://a", apiToken: "t" }),
 		refreshE2ee: async () => {},
 		syncObsidian: () => false,
+		padsSize: () => false,
 		ignores: () => false,
 		deviceName: () => "test",
 		pluginDir: () => PLUGIN_DIR,

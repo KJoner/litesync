@@ -100,6 +100,7 @@ test("§5.1: bootstrap 期间的上传写 LSE3 而不是回退信封", async () 
 	let uploaded: ArrayBuffer | null = null;
 	const ctx = {
 		store,
+		padsSize: () => false,
 		queue: new PendingQueue(),
 		e2ee: keyring,
 		client: {
@@ -156,6 +157,7 @@ function managerCtx(store: StateStore, infoRef: { value: ServerInfo }) {
 		credentials: () => ({ serverUrl: "https://a", apiToken: "t" }),
 		refreshE2ee: async () => {},
 		syncObsidian: () => false,
+		padsSize: () => false,
 		ignores: () => false,
 		deviceName: () => "test-device",
 		log: () => {},

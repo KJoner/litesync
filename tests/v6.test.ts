@@ -98,6 +98,7 @@ function managerCtx(store: StateStore, info: ServerInfo) {
 		credentials: () => ({ serverUrl: "https://a", apiToken: "t" }),
 		refreshE2ee: async () => {},
 		syncObsidian: () => false,
+		padsSize: () => false,
 		ignores: () => false,
 		deviceName: () => "test-device",
 		log: () => {},
@@ -153,6 +154,7 @@ test("v6: 绑定材料缺失时拒绝上传，绝不回退到更弱的信封（I
 	const uploaded: string[] = [];
 	const ctx = {
 		store,
+		padsSize: () => false,
 		queue: new PendingQueue(),
 		e2ee: keyring,
 		client: {

@@ -14,11 +14,14 @@ import {
 	canonicalPathHmac,
 	decryptFile,
 	decryptFileV3,
+	decryptFileV4,
 	encryptFileV3,
+	encryptFileV4,
 	encryptMeta,
 	FileKeyBinding,
 	isEncryptedPayload,
 	isLse3Envelope,
+	isLse4Envelope,
 	newFileId,
 } from "../crypto/crypto";
 import { E2eeLockedError } from "../crypto/keyring";
@@ -249,13 +252,15 @@ async function decode(
 
 	// LSE3（v9.3）：AAD = vaultId + keyEpoch(信封头) + fileId(服务器提供) + generation(信封头)。
 	// fileId 造假 → GCM 认证直接失败；generation 经 AAD 认证后做回退检查。
-	if (isLse3Envelope(dl.data)) {
+	if (isLse3Envelope(dl.data) || isLse4Envelope(dl.data)) {
 		if (!ctx.e2ee.unlocked) throw new E2eeLockedError();
 		const bind = e2eeBinding(ctx);
 		if (!bind?.vaultId || fileId === undefined) {
 			throw new Error(`无法解密 ${path}（缺少 vaultId/fileId 绑定材料）`);
 		}
-		const dec = await decryptFileV3(ctx.e2ee.requireKey(), dl.data, bind.vaultId, fileId, bind.keyEpoch);
+		const dec = isLse4Envelope(dl.data)
+			? await decryptFileV4(ctx.e2ee.requireKey(), dl.data, bind.vaultId, fileId, bind.keyEpoch)
+			: await decryptFileV3(ctx.e2ee.requireKey(), dl.data, bind.vaultId, fileId, bind.keyEpoch);
 		if (dec === null) throw new Error(`无法解密 ${path}（密钥不匹配、数据被篡改或密钥世代不符）`);
 		if (opts.enforceGeneration) {
 			const tracked = ctx.store.get(path);
@@ -433,11 +438,13 @@ export async function uploadFromPlain(
 					? await reserveFileId(ctx, path)
 					: requireFileId(tracked.fileId, `upload(${path}).fileId`);
 			generation = (tracked?.fileId === fileId ? (tracked?.generation ?? 0) : 0) + 1;
-			payload = await encryptFileV3(
-				ctx.e2ee.requireKey(),
-				{ vaultId: bind.vaultId, keyEpoch: bind.keyEpoch, fileId, generation },
-				plain,
-			);
+			const binding3 = { vaultId: bind.vaultId, keyEpoch: bind.keyEpoch, fileId, generation };
+			// 大小混淆（§11.1）：开启时用 LSE4 并把明文填充到桶边界。
+			// 只对新写入生效——已有文件在下次修改时自然转过去，
+			// 为了填充去重写整个仓库既慢又会把所有对象的 generation 一起推高。
+			payload = ctx.padsSize(path)
+				? await encryptFileV4(ctx.e2ee.requireKey(), binding3, plain, true)
+				: await encryptFileV3(ctx.e2ee.requireKey(), binding3, plain);
 			sendFileId = fileId;
 
 			// 元数据加密模式（v9.3 三期）：服务器只见伪名；建档随带 LSM1 元数据

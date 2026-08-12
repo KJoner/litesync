@@ -274,6 +274,7 @@ async function movePushCtx(renameError: unknown) {
 		},
 		ignores: () => false,
 		syncObsidian: () => false,
+		padsSize: () => false,
 		deviceName: () => "test",
 		pluginDir: () => PLUGIN_DIR,
 		log: () => {},

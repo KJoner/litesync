@@ -253,6 +253,7 @@ export default class PrivateSyncPlugin extends Plugin {
 			committer: this.committer,
 			gate: this.gate,
 			syncObsidian: () => this.effectiveSyncObsidian(),
+			padsSize: (path) => this.padsSize(path),
 			ignores: (path) => this.ignoreMatcher?.ignores(path) ?? false,
 			deviceName: () =>
 				this.settings.deviceName || `device-${(this.store?.state.deviceId ?? "").slice(0, 8)}`,
@@ -481,6 +482,24 @@ export default class PrivateSyncPlugin extends Plugin {
 	/** 移动端第一阶段不同步 .obsidian，无论设置如何（v6 计划 Part 27）。 */
 	effectiveSyncObsidian(): boolean {
 		return this.settings.syncObsidian && !Platform.isMobileApp;
+	}
+
+	/**
+	 * 这个路径要不要做大小填充（v0.17 / 计划书 §11.1）。
+	 *
+	 * 前缀匹配走规范化后的 vault 路径：设置里写 "Private/" 就只覆盖那一棵子树，
+	 * 不会因为大小写或反斜杠差异漏掉——那种漏掉最糟，
+	 * 用户以为开了，实际没开，而且没有任何提示。
+	 */
+	padsSize(path: string): boolean {
+		if (!this.settings.padObjectSizes) return false;
+		const prefixes = this.settings.padPathPrefixes
+			.split("\n")
+			.map((p) => p.trim().replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase())
+			.filter((p) => p.length > 0);
+		if (prefixes.length === 0) return true;
+		const target = path.replace(/\\/g, "/").toLowerCase();
+		return prefixes.some((p) => target === p || target.startsWith(p.endsWith("/") ? p : p + "/"));
 	}
 
 	/** 设置变化后重建忽略规则和定时器。 */

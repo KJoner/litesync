@@ -20,6 +20,14 @@ export interface SyncContext {
 	/** 是否需要同步 .obsidian 配置目录 */
 	syncObsidian(): boolean;
 	ignores(path: string): boolean;
+	/**
+	 * 这个路径要不要做大小填充（v0.17 / 计划书 §11.1）。
+	 *
+	 * 做成回调而不是把整个 settings 塞进 context：同步层只需要这一个判断，
+	 * 拿到整份设置就意味着将来任何一处都可能顺手读别的开关，
+	 * 而那些开关的变更时机与同步轮次并不同步。
+	 */
+	padsSize(path: string): boolean;
 	deviceName(): string;
 	/** 插件自己的目录（staging / recovery / swap 都放这里，永不参与同步） */
 	pluginDir(): string;

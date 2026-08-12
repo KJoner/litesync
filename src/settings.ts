@@ -33,6 +33,21 @@ export interface PluginSettings {
 	 * 正式抹除要等 v0.13.0 的隐私 tombstone ledger。
 	 */
 	allowIrreversibleMetaErase: boolean;
+	/**
+	 * 大小混淆（v0.17 / 计划书 §11.1）：把密文填充到桶边界，
+	 * 让服务器只看得到大小区间而不是精确字节数。
+	 *
+	 * 默认关闭。开启后单个对象最坏多占 12.5%，且小于 4KB 的对象一律按 4KB 计——
+	 * 替用户默默多花这些空间不是我们该做的决定，所以要他自己开。
+	 */
+	padObjectSizes: boolean;
+	/**
+	 * 只对这些路径前缀做填充（每行一个）；留空表示对全部文件生效。
+	 *
+	 * §11.1 说的是「高敏对象」：多数人只有一小部分笔记值得为它多花空间，
+	 * 而全库填充的成本会让人干脆把整个功能关掉。
+	 */
+	padPathPrefixes: string;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -48,6 +63,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	deviceKeyB64: "",
 	experimentalMetaEncryption: false,
 	allowIrreversibleMetaErase: false,
+	padObjectSizes: false,
+	padPathPrefixes: "",
 };
 
 /**
@@ -249,6 +266,34 @@ export class SyncSettingTab extends PluginSettingTab {
 						desc: "把仓库的元数据状态从 migrating 退回 plain；已伪名化的文件保持可用，不做任何破坏性操作",
 						visible: () => plugin.metaMigrationActive(),
 						action: () => void plugin.abortMetaMigration(),
+					},
+				],
+			},
+			{
+				type: "group",
+				heading: "隐私增强",
+				items: [
+					{
+						name: "混淆文件大小",
+						desc: createFragment((frag) => {
+							frag.appendText(
+								"把密文填充到桶边界，服务器只看得到大小区间而不是精确字节数。" +
+									"精确大小本身就是内容：已知文档的字节数命中即确认，同一文件的大小序列画出的是编辑节奏。",
+							);
+							frag.createEl("br");
+							frag.appendText("· 成本：单个对象最坏多占 12.5%；小于 4KB 的对象一律按 4KB 计；");
+							frag.createEl("br");
+							frag.appendText("· 只影响开启之后新写入的内容，已有文件在下次修改时才会被填充；");
+							frag.createEl("br");
+							frag.appendText("· 仓库内去重不受影响（填充在密文内部，同样的内容仍得到同样的密文）。");
+						}),
+						control: { type: "toggle", key: "padObjectSizes" },
+					},
+					{
+						name: "只填充这些路径（每行一个前缀）",
+						desc: "留空表示对全部文件生效。多数人只有一小部分笔记值得为它多花空间。",
+						visible: () => plugin.settings.padObjectSizes,
+						control: { type: "textarea", key: "padPathPrefixes" },
 					},
 				],
 			},

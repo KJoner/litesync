@@ -103,6 +103,7 @@ async function fixture(downloadImpl: (path: string) => Promise<unknown>) {
 		client: { download: downloadImpl },
 		ignores: () => false,
 		syncObsidian: () => false,
+		padsSize: () => false,
 		deviceName: () => "test",
 		pluginDir: () => PLUGIN_DIR,
 		log: () => {},
