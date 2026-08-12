@@ -8,7 +8,7 @@
  * - 绝不先删明文再传密文；只有密文下载回验（解密 + hash 一致）后才 purge
  * - 任何失败都可以重新执行（断点续传：已加密的文件跳过重传）
  */
-import { ApiError, ConflictError, NotFoundError } from "../api/client";
+import { ApiError, ConflictError, MigrationValidationError, NotFoundError } from "../api/client";
 import { SyncContext } from "../sync/context";
 import { requireSyncSafe } from "../sync/gate";
 import { e2eeBinding, purgeHistoryOf } from "../sync/transfer";
@@ -220,16 +220,18 @@ export interface MetaEncryptionOptions {
 	/**
 	 * 是否允许执行不可逆的 complete（明文路径抹除）。
 	 *
-	 * v0.12.1 默认 **false**（LS-121-C01）：当前实现无法在抹除明文的同时保住
-	 * 删除屏障（tombstone 的 path 本身就是明文），服务端也已经在 v0.12.1 起
-	 * 拒绝这种 complete。开关只为开发/测试环境保留，正式抹除要等 v0.13.0 的
-	 * 隐私 tombstone ledger。
+	 * 默认 **false**（LS-121-C01）：协议 v6 已经能在保住删除屏障的前提下抹除
+	 * 明文（tombstone 转隐私格式而不是删除，ADR-002），但抹除本身仍然不可逆，
+	 * 且迁移前备份里还留着明文路径。因此仍需显式开关，正式使用前必须完成
+	 * 计划书 §十五 的整套升级流程。
 	 */
 	allowIrreversibleComplete: boolean;
 }
 
 export interface MetaEncryptionResult {
 	migrated: number;
+	/** 转换为隐私格式的删除记录数（**不是**删除数量——tombstone 一条都不丢） */
+	convertedTombstones: number;
 	total: number;
 	/** 结束时仓库的元数据状态：migrating = 已伪名化但尚未抹除明文（可 abort 回退） */
 	metaState: string;
@@ -238,15 +240,18 @@ export interface MetaEncryptionResult {
 }
 
 /**
- * 元数据加密迁移（v9.3 三期，协议 v5）：把服务器上的明文路径全部替换为
+ * 元数据加密迁移（协议 v6 / ADR-002 + ADR-003）：把服务器上的明文路径全部替换为
  * 伪名（=fileId）+ LSM1 加密元数据。内容零重新加密（LSE3 已把内容与路径解耦）。
+ *
+ * 流程：begin → 逐对象伪名化 → tombstone 转隐私格式 → verify → （可选）complete。
  *
  * 红线：
  * - 前置：过同步安全 gate、E2EE 已启用且解锁、fullSync 收敛、无未解决冲突、
- *   所有 HEAD 均为 LSE3（否则服务器逐文件 409，提示先跑「升级加密信封」）
- * - 断点续传：单文件失败可重新执行整个命令续传（migrate-file 幂等）
- * - complete 是明文路径抹除的单向点。**v0.12.1 默认不执行**（LS-121-C01）：
- *   迁移停在 migrating，可通过 abort 无损回退
+ *   仓库信封下限已是 LSE3（否则服务器拒绝 begin，提示先跑「升级加密信封」）
+ * - 断点续传：任何一步失败都可重新执行整个命令（服务端 journal 记录进度）
+ * - **tombstone 是转换而不是删除**：删除屏障完整保留（INV-06）
+ * - verify 与 complete 分离：验证失败时数据一个字节都没动
+ * - complete 是明文路径抹除的单向点，默认不执行（LS-121-C01）
  */
 export async function encryptMetadata(ctx: SyncContext, opts: MetaEncryptionOptions): Promise<MetaEncryptionResult> {
 	const { onProgress } = opts;
@@ -255,10 +260,8 @@ export async function encryptMetadata(ctx: SyncContext, opts: MetaEncryptionOpti
 	const bind = e2eeBinding(ctx);
 	if (!bind) throw new Error("缺少 vaultId/keyEpoch 绑定材料，请先完成一次正常同步后重试");
 
-	// 0. 迁移前必须同步干净：fullSync 会等待当前轮 + 所有续轮 + 队列排空，
-	//    绝不再出现「只是设置了 runAgain 就继续往下走」（LS-121-C06）。
-	//    注意顺序：必须在 beginMigration **之前**——迁移 gate 一旦置位，
-	//    普通同步就会被挡下，fullSync 将永远等不到收敛
+	// 0. 迁移前必须同步干净：fullSync 等待当前轮 + 所有续轮 + 队列排空（LS-121-C06）。
+	//    必须在 beginMigration **之前**——迁移 gate 一旦置位，普通同步就会被挡下
 	await opts.fullSync();
 	if (ctx.queue.size > 0 || ctx.store.conflictPaths().length > 0) {
 		throw new Error("存在未完成的同步或未解决的冲突，请处理后重试");
@@ -268,18 +271,20 @@ export async function encryptMetadata(ctx: SyncContext, opts: MetaEncryptionOpti
 	try {
 		const keys = await ctx.e2ee.metaKeys();
 
-		// 1. 进入 migrating（幂等；服务器要求 encryptionState=encrypted）
-		const st = await ctx.client.metaTransition("begin");
-		ctx.store.state.bootstrap.metaState = st.metaState;
+		// 1. 进入 migrating。服务器要求 encryptionState=encrypted 且信封下限已是 LSE3——
+		//    否则伪名化后会留下无法按 fileId 解密的旧信封内容
+		let status = await ctx.client.metaTransition("begin");
+		adoptMetaState(ctx, status.metaState);
 		await ctx.store.save();
 
-		// 2. 以服务器快照为权威清单逐文件迁移
+		// 2. 逐对象伪名化。v6 的迁移只是一次元数据更新：revision、
+		//    contentGeneration、blob 全部不动，**不产生任何 tombstone**
 		const snap = await ctx.client.snapshot();
+		const pending = snap.files.filter((f) => f.fileId !== f.path);
 		let migrated = 0;
 		let done = 0;
-		for (const f of snap.files) {
-			onProgress({ total: snap.files.length, done: done++, current: f.path });
-			if (f.fileId && f.path === f.fileId) continue; // 已迁移（断点续传）
+		for (const f of pending) {
+			onProgress({ total: pending.length + status.plaintextTombstones, done: done++, current: f.path });
 			const fileId = requireFileId(f.fileId, `snapshot(${f.path}).fileId`);
 			const metaEnc = await encryptMeta(
 				keys,
@@ -289,10 +294,10 @@ export async function encryptMetadata(ctx: SyncContext, opts: MetaEncryptionOpti
 			const canonicalHash = await canonicalPathHmac(keys, f.path);
 			let res;
 			try {
-				res = await ctx.client.migrateFileMeta(f.path, metaEnc, canonicalHash);
+				res = await ctx.client.migrateObjectMeta(f.path, metaEnc, canonicalHash);
 			} catch (e) {
-				// 机器错误码分支（LS-121-S05）：绝不再靠 message.includes 判断逻辑
-				if (e instanceof ApiError && e.is("PLAINTEXT_REJECTED")) {
+				// 机器错误码分支（LS-121-S05）：绝不靠 message.includes 判断逻辑
+				if (e instanceof ApiError && (e.is("PLAINTEXT_REJECTED") || e.is("ENVELOPE_TOO_OLD"))) {
 					throw new Error(`存在旧信封密文（${f.path}），请先执行「升级加密信封 LSE1 → LSE3」后重试`);
 				}
 				throw e;
@@ -301,7 +306,7 @@ export async function encryptMetadata(ctx: SyncContext, opts: MetaEncryptionOpti
 				ctx.store.update(f.path, {
 					fileId,
 					revision: res.revision,
-					metaGeneration: 1,
+					metaGeneration: res.metaGeneration,
 					serverPseudonym: res.toPath,
 				});
 			}
@@ -310,26 +315,71 @@ export async function encryptMetadata(ctx: SyncContext, opts: MetaEncryptionOpti
 		}
 		await ctx.store.save();
 
-		// 3. 明文路径抹除（单向点）——v0.12.1 默认不执行（LS-121-C01）
-		if (!opts.allowIrreversibleComplete) {
-			ctx.log(`meta encryption: ${migrated} migrated, irreversible erase skipped (experimental build gate)`);
-			return { migrated, total: snap.files.length, metaState: st.metaState, erased: false };
+		// 3. tombstone 转成隐私格式（ADR-002 §3.2）——**转换而不是删除**。
+		//    v0.12.0 靠删掉 tombstone 来抹明文，代价是旧设备重新上线会复活已删内容。
+		const tombstones = await ctx.client.listPlaintextTombstones();
+		let convertedTombstones = 0;
+		for (const t of tombstones) {
+			onProgress({
+				total: pending.length + tombstones.length,
+				done: done++,
+				current: t.lastPseudonym,
+			});
+			await ctx.client.migrateTombstone(t.fileId, await canonicalPathHmac(keys, t.lastPseudonym));
+			convertedTombstones++;
 		}
-		const final = await ctx.client.metaTransition("complete", true);
-		ctx.store.state.bootstrap.metaState = final.metaState;
+
+		// 4. 进入 verifying：此后不再接受迁移写入，只接受验证与 complete。
+		//    验证与不可逆擦除彻底分离——验证失败时数据一个字节都没动
+		status = await ctx.client.metaTransition("verify");
+		adoptMetaState(ctx, status.metaState);
 		await ctx.store.save();
-		ctx.log(`meta encryption complete: ${migrated} migrated, plaintext paths erased`);
-		return { migrated, total: snap.files.length, metaState: final.metaState, erased: true };
+
+		// 5. 预检：服务端 11 项验证器（不改状态）
+		const check = await ctx.client.validateMetaMigration();
+		if (!check.ok) {
+			throw new MigrationValidationError(check.failures);
+		}
+
+		const result: MetaEncryptionResult = {
+			migrated,
+			convertedTombstones,
+			total: snap.files.length,
+			metaState: status.metaState,
+			erased: false,
+		};
+
+		// 6. 明文路径抹除（单向点）——默认不执行（LS-121-C01）
+		if (!opts.allowIrreversibleComplete) {
+			ctx.log(
+				`meta encryption: ${migrated} objects + ${convertedTombstones} tombstones migrated, ` +
+					`erase skipped (experimental build gate)`,
+			);
+			return result;
+		}
+		const final = await ctx.client.metaTransition("complete", true, status.migrationId);
+		adoptMetaState(ctx, final.metaState);
+		ctx.store.state.bootstrap.formatEpoch = final.formatEpoch;
+		// formatEpoch 变了 → 服务器强制全量对账，本地游标作废
+		ctx.store.state.lastSequence = 0;
+		await ctx.store.save();
+		ctx.log(`meta encryption complete: formatEpoch=${final.formatEpoch}, plaintext paths erased`);
+		return { ...result, metaState: final.metaState, erased: true };
 	} finally {
 		ctx.gate.endMigration();
 	}
+}
+
+/** 采纳服务器返回的元数据状态（同时刷新 gate 相关判断依据）。 */
+function adoptMetaState(ctx: SyncContext, metaState: string): void {
+	ctx.store.state.bootstrap.metaState = metaState;
 }
 
 /** 放弃元数据迁移：回到 plain（已伪名化的行保持可用，无破坏性操作）。 */
 export async function abortMetadataMigration(ctx: SyncContext): Promise<string> {
 	requireSyncSafe(ctx, "放弃路径加密迁移");
 	const st = await ctx.client.metaTransition("abort");
-	ctx.store.state.bootstrap.metaState = st.metaState;
+	adoptMetaState(ctx, st.metaState);
 	await ctx.store.save();
 	ctx.log(`meta migration aborted, metaState=${st.metaState}`);
 	return st.metaState;
@@ -431,6 +481,22 @@ async function runEnvelopeUpgrade(
 		}
 	}
 	await ctx.store.save();
+
+	// 全部升级完成后请服务器提升仓库级信封下限（ADR-006 §2.1）。
+	// 提升之后**任何**写入路径——包括新建与删除后重建——都不再接受旧信封，
+	// 这正是 v0.12.1 的单对象检查挡不住的那些窗口。
+	if (skipped === 0) {
+		try {
+			const st = await ctx.client.completeEnvelopeUpgrade();
+			ctx.store.state.bootstrap.minimumEnvelopeVersion = st.minimumEnvelopeVersion;
+			await ctx.store.save();
+			ctx.log(`envelope floor raised to ${st.minimumEnvelopeVersion}`);
+		} catch (e) {
+			// 仍有旧信封内容（例如历史版本对应的 HEAD 尚未刷新）→ 保持现状，
+			// 下次重跑本命令时再提升；绝不因此让已完成的升级白做
+			ctx.log(`envelope floor not raised yet: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
 	ctx.log(`envelope upgrade: ${upgraded} upgraded, ${skipped} skipped, ${files.length} total`);
 	return { upgraded, skipped, total: files.length };
 }

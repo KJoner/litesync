@@ -204,6 +204,9 @@ export default class PrivateSyncPlugin extends Plugin {
 			serverUrl: this.settings.serverUrl,
 			apiToken: this.getApiToken(),
 			deviceId: this.store?.state.deviceId ?? "",
+			// 逐请求携带（协议 v6 / ADR-006）：与服务器不符时服务器直接拒绝写入，
+			// 而不是让我们用过时的寻址方式把数据写坏
+			formatEpoch: this.store?.state.bootstrap.formatEpoch ?? 0,
 		}));
 
 		// 移动端第一阶段不同步 Obsidian 配置目录：桌面与移动配置差异大，避免互相覆盖（v6）

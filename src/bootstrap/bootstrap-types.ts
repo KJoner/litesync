@@ -16,8 +16,16 @@ export interface BootstrapState {
 	repoEpoch?: string;
 	/** E2EE 密钥世代（v9.2）：LSE2/LSE3 信封的 AAD 绑定材料，随 /info 同步 */
 	keyEpoch?: number;
-	/** 元数据加密状态（v9.3 三期）：plain / migrating / encrypted，随 /info 同步 */
+	/** 元数据加密状态：plain / migrating / verifying / encrypted，随 /info 同步 */
 	metaState?: string;
+	/**
+	 * 寻址格式世代（v0.13.0 / ADR-006）：元数据加密完成时服务器 +1。
+	 * 与 repoEpoch（灾备恢复 → 恢复合并）语义不同：formatEpoch 变化意味着
+	 * 「寻址方式变了」，客户端必须丢弃游标走 snapshot 全量对账。
+	 */
+	formatEpoch?: number;
+	/** 仓库级信封下限（v0.13.0）：低于它的写入会被服务器拒绝，客户端也不再产出 */
+	minimumEnvelopeVersion?: number;
 	mode?: BootstrapMode;
 	snapshotSequence?: number;
 	completedAt?: number;

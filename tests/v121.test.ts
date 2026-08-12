@@ -336,11 +336,14 @@ const serverInfo = (): ServerInfo => ({
 	version: "test",
 	latestSequence: 0,
 	serverTime: 0,
-	protocolVersion: 5,
-	minProtocolVersion: 5,
+	protocolVersion: 6,
+	minProtocolVersion: 6,
 	vaultId: VAULT_ID,
 	repoEpoch: "epoch-1",
 	keyEpoch: 1,
+	formatEpoch: 1,
+	minimumEnvelopeVersion: 3,
+	schemaVersion: 6,
 });
 
 test("C02: 首轮同步完成权威校验后才固定绑定；换 server URL 立即回到 unbound", async () => {
@@ -448,8 +451,22 @@ test("C01: 默认构建只做伪名化，绝不调用 complete（明文抹除）
 	gate.markBound();
 	const transitions: string[] = [];
 	const migrated: string[] = [];
+	const convertedTombstones: string[] = [];
 	let fullSyncCalls = 0;
 	let gateWasActiveDuringFullSync = false;
+
+	const status = (metaState: string) => ({
+		metaState,
+		migrationId: "mig-1",
+		ownerDeviceId: "dev",
+		leaseExpiresAt: 0,
+		cutoffSequence: 3,
+		targetFormatEpoch: 2,
+		formatEpoch: 1,
+		minimumEnvelopeVersion: 3,
+		journal: { pending: 0 },
+		plaintextTombstones: 1,
+	});
 
 	const ctx = {
 		store,
@@ -459,16 +476,23 @@ test("C01: 默认构建只做伪名化，绝不调用 complete（明文抹除）
 		client: {
 			metaTransition: async (action: string) => {
 				transitions.push(action);
-				return { metaState: action === "begin" ? "migrating" : "plain" };
+				return status(action === "begin" ? "migrating" : action === "verify" ? "verifying" : "plain");
 			},
 			snapshot: async () => ({
 				sequence: 3,
 				files: [{ path: "笔记/a.md", revision: 1, hash: "h", size: 1, mtime: 0, fileId: FILE_ID }],
 			}),
-			migrateFileMeta: async (from: string) => {
+			migrateObjectMeta: async (from: string) => {
 				migrated.push(from);
-				return { fromPath: from, toPath: FILE_ID, revision: 1, sequence: 4 };
+				return { fileId: FILE_ID, fromPath: from, toPath: FILE_ID, revision: 1, metaGeneration: 1 };
 			},
+			listPlaintextTombstones: async () => [
+				{ fileId: "ffffffffffffffffffffffffffffffff", lastPseudonym: "已删除/旧笔记.md", deletionRevision: 4 },
+			],
+			migrateTombstone: async (fileId: string) => {
+				convertedTombstones.push(fileId);
+			},
+			validateMetaMigration: async () => ({ ok: true, failures: [] }),
 		},
 		log: () => {},
 		notify: () => {},
@@ -489,9 +513,13 @@ test("C01: 默认构建只做伪名化，绝不调用 complete（明文抹除）
 	assert.equal(fullSyncCalls, 1);
 	assert.equal(gateWasActiveDuringFullSync, false, "beginMigration 不得早于 fullSync");
 	assert.deepEqual(migrated, ["笔记/a.md"]);
-	assert.deepEqual(transitions, ["begin"], "默认构建绝不调用 complete");
+	// tombstone 是**转换**而不是删除：删除屏障必须完整保留（INV-06 / ADR-002）
+	assert.deepEqual(convertedTombstones, ["ffffffffffffffffffffffffffffffff"]);
+	assert.equal(r.convertedTombstones, 1);
+	// 走到 verifying 就停：默认构建绝不调用不可逆的 complete
+	assert.deepEqual(transitions, ["begin", "verify"]);
 	assert.equal(r.erased, false);
-	assert.equal(r.metaState, "migrating", "停在可 abort 回退的状态");
+	assert.equal(r.metaState, "verifying", "停在可 abort 回退的状态");
 	assert.equal(gate.isMigrationActive, false, "迁移结束后必须释放 gate");
 
 	// 身份与伪名已记录，且 fileId 未被重置（INV-05）
@@ -512,7 +540,18 @@ test("C01: 迁移过程抛错时同样释放迁移 gate（不会把插件卡在 
 		e2ee: keyring,
 		queue: new PendingQueue(),
 		client: {
-			metaTransition: async () => ({ metaState: "migrating" }),
+			metaTransition: async () => ({
+				metaState: "migrating",
+				migrationId: "mig-2",
+				ownerDeviceId: "dev",
+				leaseExpiresAt: 0,
+				cutoffSequence: 0,
+				targetFormatEpoch: 2,
+				formatEpoch: 1,
+				minimumEnvelopeVersion: 3,
+				journal: {},
+				plaintextTombstones: 0,
+			}),
 			snapshot: async () => {
 				throw new Error("snapshot failed");
 			},

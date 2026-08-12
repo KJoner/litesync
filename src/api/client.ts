@@ -21,8 +21,21 @@ export interface ServerInfo {
 	/** E2EE 状态机（0.9.0+）：plaintext / migrating / encrypted */
 	encryptionState?: string;
 	keyEpoch?: number;
-	/** 元数据加密状态机（0.12.0+）：plain / migrating / encrypted */
+	/** 元数据加密状态机：plain / migrating / verifying / encrypted */
 	metaState?: string;
+	/**
+	 * 寻址格式世代（0.13.0+ / ADR-006）：元数据加密完成时 +1。
+	 * 与 repoEpoch（灾备恢复）、keyEpoch（密钥轮换）语义完全不同——
+	 * formatEpoch 变化意味着「服务器的寻址方式变了」，客户端必须丢弃游标重新对账。
+	 */
+	formatEpoch?: number;
+	/** 仓库级信封下限（0.13.0+）：低于它的写入会被服务器拒绝 */
+	minimumEnvelopeVersion?: number;
+	/** 服务端数据模型版本（0.13.0+，6 = fileId 对象模型） */
+	schemaVersion?: number;
+	/** 进行中的迁移（0.13.0+）：非 owner 设备据此知道自己处于受限写入状态 */
+	migrationId?: string;
+	migrationOwnerDeviceId?: string;
 }
 
 /**
@@ -32,8 +45,12 @@ export interface ServerInfo {
  * v3（0.10.0）：设备级凭据与配对包 v2（enrollment）、LSE2 加密信封。
  * v4（0.11.0）：LSE3 信封（fileId-AAD + contentGeneration 抗回退重放）、E2EE 原子 MOVE。
  * v5（0.12.0）：元数据加密——伪名路径 + LSM1 信封，改名 = 元数据更新。
+ * v6（0.13.0）：fileId 为主键的对象模型（ADR-001）——revision 属于对象，
+ *   改名与元数据迁移不再产生 tombstone；隐私 tombstone 台账与显式 restore
+ *   （ADR-002）；四态迁移状态机（ADR-003）；仓库级 minimumEnvelopeVersion 与
+ *   formatEpoch（ADR-006）。逐请求携带协议版本与 formatEpoch。
  */
-export const PLUGIN_PROTOCOL_VERSION = 5;
+export const PLUGIN_PROTOCOL_VERSION = 6;
 
 /** 协议不兼容时返回给用户的提示；兼容返回 null。 */
 export function protocolError(info: ServerInfo): string | null {
@@ -50,11 +67,16 @@ export function protocolError(info: ServerInfo): string | null {
 
 export interface RemoteChange {
 	sequence: number;
+	/** 服务器可见寻址名（明文模式 = 真实路径，meta 模式 = 伪名） */
 	path: string;
-	action: "upsert" | "delete";
+	/** 稳定身份（0.13.0+）：客户端据此对账，不再依赖 path */
+	fileId?: string;
+	action: "upsert" | "delete" | "restore";
 	revision: number;
 	hash?: string;
-	/** 元数据世代（0.12.0+）：hash 未变但世代变新 = 仅改名 */
+	/** 内容世代（0.13.0+）：抗回退比较 */
+	contentGeneration?: number;
+	/** 元数据世代：hash 未变但世代变新 = 仅改名 */
 	metaGeneration?: number;
 }
 
@@ -67,6 +89,8 @@ export interface ChangesResponse {
 	minSequence?: number;
 	/** sequence 世代（0.9.0+）：与本地保存值不一致时必须停止增量同步 */
 	repoEpoch?: string;
+	/** 寻址格式世代（0.13.0+）：变化时必须丢弃游标重新对账 */
+	formatEpoch?: number;
 	headSequence?: number;
 }
 
@@ -82,6 +106,9 @@ export interface SnapshotFile {
 	/** 加密元数据（0.12.0+，meta 模式）：真实路径在里面 */
 	metaEnc?: string;
 	metaGeneration?: number;
+	/** 内容世代与信封版本（0.13.0+）：抗回退比较与信封下限核对 */
+	contentGeneration?: number;
+	envelopeVersion?: number;
 }
 
 export interface UploadOk {
@@ -92,6 +119,8 @@ export interface UploadOk {
 	sequence: number;
 	/** 稳定文件身份（0.11.0+；LSE3 密文的 AAD 绑定它） */
 	fileId?: string;
+	contentGeneration?: number;
+	metaGeneration?: number;
 }
 
 /** 409 响应中携带的服务器当前状态。 */
@@ -105,6 +134,10 @@ export interface RemoteFileState {
 	 * 客户端据此区分「陈旧副本复活」与「同名新内容重建」
 	 */
 	priorHash?: string;
+	/** 冲突对象的稳定身份（0.13.0+）：客户端据此走显式 restore 而不是新建 */
+	fileId?: string;
+	/** tombstone 冲突时删除时的内容世代：restore 必须提交严格大于它的世代 */
+	contentGeneration?: number;
 }
 
 export interface DownloadResult {
@@ -160,7 +193,16 @@ export type ServerErrorCode =
 	| "CANONICAL_COLLISION"
 	| "FILE_ID_CONFLICT"
 	| "TOMBSTONE_PLAINTEXT"
+	| "TOMBSTONE_PURGED"
 	| "MIGRATION_LOCKED"
+	| "MIGRATION_INCOMPLETE"
+	| "MIGRATION_MISMATCH"
+	| "MIGRATION_VALIDATION_FAILED"
+	| "FORMAT_EPOCH_MISMATCH"
+	| "UPGRADE_REQUIRED"
+	| "STALE_REVISION"
+	| "HASH_MISMATCH"
+	| "CONFLICT"
 	| "NOT_FOUND"
 	| "TOO_LARGE"
 	| "INTERNAL";
@@ -180,6 +222,49 @@ export class ApiError extends Error {
 
 	is(code: ServerErrorCode): boolean {
 		return this.code === code;
+	}
+}
+
+/** 迁移状态与 journal 进度（GET /api/v1/meta/status）。 */
+export interface MigrationStatus {
+	metaState: string;
+	migrationId: string;
+	ownerDeviceId: string;
+	leaseExpiresAt: number;
+	cutoffSequence: number;
+	targetFormatEpoch: number;
+	formatEpoch: number;
+	minimumEnvelopeVersion: number;
+	journal: Record<string, number>;
+	plaintextTombstones: number;
+}
+
+/** 仍带明文寻址名的删除记录（迁移期间由 owner 拉取并逐条转换）。 */
+export interface PlaintextTombstone {
+	fileId: string;
+	lastPseudonym: string;
+	deletionRevision: number;
+}
+
+/** complete 验证器的一条失败项。 */
+export interface ValidationFailure {
+	check: string;
+	code: string;
+	count: number;
+	example?: string;
+}
+
+/**
+ * complete 验证失败：携带**完整**清单。
+ * 服务端在这种情况下没有改动任何数据，可以修掉问题后原地重试。
+ */
+export class MigrationValidationError extends Error {
+	constructor(public failures: ValidationFailure[]) {
+		super(
+			`迁移验证未通过（${failures.length} 项）：` +
+				failures.map((f) => `${f.check}（${f.code} ×${f.count}）`).join("；"),
+		);
+		this.name = "MigrationValidationError";
 	}
 }
 
@@ -204,6 +289,12 @@ interface ClientConfig {
 	serverUrl: string;
 	apiToken: string;
 	deviceId: string;
+	/**
+	 * 客户端当前认为的寻址格式世代（0.13.0+ / ADR-006）。
+	 * 逐请求携带；与服务器不符时服务器返回 409 FORMAT_EPOCH_MISMATCH，
+	 * 客户端据此丢弃游标重新对账，而不是继续用错误的寻址方式写入。
+	 */
+	formatEpoch: number;
 }
 
 /**
@@ -225,12 +316,20 @@ export class ApiClient {
 	}
 
 	private headers(extra?: Record<string, string>): Record<string, string> {
-		const { apiToken, deviceId } = this.getConfig();
+		const { apiToken, deviceId, formatEpoch } = this.getConfig();
 		return {
 			Authorization: `Bearer ${apiToken}`,
 			"X-Device-ID": deviceId,
+			// 逐请求协议与格式世代校验（协议 v6 / ADR-006 §2.2、计划书 §5.3）
+			"X-LiteSync-Protocol": String(PLUGIN_PROTOCOL_VERSION),
+			...(formatEpoch > 0 ? { "X-Format-Epoch": String(formatEpoch) } : {}),
 			...extra,
 		};
+	}
+
+	/** 幂等键：响应丢失后用同一个 id 重试，服务器返回首次结果而不是产生第二个 revision。 */
+	private opHeader(operationId?: string): Record<string, string> {
+		return operationId ? { "X-Operation-Id": operationId } : {};
 	}
 
 	async info(): Promise<ServerInfo> {
@@ -300,6 +399,7 @@ export class ApiClient {
 		action: UploadAction = "upsert",
 		fileId?: string,
 		meta?: { metaEnc: string; canonicalHash: string },
+		operationId?: string,
 	): Promise<UploadOk> {
 		const res = await requestUrl({
 			url: `${this.base()}/api/v1/file`,
@@ -313,6 +413,7 @@ export class ApiClient {
 				"X-Action": action,
 				...(fileId ? { "X-File-Id": fileId } : {}),
 				...(meta ? { "X-Meta-Enc": meta.metaEnc, "X-Canonical-Hash": meta.canonicalHash } : {}),
+				...this.opHeader(operationId),
 			}),
 			body: data,
 			throw: false,
@@ -553,28 +654,88 @@ export class ApiClient {
 	}
 
 	/**
-	 * 原子改名（v9.3，明文模式）：服务器单事务完成旧路径 tombstone + 新路径新行。
-	 * 409 → ConflictError（远端已变化/目标占用）；其余非 200 → ApiError，
-	 * 调用方回退 delete+upsert 语义。
+	 * 改名（协议 v6 / ADR-001 §3.4）：一次元数据更新。
+	 *
+	 * 服务器只改 pseudonym / canonical HMAC / metaGeneration——内容 blob、
+	 * revision、contentGeneration 全部不动，**不产生任何 tombstone**。
+	 * 412 = metaGeneration CAS 失败（并发改名，重取后重试）；
+	 * 409 = 目标被占用或目标名上有 tombstone（后者必须走 restore）。
 	 */
-	async move(
+	async rename(
 		fromPath: string,
 		toPath: string,
-		baseRevision: number,
-	): Promise<{ revision: number; tombstoneRevision: number; sequence: number }> {
+		baseMetaGeneration: number,
+		meta?: { metaEnc: string; canonicalHash: string },
+		operationId?: string,
+	): Promise<{ fileId: string; toPath: string; revision: number; metaGeneration: number; sequence: number }> {
 		const res = await requestUrl({
-			url: `${this.base()}/api/v1/file/move`,
+			url: `${this.base()}/api/v1/file/rename`,
 			method: "POST",
-			headers: this.headers({ "Content-Type": "application/json" }),
-			body: JSON.stringify({ fromPath, toPath, baseRevision }),
+			headers: this.headers({ "Content-Type": "application/json", ...this.opHeader(operationId) }),
+			body: JSON.stringify({
+				fromPath,
+				toPath,
+				baseMetaGeneration,
+				metaEnc: meta?.metaEnc ?? "",
+				canonicalHash: meta?.canonicalHash ?? "",
+			}),
 			throw: false,
 		});
-		if (res.status === 409) throw new ConflictError(parseConflict(res.text, fromPath));
-		if (res.status !== 200) throw apiError(res.status, `move ${fromPath} -> ${toPath} failed`, res.text);
-		return res.json as { revision: number; tombstoneRevision: number; sequence: number };
+		if (res.status === 409) throw new ConflictError(parseConflict(res.text, toPath));
+		if (res.status !== 200) throw apiError(res.status, `rename ${fromPath} -> ${toPath} failed`, res.text);
+		return res.json as { fileId: string; toPath: string; revision: number; metaGeneration: number; sequence: number };
 	}
 
-	// ---------- 元数据加密（v9.3 三期，协议 v5） ----------
+	/**
+	 * 显式恢复已删除对象（协议 v6 / ADR-002 §3.6）。
+	 *
+	 * v5 里「删除后重建」是拿 tombstone revision 做普通 upsert 穿透墓碑，
+	 * 服务器分不清「用户真想恢复」与「陈旧设备把三个月前的副本传了回来」。
+	 * v6 把它变成显式操作：恢复后 revision 连续、fileId 不变、历史全部仍可达。
+	 * 随后再用返回的 revision 作为 baseRevision 上传新内容。
+	 */
+	async restore(
+		fileId: string,
+		params: {
+			expectedTombstoneRevision: number;
+			contentGeneration: number;
+			pseudonym: string;
+			metaEnc?: string;
+			canonicalHash?: string;
+		},
+		operationId?: string,
+	): Promise<{ fileId: string; path: string; revision: number; sequence: number }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/files/${encodeURIComponent(fileId)}/restore`,
+			method: "POST",
+			headers: this.headers({ "Content-Type": "application/json", ...this.opHeader(operationId) }),
+			body: JSON.stringify({
+				expectedTombstoneRevision: params.expectedTombstoneRevision,
+				contentGeneration: params.contentGeneration,
+				pseudonym: params.pseudonym,
+				metaEnc: params.metaEnc ?? "",
+				canonicalHash: params.canonicalHash ?? "",
+			}),
+			throw: false,
+		});
+		if (res.status !== 200) throw apiError(res.status, `restore ${fileId} failed`, res.text);
+		return res.json as { fileId: string; path: string; revision: number; sequence: number };
+	}
+
+	/** 信封升级完成：服务器验证全部 HEAD 为 LSE3 后把仓库下限提升到 3（ADR-006）。 */
+	async completeEnvelopeUpgrade(): Promise<{ minimumEnvelopeVersion: number }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/envelope/complete`,
+			method: "POST",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: "{}",
+			throw: false,
+		});
+		if (res.status !== 200) throw apiError(res.status, "envelope upgrade complete failed", res.text);
+		return res.json as { minimumEnvelopeVersion: number };
+	}
+
+	// ---------- 元数据加密（协议 v6，ADR-003） ----------
 
 	/** 轻量获取文件元数据（改名变更无需下载内容）。 */
 	async getFileMeta(
@@ -591,31 +752,24 @@ export class ApiClient {
 		return res.json as { path: string; fileId: string; revision: number; metaEnc: string; metaGeneration: number };
 	}
 
-	/** 改名 = 元数据更新（metaGeneration CAS；412 = 并发改名需重取）。 */
-	async updateFileMeta(
-		path: string,
-		baseMetaGeneration: number,
-		metaEnc: string,
-		canonicalHash: string,
-	): Promise<{ revision: number; metaGeneration: number; sequence: number }> {
+	/** 迁移进度与状态（journal 汇总）。 */
+	async metaStatus(): Promise<MigrationStatus> {
 		const res = await requestUrl({
-			url: `${this.base()}/api/v1/file/meta`,
-			method: "PUT",
-			headers: this.headers({ "Content-Type": "application/json" }),
-			body: JSON.stringify({ path, baseMetaGeneration, metaEnc, canonicalHash }),
+			url: `${this.base()}/api/v1/meta/status`,
+			method: "GET",
+			headers: this.headers(),
 			throw: false,
 		});
-		if (res.status === 409) throw new ConflictError(parseConflict(res.text, path));
-		if (res.status !== 200) throw apiError(res.status, "meta update failed", res.text);
-		return res.json as { revision: number; metaGeneration: number; sequence: number };
+		if (res.status !== 200) throw apiError(res.status, "meta status failed", res.text);
+		return res.json as MigrationStatus;
 	}
 
-	/** 元数据迁移：单文件真实路径 → 伪名（断点续传安全）。 */
-	async migrateFileMeta(
+	/** 单对象伪名化（幂等，断点续传安全）。 */
+	async migrateObjectMeta(
 		fromPath: string,
 		metaEnc: string,
 		canonicalHash: string,
-	): Promise<{ fromPath: string; toPath: string; revision: number; sequence: number }> {
+	): Promise<{ fileId: string; fromPath: string; toPath: string; revision: number; metaGeneration: number }> {
 		const res = await requestUrl({
 			url: `${this.base()}/api/v1/meta/migrate`,
 			method: "POST",
@@ -624,22 +778,77 @@ export class ApiClient {
 			throw: false,
 		});
 		if (res.status !== 200) throw apiError(res.status, "meta migrate failed", res.text);
-		return res.json as { fromPath: string; toPath: string; revision: number; sequence: number };
+		return res.json as { fileId: string; fromPath: string; toPath: string; revision: number; metaGeneration: number };
 	}
 
-	/** 元数据加密状态机；complete 是明文路径抹除的单向点（必须显式确认）。 */
-	async metaTransition(action: "begin" | "abort"): Promise<{ metaState: string }>;
-	async metaTransition(action: "complete", confirmErase: true): Promise<{ metaState: string }>;
-	async metaTransition(action: "begin" | "complete" | "abort", confirmErase?: boolean): Promise<{ metaState: string }> {
+	/** 列出仍带明文寻址名的删除记录（迁移 owner 专用）。 */
+	async listPlaintextTombstones(): Promise<PlaintextTombstone[]> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/meta/tombstones`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200) throw apiError(res.status, "meta tombstones failed", res.text);
+		return (res.json as { tombstones: PlaintextTombstone[] }).tombstones ?? [];
+	}
+
+	/**
+	 * 把一条 tombstone 转成隐私格式（ADR-002 §3.2）。
+	 * 明文寻址名换成 fileId、归一化路径换成客户端 HMAC——**删除屏障完整保留**，
+	 * 这正是 v0.12.0「删掉 tombstone 抹明文」造成静默复活的正解。
+	 */
+	async migrateTombstone(fileId: string, canonicalHash: string): Promise<void> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/meta/migrate-tombstone`,
+			method: "POST",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify({ fileId, canonicalHash }),
+			throw: false,
+		});
+		if (res.status !== 200) throw apiError(res.status, "tombstone migrate failed", res.text);
+	}
+
+	/** 预检：只跑服务端验证器，不改状态。 */
+	async validateMetaMigration(): Promise<{ ok: boolean; failures: ValidationFailure[] }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/meta/validate`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200) throw apiError(res.status, "meta validate failed", res.text);
+		const body = res.json as { ok: boolean; failures: ValidationFailure[] };
+		return { ok: body.ok, failures: body.failures ?? [] };
+	}
+
+	/**
+	 * 元数据迁移状态机（协议 v6 / ADR-003）。
+	 *
+	 *   begin    plain → migrating
+	 *   verify   migrating → verifying（journal 必须清空；此后只接受验证与 complete）
+	 *   complete verifying → encrypted（跑 11 项验证器 → 擦除，单向，必须显式确认）
+	 *   abort    migrating/verifying → plain（无破坏性操作）
+	 */
+	async metaTransition(action: "begin" | "verify" | "abort"): Promise<MigrationStatus>;
+	async metaTransition(action: "complete", confirmErase: true, migrationId?: string): Promise<MigrationStatus>;
+	async metaTransition(
+		action: "begin" | "verify" | "complete" | "abort",
+		confirmErase?: boolean,
+		migrationId?: string,
+	): Promise<MigrationStatus> {
 		const res = await requestUrl({
 			url: `${this.base()}/api/v1/meta/${action}`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json" }),
-			body: action === "complete" ? JSON.stringify({ confirmErase: confirmErase === true }) : "{}",
+			body:
+				action === "complete"
+					? JSON.stringify({ confirmErase: confirmErase === true, migrationId: migrationId ?? "" })
+					: "{}",
 			throw: false,
 		});
-		if (res.status !== 200) throw apiError(res.status, `meta ${action} failed`, res.text);
-		return res.json as { metaState: string };
+		if (res.status !== 200) throw metaTransitionError(res.status, action, res.text);
+		return res.json as MigrationStatus;
 	}
 
 	async remove(path: string, baseRevision: number): Promise<void> {
@@ -664,6 +873,8 @@ function parseConflict(text: string, path: string): RemoteFileState {
 		hash: typeof body?.hash === "string" ? body.hash : "",
 		deleted: body?.deleted === true,
 		priorHash: typeof body?.priorHash === "string" ? body.priorHash : undefined,
+		fileId: typeof body?.fileId === "string" ? body.fileId : undefined,
+		contentGeneration: typeof body?.contentGeneration === "number" ? body.contentGeneration : undefined,
 	};
 }
 
@@ -673,6 +884,15 @@ function serverErrText(text: string): string {
 	const msg = typeof body?.message === "string" ? body.message : typeof body?.error === "string" ? body.error : "";
 	const extra = typeof body?.existing === "string" ? `（与现有文件冲突：${body.existing}）` : "";
 	return msg ? ` — ${msg}${extra}` : "";
+}
+
+/** meta 状态机错误：验证失败时抽出完整清单，其余按普通 ApiError 处理。 */
+function metaTransitionError(status: number, action: string, text: string): Error {
+	const body = tryJson(text);
+	if (body?.code === "MIGRATION_VALIDATION_FAILED" && Array.isArray(body.failures)) {
+		return new MigrationValidationError(body.failures as ValidationFailure[]);
+	}
+	return apiError(status, `meta ${action} failed`, text);
 }
 
 /** 统一构造带机器错误码的 ApiError（v0.12.1 / LS-121-S05）。 */

@@ -335,6 +335,30 @@ export class SyncManager {
 		}
 		this.ctx.gate.markRepoEpochMismatch(null);
 
+		// formatEpoch 保护（v0.13.0 / ADR-006）：服务器完成元数据加密后寻址格式变了。
+		// 与 repoEpoch（灾备恢复 → 恢复合并，保留本地新内容）语义不同——
+		// 这里不需要合并，只需要**丢弃游标重新对账**：对象身份没变，
+		// 变的只是服务器怎么称呼它们。
+		const savedFormat = this.ctx.store.state.bootstrap.formatEpoch;
+		if (info.formatEpoch !== undefined && savedFormat !== undefined && info.formatEpoch !== savedFormat) {
+			this.ctx.store.state.bootstrap.formatEpoch = info.formatEpoch;
+			this.ctx.store.state.lastSequence = 0; // 强制下一轮走 snapshot 全量对账
+			await this.ctx.store.save();
+			this.ctx.notify(
+				info.formatEpoch > savedFormat
+					? "服务器已完成路径与文件名加密，本设备将重新对账一次（内容不受影响）"
+					: "服务器的寻址格式世代发生了回退，已停止同步；请检查服务器是否从旧备份恢复",
+			);
+			this.ctx.log(`formatEpoch changed ${savedFormat} -> ${info.formatEpoch}, forcing snapshot reconcile`);
+			if (info.formatEpoch < savedFormat) {
+				// 回退 = 服务器可能被换回旧数据：不自动继续
+				const msg = "服务器 formatEpoch 回退，已停止同步等待人工确认";
+				this.ctx.gate.markIntegrityError(msg);
+				this.onStatus("offline", msg);
+				return false;
+			}
+		}
+
 		// v0.8 升级设备第一次见到 epoch / vaultId：补记录（首见即固定身份）
 		let adopted = false;
 		if (!savedEpoch && info.repoEpoch && this.ctx.store.bootstrapReady) {
@@ -360,9 +384,22 @@ export class SyncManager {
 				adopted = true;
 			}
 		}
-		// 元数据加密状态（v9.3 三期）：encrypted 后所有服务器路径都是伪名
+		// 元数据加密状态：encrypted 后所有服务器路径都是伪名
 		if (info.metaState !== undefined && this.ctx.store.state.bootstrap.metaState !== info.metaState) {
 			this.ctx.store.state.bootstrap.metaState = info.metaState;
+			adopted = true;
+		}
+		// 首见 formatEpoch / 仓库信封下限（v0.13.0）：记录之，用于逐请求校验与
+		// 「不再产出低于下限的信封」判断
+		if (info.formatEpoch !== undefined && this.ctx.store.state.bootstrap.formatEpoch !== info.formatEpoch) {
+			this.ctx.store.state.bootstrap.formatEpoch = info.formatEpoch;
+			adopted = true;
+		}
+		if (
+			info.minimumEnvelopeVersion !== undefined &&
+			this.ctx.store.state.bootstrap.minimumEnvelopeVersion !== info.minimumEnvelopeVersion
+		) {
+			this.ctx.store.state.bootstrap.minimumEnvelopeVersion = info.minimumEnvelopeVersion;
 			adopted = true;
 		}
 		if (adopted) await this.ctx.store.save();

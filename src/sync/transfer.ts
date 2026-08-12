@@ -1,10 +1,13 @@
 /**
- * 传输层加解密封装（计划书 Phase 12；v9.2 LSE2；v9.3 LSE3）。
+ * 传输层加解密封装。
  *
  * 同步逻辑只面对明文；本模块负责：
- * - 下载：校验密文 hash → 解密（LSE1/LSE2/LSE3）→ 返回明文 + 双 hash + 身份信息
- * - 上传：E2EE 启用时加密（默认 LSE3：fileId-AAD + 单调 generation）
+ * - 下载：校验密文 hash → 解密（LSE1/LSE2 只读兼容，LSE3 为当前格式）→
+ *   返回明文 + 双 hash + 身份信息
+ * - 上传：E2EE 启用时一律写 LSE3（fileId-AAD + 单调 generation）；
+ *   绑定材料缺失时**硬失败**，绝不回退到更弱的信封（协议 v6 / ADR-006 §2.4）
  * - HEAD 下载强制 generation 不回退（恶意服务器无法重放旧版本密文当最新）
+ * - meta 模式下真实路径绝不进入任何请求（伪名翻译，LS-121-C05）
  */
 import { DownloadResult, UploadAction } from "../api/client";
 import {
@@ -28,6 +31,19 @@ import { SyncContext } from "./context";
 /** 元数据加密模式（v9.3 三期）：服务器只见伪名（=fileId），真实路径在 LSM1 里。 */
 export function metaEncrypted(ctx: SyncContext): boolean {
 	return ctx.store.state.bootstrap.metaState === "encrypted";
+}
+
+/**
+ * 缺少 LSE3 信封的绑定材料（vaultId + keyEpoch）。
+ *
+ * v0.12.x 在这种情况下会回退 LSE1——那是自己给自己制造信封降级。
+ * 协议 v6 起一律硬失败：先完成一次 /info 对账拿到绑定材料，再重试（ADR-006 §2.4）。
+ */
+export class EnvelopeBindingMissingError extends Error {
+	constructor(public realPath: string) {
+		super("缺少 vaultId/keyEpoch 绑定材料，已阻止本次上传（绝不回退到更弱的加密信封）；下一轮同步会自动补齐后重试");
+		this.name = "EnvelopeBindingMissingError";
+	}
 }
 
 /**
@@ -88,9 +104,9 @@ export interface PlainDownload {
 }
 
 /**
- * LSE2/LSE3 信封的基础绑定材料（v9.2）：vaultId 来自 bootstrap，keyEpoch 来自
- * 服务器状态机（协议检查时同步）。任一缺失（如 v0.9 升级后的首轮）返回
- * undefined → 加密回退 LSE1，下一轮补齐后自动切 LSE3。
+ * LSE3 信封的基础绑定材料：vaultId 来自 bootstrap，keyEpoch 来自服务器状态机
+ *（协议检查时同步）。任一缺失返回 undefined——协议 v6 起调用方必须**硬失败**
+ * 而不是回退到更弱的信封（ADR-006 §2.4）。
  */
 export function e2eeBinding(ctx: SyncContext): FileKeyBinding | undefined {
 	const b = ctx.store.state.bootstrap;
@@ -263,7 +279,13 @@ export async function uploadFromPlain(
 
 	if (ctx.e2ee.enabled) {
 		const bind = e2eeBinding(ctx);
-		if (bind) {
+		if (!bind) {
+			// 协议 v6 / ADR-006 §2.4：绑定材料缺失时**不再回退 LSE1**。
+			// 回退等于自己制造一次信封降级——服务器的仓库级下限也会拒绝它。
+			// 正确做法是先完成一次 /info 对账拿到 vaultId + keyEpoch。
+			throw new EnvelopeBindingMissingError(path);
+		}
+		{
 			const tracked = ctx.store.get(path);
 			// 新文件：id 必须在加密前确定 → 客户端预生成，随上传头交给服务器。
 			// 已跟踪文件沿用原身份，但先校验一遍——被改坏的 fileId 会让这份
@@ -296,9 +318,6 @@ export async function uploadFromPlain(
 					metaGeneration = tracked.metaGeneration;
 				}
 			}
-		} else {
-			// 绑定材料未就绪（升级过渡首轮）：回退 LSE1，下一轮自动切 LSE3
-			payload = await encryptFile(ctx.e2ee.requireKey(), path, plain);
 		}
 	}
 	const cipherHash = await sha256Hex(payload);

@@ -7,11 +7,13 @@ import { attemptAutoMerge } from "./auto-merge";
 import { keepBothVersions } from "./conflict";
 import { SyncContext } from "./context";
 import { canonicalPathHmac, encryptMeta } from "../crypto/crypto";
+import { FileState } from "../state/store";
 import {
 	downloadPlain,
 	e2eeBinding,
 	metaEncrypted,
 	removeRemote,
+	serverPathOf,
 	uploadFromPlain,
 	versionPlain,
 } from "./transfer";
@@ -130,9 +132,14 @@ export async function pushPendingChanges(ctx: SyncContext): Promise<PushResult> 
 }
 
 /**
- * 原子改名推送（v9.3）：服务器单事务完成「旧路径 tombstone + 新路径新行」。
- * 任何不满足前提的情况（内容又被编辑 / E2EE / 服务器 409/404/422 /
- * 旧服务器没有该接口）一律内联回退到 delete+upsert 语义——宁可退化，绝不丢内容。
+ * 改名推送（协议 v6 / ADR-001 §3.4）。
+ *
+ * v5 的 MOVE 是「旧路径 tombstone + 新路径新行」，历史断成两截、身份被换掉、
+ * 还留下一条假删除。v6 里身份不依赖 path，改名退化为**一次元数据更新**：
+ * revision、contentGeneration、blob 全部不动，**不产生任何 tombstone**。
+ *
+ * 因此这里也不再需要「E2EE 下必须是 LSE3 才敢 MOVE」那类前提——服务器根本不碰密文。
+ * 仍然保留 delete+upsert 回退：改名后内容又被编辑、或服务器拒绝时，宁可退化也不丢内容。
  */
 async function pushMove(ctx: SyncContext, toPath: string, fromPath: string): Promise<Outcome> {
 	const adapter = ctx.app.vault.adapter;
@@ -153,71 +160,114 @@ async function pushMove(ctx: SyncContext, toPath: string, fromPath: string): Pro
 		return outcome;
 	};
 
-	// 前提：旧路径已同步、新路径存在、内容未变、无冲突冻结；
-	// E2EE 下要求 tracked 为 LSE3（generation 已知，密文 AAD 绑 fileId 不绑路径），
-	// 否则回退（LSE1/LSE2 密文移动后无法解密；服务器侧也会再校验一次）
+	// 前提：旧路径已同步、新路径存在、内容未变、无冲突冻结
 	if (!tracked || !stat || ctx.store.getConflict(fromPath) || ctx.store.getConflict(toPath)) {
-		return fallback();
-	}
-	if (ctx.e2ee.enabled && (tracked.generation === undefined || !tracked.fileId)) {
 		return fallback();
 	}
 	const data = await adapter.readBinary(toPath);
 	const hash = await sha256Hex(data);
 	if (hash !== tracked.hash) return fallback(); // 改名后又编辑：内容需要正常上传
 
-	// meta 模式（v9.3 三期）：改名 = 元数据更新，内容与伪名完全不动
-	if (metaEncrypted(ctx)) {
-		if (!tracked.fileId || tracked.metaGeneration === undefined) return fallback();
-		const bind = e2eeBinding(ctx);
-		if (!bind) return fallback();
-		try {
-			const keys = await ctx.e2ee.metaKeys();
-			const newGen = tracked.metaGeneration + 1;
-			const metaEnc = await encryptMeta(
-				keys,
-				{ vaultId: bind.vaultId, keyEpoch: bind.keyEpoch, fileId: tracked.fileId, metaGeneration: newGen },
-				{ path: toPath },
-			);
-			const canonicalHash = await canonicalPathHmac(keys, toPath);
-			const out = await ctx.client.updateFileMeta(tracked.fileId, tracked.metaGeneration, metaEnc, canonicalHash);
-			// 改名只动元数据：fileId / contentGeneration / 伪名全部原样保留（LS-121-C04）
-			ctx.store.rename(fromPath, toPath, {
-				mtime: stat.mtime,
-				size: stat.size,
-				metaGeneration: out.metaGeneration,
-				serverPseudonym: tracked.fileId,
-			});
-			ctx.log(`push: meta-renamed ${fromPath} -> ${toPath} (metaGen ${out.metaGeneration})`);
-			return "pushed";
-		} catch (e) {
-			if (e instanceof ConflictError || e instanceof NotFoundError) return fallback();
-			if (e instanceof ApiError && (e.status === 400 || e.status === 404 || e.status === 412 || e.status === 422)) {
-				return fallback(); // 并发改名 CAS / 同名占用 / 旧服务器
-			}
-			throw e;
-		}
-	}
+	const meta = await renameMetadata(ctx, tracked, toPath);
+	if (meta === "unavailable") return fallback();
+
+	// meta 模式下服务器可见的寻址名不变（伪名），只更新加密元数据；
+	// 明文模式下寻址名就是真实路径
+	const serverFrom = metaEncrypted(ctx) ? serverPathOf(ctx, fromPath) : fromPath;
+	const serverTo = metaEncrypted(ctx) ? serverFrom : toPath;
 
 	try {
-		const out = await ctx.client.move(fromPath, toPath, tracked.revision);
+		const out = await ctx.client.rename(serverFrom, serverTo, tracked.metaGeneration ?? 0, meta);
 		ctx.store.rename(fromPath, toPath, {
-			hash,
-			serverHash: tracked.serverHash,
-			revision: out.revision,
 			mtime: stat.mtime,
 			size: stat.size,
+			revision: out.revision,
+			metaGeneration: out.metaGeneration,
+			fileId: out.fileId,
+			serverPseudonym: metaEncrypted(ctx) ? out.toPath : undefined,
 		});
-		ctx.log(`push: moved ${fromPath} -> ${toPath} (rev ${out.revision})`);
+		ctx.log(`push: renamed ${fromPath} -> ${toPath} (metaGen ${out.metaGeneration})`);
 		return "pushed";
 	} catch (e) {
-		if (e instanceof ConflictError) return fallback(); // 远端变化 / 目标被占用
-		if (e instanceof NotFoundError) return fallback(); // 远端已无此文件
-		if (e instanceof ApiError && (e.status === 400 || e.status === 404 || e.status === 409 || e.status === 422)) {
-			return fallback(); // 旧服务器无该接口 / 路径碰撞 / E2EE 拒绝
+		if (e instanceof ConflictError || e instanceof NotFoundError) return fallback();
+		if (e instanceof ApiError && (e.status === 400 || e.status === 404 || e.status === 412 || e.status === 422)) {
+			return fallback(); // 并发改名 CAS / 同名占用 / 非法目标
 		}
-		throw e; // 网络/5xx：保留队列条目，退避重试
+		throw e;
 	}
+}
+
+/**
+ * 改名要携带的加密元数据。
+ * meta 模式必须带（真实路径在密文里）；明文模式一律不带——
+ * 服务端在 plain 状态会拒绝任何 metaEnc（状态守卫，LS-121-S03）。
+ * 返回 "unavailable" 表示缺少必要材料，调用方退化为 delete+upsert。
+ */
+async function renameMetadata(
+	ctx: SyncContext,
+	tracked: FileState,
+	toPath: string,
+): Promise<{ metaEnc: string; canonicalHash: string } | undefined | "unavailable"> {
+	if (!metaEncrypted(ctx)) return undefined;
+	const bind = e2eeBinding(ctx);
+	if (!bind || !tracked.fileId || tracked.metaGeneration === undefined) return "unavailable";
+	const keys = await ctx.e2ee.metaKeys();
+	const newGen = tracked.metaGeneration + 1;
+	return {
+		metaEnc: await encryptMeta(
+			keys,
+			{ vaultId: bind.vaultId, keyEpoch: bind.keyEpoch, fileId: tracked.fileId, metaGeneration: newGen },
+			{ path: toPath },
+		),
+		canonicalHash: await canonicalPathHmac(keys, toPath),
+	};
+}
+
+/**
+ * 显式恢复一个已删除对象（协议 v6 / ADR-002 §3.6）。
+ *
+ * 服务器在 tombstone 冲突里告诉我们对象身份、墓碑 revision 与删除时的内容世代；
+ * 恢复请求必须原样带回前两者（防复活锚点），并提交严格更新的内容世代（抗回退）。
+ * 服务器没给 fileId（旧版本）时返回 null，调用方放弃而不是盲目重建。
+ */
+async function restoreObject(
+	ctx: SyncContext,
+	path: string,
+	server: { revision: number; fileId?: string; contentGeneration?: number },
+): Promise<{ fileId: string; revision: number } | null> {
+	if (!server.fileId) return null;
+	const tracked = ctx.store.get(path);
+	const nextGen = Math.max(server.contentGeneration ?? 0, tracked?.generation ?? 0) + 1;
+
+	let meta: { metaEnc: string; canonicalHash: string } | undefined;
+	let pseudonym = path;
+	if (metaEncrypted(ctx)) {
+		const bind = e2eeBinding(ctx);
+		if (!bind) return null;
+		const keys = await ctx.e2ee.metaKeys();
+		pseudonym = server.fileId;
+		meta = {
+			metaEnc: await encryptMeta(
+				keys,
+				{ vaultId: bind.vaultId, keyEpoch: bind.keyEpoch, fileId: server.fileId, metaGeneration: 1 },
+				{ path },
+			),
+			canonicalHash: await canonicalPathHmac(keys, path),
+		};
+	}
+	const out = await ctx.client.restore(server.fileId, {
+		expectedTombstoneRevision: server.revision,
+		contentGeneration: nextGen,
+		pseudonym,
+		metaEnc: meta?.metaEnc,
+		canonicalHash: meta?.canonicalHash,
+	});
+	ctx.store.update(path, {
+		fileId: out.fileId,
+		revision: out.revision,
+		serverPseudonym: metaEncrypted(ctx) ? out.path : undefined,
+	});
+	return { fileId: out.fileId, revision: out.revision };
 }
 
 type Outcome = "pushed" | "skipped" | "conflict";
@@ -280,19 +330,28 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 						return "skipped";
 					}
 				}
-				// 基于墓碑 revision 显式重建（同名新内容 / 本地编辑胜出）
-				const out = await uploadFromPlain(ctx, path, data, server.revision, stat.mtime);
+				// v6：重建必须走**显式恢复**（ADR-002 §3.6）。
+				// 普通上传再也无法穿透墓碑——服务器分不清「用户真想恢复」与
+				// 「陈旧设备把三个月前的副本传了回来」，所以要求客户端明说。
+				// 恢复后 revision 连续、fileId 不变、删除前的历史全部仍可达。
+				const restored = await restoreObject(ctx, path, server);
+				if (restored === null) {
+					ctx.notify(`无法恢复已删除的文件（服务器未提供对象身份）：${path}`);
+					return "skipped";
+				}
+				const out = await uploadFromPlain(ctx, path, data, restored.revision, stat.mtime);
 				ctx.store.update(path, {
 					hash,
 					serverHash: out.cipherHash,
 					revision: out.revision,
 					mtime: stat.mtime,
 					size: stat.size,
-					fileId: out.fileId,
+					fileId: out.fileId ?? restored.fileId,
 					generation: out.generation,
 					metaGeneration: out.metaGeneration,
 					serverPseudonym: out.serverPseudonym,
 				});
+				ctx.log(`push: restored + uploaded ${path} (rev ${out.revision})`);
 				return "pushed";
 			}
 			if (!ctx.e2ee.enabled && server.hash === hash) {
