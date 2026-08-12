@@ -28,6 +28,7 @@
 import { App, Platform } from "obsidian";
 import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
+import { evalFailpoint, FP } from "../utils/failpoint";
 import { InvalidVaultPathError, validateAndCanonicalizeVaultPath } from "../utils/vault-path";
 
 /** 前置条件不满足时的处置方式。 */
@@ -197,9 +198,15 @@ export class LocalCommitter {
 			}
 		}
 
+		// §8.1 注入点：旧内容已进 recovery、新内容尚未安装。
+		// 这是唯一一个「目标路径上什么都没有」的瞬间——崩溃后必须能从
+		// recovery 找回旧内容，绝不能变成「文件凭空消失」
+		await evalFailpoint(FP.commitAfterRecovery);
+
 		// 步骤 10：安装
 		try {
 			await ensureParentFolder(adapter, path);
+			await evalFailpoint(FP.commitBeforeInstall);
 			await adapter.rename(staging, path);
 		} catch (e) {
 			// 安装失败 → 把旧内容搬回去，恢复到调用前的状态

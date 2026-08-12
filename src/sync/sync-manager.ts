@@ -360,22 +360,26 @@ export class SyncManager {
 		// 变的只是服务器怎么称呼它们。
 		const savedFormat = this.ctx.store.state.bootstrap.formatEpoch;
 		if (info.formatEpoch !== undefined && savedFormat !== undefined && info.formatEpoch !== savedFormat) {
-			this.ctx.store.state.bootstrap.formatEpoch = info.formatEpoch;
-			this.ctx.store.state.lastSequence = 0; // 强制下一轮走 snapshot 全量对账
-			await this.ctx.store.save();
-			this.ctx.notify(
-				info.formatEpoch > savedFormat
-					? "服务器已完成路径与文件名加密，本设备将重新对账一次（内容不受影响）"
-					: "服务器的寻址格式世代发生了回退，已停止同步；请检查服务器是否从旧备份恢复",
-			);
-			this.ctx.log(`formatEpoch changed ${savedFormat} -> ${info.formatEpoch}, forcing snapshot reconcile`);
 			if (info.formatEpoch < savedFormat) {
-				// 回退 = 服务器可能被换回旧数据：不自动继续
+				// 回退 = 服务器可能被换回旧数据，或者有人在冒充它。
+				//
+				// 这里**必须先判断再采纳**（v0.14.0-RC / §8.6）：以前的写法是先把
+				// 服务器给的值写进 bootstrap、清掉游标，再检查是不是回退。
+				// 结果是即使随后停机，盘上已经留下了攻击者给的那个旧世代——
+				// 用户一旦清除完整性告警，客户端就会用旧格式去寻址。
+				// 不采纳、不清游标、直接停机才是安全的顺序。
 				const msg = "服务器 formatEpoch 回退，已停止同步等待人工确认";
+				this.ctx.log(`formatEpoch rollback ${savedFormat} -> ${info.formatEpoch}, refusing to adopt`);
+				this.ctx.notify("服务器的寻址格式世代发生了回退，已停止同步；请检查服务器是否从旧备份恢复");
 				this.ctx.gate.markIntegrityError(msg);
 				this.onStatus("offline", msg);
 				return false;
 			}
+			this.ctx.store.state.bootstrap.formatEpoch = info.formatEpoch;
+			this.ctx.store.state.lastSequence = 0; // 强制下一轮走 snapshot 全量对账
+			await this.ctx.store.save();
+			this.ctx.notify("服务器已完成路径与文件名加密，本设备将重新对账一次（内容不受影响）");
+			this.ctx.log(`formatEpoch changed ${savedFormat} -> ${info.formatEpoch}, forcing snapshot reconcile`);
 		}
 
 		// v0.8 升级设备第一次见到 epoch / vaultId：补记录（首见即固定身份）

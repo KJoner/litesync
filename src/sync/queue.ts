@@ -14,6 +14,8 @@
  * 重新生成身份（那会在服务器上造出重复对象或永久 422）。
  */
 
+import { evalFailpoint, FP } from "../utils/failpoint";
+
 export type PendingActionType = "upsert" | "delete" | "move";
 
 /** 操作在日志中的生命周期（计划书 §6.3）。 */
@@ -145,7 +147,13 @@ export class PendingQueue {
 	private async flush(path: string): Promise<void> {
 		if (!this.persist) return;
 		try {
+			// §8.1 注入点：条目在内存里、还没落盘。此刻崩溃这条操作必须**消失**，
+			// 而不是留在盘上让人以为已经被接受
+			await evalFailpoint(FP.queueBeforeDurable);
 			await this.persist();
+			// §8.1 注入点：已落盘。此刻崩溃这条操作必须**还在**——
+			// 它已经被承诺给用户了
+			await evalFailpoint(FP.queueAfterDurable);
 		} catch (e) {
 			// 落盘失败 → 这条操作不能被当作「已接受」。回滚出队，
 			// 让下一轮扫描重新发现该文件（扫描是幂等的兜底路径）

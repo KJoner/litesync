@@ -5,6 +5,7 @@ import { BlockedChange } from "../state/store";
 import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
 import { requireFileId } from "../utils/validate";
+import { evalFailpoint, FP } from "../utils/failpoint";
 import { InvalidVaultPathError, validateAndCanonicalizeVaultPath } from "../utils/vault-path";
 import { attemptAutoMerge } from "./auto-merge";
 import { keepBothVersions } from "./conflict";
@@ -145,6 +146,9 @@ async function tryResolveNameSwap(
 	try {
 		await ensureParentFolder(adapter, temp);
 		await adapter.rename(realPath, temp); // A → temp
+		// §8.1 注入点：交换只做了一半。此刻崩溃，那份内容只存在于插件目录里，
+		// 必须靠 recoverInterruptedSwaps 找回来
+		await evalFailpoint(FP.swapAfterFirstStep);
 		await ensureParentFolder(adapter, realPath);
 		await adapter.rename(newPath, realPath); // B → A
 		await ensureParentFolder(adapter, newPath);
@@ -323,7 +327,25 @@ async function guardRepoEpoch(ctx: SyncContext, serverEpoch: string | undefined)
 		return;
 	}
 	if (saved !== serverEpoch) {
+		// v0.14.0-RC / §8.5：这里必须与 SyncManager 的 /info 路径做**完全一样**的事。
+		//
+		// 之前这条路径只重置了 bootstrap：没有留档恢复现场，也没有作废旧游标。
+		// 于是「先由 changes 发现 epoch 变化」和「先由 /info 发现」会得到两种
+		// 不同的本地状态——而前者恰恰是离线一段时间后重新上线的常见顺序。
+		ctx.store.enterRecovery({
+			reason: "repo-epoch-changed",
+			previousEpoch: saved,
+			serverEpoch,
+			localSequence: ctx.store.state.lastSequence,
+			localFileCount: ctx.store.paths().length,
+			at: Date.now(),
+		});
 		ctx.store.resetBootstrap();
+		ctx.store.clearBinding();
+		// 旧游标作废：它属于上一个 sequence 世代，在新世代里指向的是完全不同的变更。
+		// 留着它比清掉危险得多——只要有任何一条路径把 bootstrap 重新置为 ready
+		// 而没有重新锚定游标，同步就会从一个错误的位置继续。
+		ctx.store.state.lastSequence = 0;
 		await ctx.store.save();
 		ctx.notify(
 			"服务器数据已从备份恢复（repoEpoch 变化），自动同步已暂停；\n请重新运行接入向导并选择「安全合并」，本地较新的内容不会丢失",
@@ -374,6 +396,9 @@ export async function pullRemoteChanges(ctx: SyncContext): Promise<PullResult> {
 			}
 			for (const change of resp.changes) {
 				const outcome = await applyRemoteChange(ctx, change);
+				// §8.1 注入点：变更已应用、游标尚未推进。此刻崩溃会让这条变更
+				// 被重放一次——重放必须是幂等的，绝不能产生第二份内容或假冲突
+				await evalFailpoint(FP.cursorBeforeAck);
 				if (outcome === "applied") result.applied++;
 				if (outcome === "conflict") result.conflicts++;
 				if (outcome === "blocked") {

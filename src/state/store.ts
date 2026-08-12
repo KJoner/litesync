@@ -5,6 +5,7 @@ import { PendingOp } from "../sync/queue";
 import { sha256Hex } from "../utils/hash";
 import { encodeUtf8 } from "../utils/text";
 import { isFileId, isGeneration } from "../utils/validate";
+import { evalFailpoint, FP } from "../utils/failpoint";
 import { platformCollisionKey } from "../utils/vault-path";
 
 /**
@@ -391,6 +392,10 @@ export class StateStore {
 		};
 		const p = this.slotPath(target);
 		await this.adapter.write(p, JSON.stringify(env));
+		// §8.1 注入点：非活动槽已写完，但 generation 还没提升。
+		// 此刻崩溃时加载器会取 generation 更高的**旧**副本——即回到写入前的状态。
+		// 「要么旧状态完整，要么新状态完整」在这里体现为「旧的那份完整」
+		await evalFailpoint(FP.stateAfterSlotWrite);
 
 		// 读回校验：写坏（磁盘满/中断）或被别人覆盖时保留另一份完好副本并报错
 		const check = await this.readEnvelope(target);
@@ -406,6 +411,9 @@ export class StateStore {
 					`请确认没有第二个 Obsidian 实例打开同一个 Vault`,
 			);
 		}
+		// §8.1 注入点：即将把新槽认定为活动槽。这一步在内存里，但它决定了
+		// 下次 save 写哪一个槽——注入失败会让本次 save 报错，调用方据此重试
+		await evalFailpoint(FP.stateBeforePointerSwitch);
 		this.generation = env.generation;
 		this.activeSlot = target;
 		this.savedGeneration = snapshotGeneration;
