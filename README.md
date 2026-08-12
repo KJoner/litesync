@@ -108,7 +108,7 @@ is ever silently overwritten, and nothing is ever permanently deleted.
 ## Known limitations & remaining threats
 
 Being explicit about what LiteSync does **not** protect against is part of the
-design. The list below is accurate as of v0.14.0-rc.1.
+design. The list below is accurate as of v0.17.0-rc.1.
 
 ### What a malicious or compromised server can still do
 
@@ -151,13 +151,23 @@ has no copy.
 
 ### Platform limitations
 
-- On platforms that cannot guarantee an atomic file replace (some mobile
-  configurations), overwriting an existing file automatically degrades to
-  keeping both versions rather than risking a half-written file.
+- On platforms that cannot guarantee an atomic file replace, overwriting an
+  existing file automatically degrades to saving the incoming version alongside
+  the local one, rather than risking a half-written file. Every platform we have
+  measured so far (Windows, Linux, macOS, iOS, Android) **does** support atomic
+  installs, so this path is a safety net rather than an everyday behaviour. The
+  plugin probes for it at runtime instead of assuming — run **"LiteSync:
+  Platform compatibility probe"** to see the result for your own device.
 - `Note.md` and `note.md` are treated as **the same file** regardless of which
-  operating system you are on. This is deliberate: judging by the local
-  platform would make a Linux device and a macOS device disagree about whether
-  two names collide, and they would then overwrite each other.
+  operating system you are on, and `café.md` written as NFC or NFD is likewise
+  one file. This is deliberate, and measurement backs it up: on real devices
+  **iOS is case-sensitive and normalises Unicode, while Android is the
+  opposite** — case-insensitive and non-normalising. Judging by the local
+  platform would make those two devices disagree about whether two names
+  collide, and they would then overwrite each other. The rule therefore takes
+  the strictest interpretation across all platforms. The cost is that you
+  cannot keep `Note.md` and `note.md` as separate files even on a system that
+  allows it; the benefit is that no device can silently overwrite another's.
 - Network drives and cloud-sync folders (Dropbox, OneDrive, iCloud Drive) are
   **not supported** as vault locations. Two synchronizers writing the same
   files will corrupt each other's state.
