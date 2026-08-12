@@ -10,6 +10,7 @@
  * - meta 模式下真实路径绝不进入任何请求（伪名翻译，LS-121-C05）
  */
 import { DownloadResult, UploadAction } from "../api/client";
+import { NON_ATOMIC_REASON } from "./local-commit";
 import {
 	canonicalPathHmac,
 	decryptFile,
@@ -367,6 +368,45 @@ export async function writeIfLocalUnchanged(
 		return false;
 	}
 	return res.status === "committed";
+}
+
+/**
+ * 与 writeIfLocalUnchanged 相同，但把「本平台不支持原子替换」单独报出来
+ *（计划书 §8.8 门槛 11）。
+ *
+ * 调用方需要区分两种 false：
+ *
+ *   - 本地在下载期间真的被改了 → 走合并/冲突，这是一次真实的并发编辑；
+ *   - 平台没有原子替换 → 与并发无关，**每一次**覆盖都会这样，
+ *     必须直接退化为 keep-both。
+ *
+ * 混作一谈的代价：日志会说「local changed during download」，而本地根本没变。
+ * 在移动端上排查这种误报会非常痛苦——那里本来就更难观察发生了什么。
+ */
+export async function writeOrReportNonAtomic(
+	ctx: SyncContext,
+	path: string,
+	data: ArrayBuffer,
+	expectedLocalHash: string | null,
+	mtime?: number,
+	operationId?: string,
+): Promise<"written" | "local-changed" | "non-atomic"> {
+	const res = await ctx.committer.commitRemoteChange({
+		operationId: operationId ?? newOperationId(),
+		realPath: path,
+		expectedLocalHash,
+		incoming: data,
+		incomingHash: await sha256Hex(data),
+		conflictPolicy: "fail",
+		...(mtime !== undefined && mtime > 0 ? { incomingMtime: mtime } : {}),
+	});
+	if (res.status === "committed") return "written";
+	if (res.status === "rejected" && (res.reason ?? "").startsWith(NON_ATOMIC_REASON)) {
+		ctx.log(`commit: ${path} 退化为保留双方版本（本平台无原子替换）`);
+		return "non-atomic";
+	}
+	ctx.log(`commit not applied: ${path} (${res.status === "rejected" ? (res.reason ?? "") : res.status})`);
+	return "local-changed";
 }
 
 export interface UploadOutcome {

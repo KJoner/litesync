@@ -25,7 +25,7 @@
  * 因此第 5 步的「重新读取 + 核对 hash」才是真正的安全依据，mutex 只是减少窗口。
  */
 
-import { App, Platform } from "obsidian";
+import { App } from "obsidian";
 import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
 import { evalFailpoint, FP } from "../utils/failpoint";
@@ -84,6 +84,15 @@ export class CommitIntegrityError extends Error {
 
 /** recovery 副本保留时长：一周内用户还能自己找回被换下来的旧内容。 */
 const RECOVERY_RETENTION_MS = 7 * 24 * 3600 * 1000;
+
+/**
+ * 「本平台不支持原子替换」的可判定标记（计划书 §8.8 门槛 11）。
+ *
+ * 上层用它把这种情况与「本地文件真的被并发修改了」区分开。两者的正确处置不同，
+ * 而且把前者误报成后者会让人以为存在并发编辑，从而怀疑错方向——
+ * 在移动端上尤其糟糕，因为那里本来就更难观察发生了什么。
+ */
+export const NON_ATOMIC_REASON = "PLATFORM_NO_ATOMIC_REPLACE";
 
 export class LocalCommitter {
 	private locks = new Map<string, Promise<unknown>>();
@@ -177,7 +186,13 @@ export class LocalCommitter {
 		// 移动端若没有可靠的 rename 原语，直接覆盖会在中途断电时留下半个文件。
 		// 计划书 §6.1 要求此时不得直接覆盖 —— 交回调用方走 keep-both。
 		if (!(await this.canInstallAtomically()) && currentHash !== null) {
-			return { status: "rejected", reason: "本平台无法保证原子替换，已保留双方版本" };
+			// 交回调用方走 keep-both（§8.8 门槛 11）。reason 用一个可判定的前缀，
+			// 让上层能把它与「本地真的被改了」区分开——那两种情况的正确处置不同，
+			// 而且把前者误报成后者会让人以为有并发编辑，从而怀疑错方向
+			return {
+				status: "rejected",
+				reason: `${NON_ATOMIC_REASON}：本平台不提供可靠的 rename，无法原子安装`,
+			};
 		}
 
 		// 步骤 1：写 staging（失败也不会碰到目标文件）
@@ -207,7 +222,18 @@ export class LocalCommitter {
 		try {
 			await ensureParentFolder(adapter, path);
 			await evalFailpoint(FP.commitBeforeInstall);
-			await adapter.rename(staging, path);
+			if (currentHash === null && !(await this.canInstallAtomically())) {
+				// 平台没有可用的 rename，但这是**新建**：目标路径上什么都没有，
+				// 直接写不会毁掉任何已有内容。写坏了最坏是留下半个新文件，
+				// 而它本来就不存在——用户没有损失。
+				//
+				// 不这么做的话，没有 rename 的平台连新文件都收不到，
+				// 那不是「安全退化为 keep-both」，是同步彻底不工作。
+				await adapter.writeBinary(path, req.incoming);
+				await this.discard(staging);
+			} else {
+				await adapter.rename(staging, path);
+			}
 		} catch (e) {
 			// 安装失败 → 把旧内容搬回去，恢复到调用前的状态
 			if (recoveryPath !== undefined) {
@@ -245,32 +271,61 @@ export class LocalCommitter {
 	/**
 	 * 探测本平台能否用 rename 安装（只探测一次）。
 	 *
-	 * 桌面端一律可用。移动端由 Capacitor 提供，历史上有过不可靠的版本，
-	 * 因此实际做一次 write→rename→remove 再下结论——猜错的代价是用户数据。
+	 * # 探测的是「改名到一个空位」，因为安装做的就是这件事
+	 *
+	 * 安装流程是「先把旧内容挪进 recovery，再把 staging 改名过来」——
+	 * 目标路径在改名那一刻已经是空的。所以这里要探测的是
+	 * `rename(A → 不存在的 B)`，而**不是**「改名覆盖已存在的文件」。
+	 *
+	 * 这个区别很要紧：Windows 的 rename 不能覆盖已存在的文件，
+	 * 但先挪走再改名完全正常。按「能否覆盖」来探测会把所有 Windows 用户
+	 * 误判成不支持原子替换，于是每一次远端更新都退化成冲突副本——
+	 * 一个为了安全而加的检查，反过来把正常平台的同步毁掉。
+	 *
+	 * 探测同时校验改名后的**内容**，而不只是「目标存在」：一个把 rename
+	 * 实现成「创建空文件」的适配器，只查存在性是查不出来的。
+	 *
+	 * 桌面端不再跳过探测（v0.17 改）：以前直接假定桌面可用，于是这条路径
+	 * 在桌面上从来没被真正跑过——而网络盘、同步盘挂载的 Vault 就在桌面上。
+	 * 一次探测的代价是三个小文件操作，只在每个会话里发生一次。
 	 */
 	private async canInstallAtomically(): Promise<boolean> {
 		if (this.renameSupported !== null) return this.renameSupported;
-		if (!Platform.isMobileApp) {
-			this.renameSupported = true;
-			return true;
-		}
 		const adapter = this.app.vault.adapter;
 		const probeA = `${this.stagingDir}/.probe-a`;
 		const probeB = `${this.stagingDir}/.probe-b`;
+		const marker = new Uint8Array([0xa5]).buffer;
 		try {
 			await ensureParentFolder(adapter, probeA);
-			await adapter.writeBinary(probeA, new Uint8Array([1]).buffer);
+			await this.discard(probeB); // 上次残留会让下面变成「覆盖」，那不是我们要测的
+			await adapter.writeBinary(probeA, marker);
 			await adapter.rename(probeA, probeB);
-			this.renameSupported = (await adapter.stat(probeB)) !== null;
+			const after = await adapter.readBinary(probeB);
+			this.renameSupported = after.byteLength === 1 && new Uint8Array(after)[0] === 0xa5;
 		} catch {
 			this.renameSupported = false;
 		}
 		await this.discard(probeA);
 		await this.discard(probeB);
 		if (!this.renameSupported) {
-			this.log("commit: 本平台不提供可靠的原子替换，覆盖类写入将自动退化为保留双方版本");
+			this.log(
+				"commit: 本平台不支持可靠的 rename。" +
+					"覆盖类写入将退化为保留双方版本——绝不做非原子覆盖：" +
+					"中途断电会留下半个文件，而那半个文件就是用户唯一的那份内容",
+			);
 		}
 		return this.renameSupported;
+	}
+
+	/**
+	 * 本平台是否支持原子替换（供 UI 与诊断使用；会触发一次探测）。
+	 *
+	 * 计划书 §8.8 门槛 11 要求「所有不可原子替换的平台都安全退化为 keep-both」。
+	 * 把这个判断暴露出来，是为了让「退化有没有发生」是可观测的，
+	 * 而不是只能从一堆冲突副本里反推。
+	 */
+	async supportsAtomicReplace(): Promise<boolean> {
+		return this.canInstallAtomically();
 	}
 
 	private async discard(path: string): Promise<void> {

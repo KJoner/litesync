@@ -87,3 +87,42 @@ export async function keepBothVersions(
 	ctx.notify(`同步冲突: ${path}\n本地版本已保存为 ${conflictPath}`);
 	return conflictPath;
 }
+
+/**
+ * 把**远端**内容另存一份，原文件一个字节都不动（计划书 §8.8 门槛 11）。
+ *
+ * 用于「本平台不支持原子替换」这一种情况，与并发编辑无关。
+ *
+ * # 为什么不能复用 keepBothVersions
+ *
+ * keepBothVersions 的最后一步是「用远端版本覆盖原路径」。在没有原子替换的平台上
+ * 那一步同样会被拒，于是结果变成：本地内容原地不动、冲突副本里存的又是**本地**
+ * 内容（一份多余的重复），而远端版本哪儿都没写。用户根本收不到这次更新，
+ * 却看到一个莫名其妙的副本——这不是「安全退化」，这是数据没到。
+ *
+ * 这里反过来：远端版本进新文件，本地保持原样。两份内容都在盘上，
+ * 用户自己核对合并。这才是门槛 11 说的 keep-both。
+ *
+ * 新文件的写入是**创建**而不是覆盖，因此不需要原子替换——
+ * 写坏了也只是多一个坏副本，不会毁掉用户已有的内容。
+ */
+export async function keepIncomingAside(
+	ctx: SyncContext,
+	path: string,
+	incoming: ArrayBuffer,
+): Promise<string | null> {
+	const adapter = ctx.app.vault.adapter;
+
+	let asidePath = conflictPathFor(path, "remote", new Date());
+	for (let i = 0; i < 5 && (await adapter.stat(asidePath)); i++) {
+		asidePath = conflictPathFor(path, "remote", new Date());
+	}
+	// 前置条件「本地不存在」：万一同名副本已存在，宁可失败也不覆盖
+	if (!(await writeIfLocalUnchanged(ctx, asidePath, incoming, null))) {
+		ctx.log(`keepIncomingAside: 无法创建副本 ${asidePath}`);
+		return null;
+	}
+	// 副本作为新文件推给服务器，让其他设备也看得到这次分歧
+	ctx.queue.stage(asidePath, { action: "upsert" });
+	return asidePath;
+}

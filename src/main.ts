@@ -26,6 +26,7 @@ import { LocalCommitter } from "./sync/local-commit";
 import { PendingQueue } from "./sync/queue";
 import { SyncManager, SyncStatus } from "./sync/sync-manager";
 import { IgnoreMatcher } from "./utils/ignore";
+import { renderProbeReport, runPlatformProbe } from "./diagnostics/platform-probe";
 import { nextFlushDelay, quantizeMtime } from "./utils/timing";
 import { VaultKeyDoc } from "./crypto/crypto";
 
@@ -129,6 +130,11 @@ export default class PrivateSyncPlugin extends Plugin {
 			id: "encrypt-metadata",
 			name: "加密路径与文件名 (Encrypt file paths and names)",
 			callback: () => this.confirmMetaEncryption(),
+		});
+		this.addCommand({
+			id: "platform-probe",
+			name: "平台兼容性自检 (Platform compatibility probe)",
+			callback: () => void this.runPlatformProbe(),
 		});
 		this.addRibbonIcon("refresh-cw", "LiteSync: 立即同步", () => void this.syncNow());
 
@@ -502,6 +508,39 @@ export default class PrivateSyncPlugin extends Plugin {
 		if (prefixes.length === 0) return true;
 		const target = path.replace(/\\/g, "/").toLowerCase();
 		return prefixes.some((p) => target === p || target.startsWith(p.endsWith("/") ? p : p + "/"));
+	}
+
+	/**
+	 * 平台兼容性自检（计划书 §8.4 实机矩阵、§8.8 门槛 3 与 11）。
+	 *
+	 * §8.4 要求在各平台跑一遍路径用例矩阵。桌面端可以用 `npm test`
+	 *（tests/realfs.test.ts 直接操作真实文件系统），**但移动端跑不了 Node**。
+	 * 于是移动端那一格长期只能靠推理填——而推理错的方向恰好最危险：
+	 * 我们以为两个名字不同，文件系统认为相同，后写的静默覆盖先写的。
+	 *
+	 * 这个命令跑在插件内部、用 Obsidian 自己的 adapter，因此在移动端也能跑。
+	 * 结果写成一篇笔记，用户可以直接读、直接贴出来。
+	 */
+	async runPlatformProbe(): Promise<void> {
+		const pluginDir = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+		new Notice("LiteSync：正在自检平台兼容性…");
+		try {
+			const rep = await runPlatformProbe(this.app, pluginDir, this.manifest.version, this.committer);
+			const md = renderProbeReport(rep);
+			// 文件名带到秒：每次自检都是一次**新建**，绝不覆盖上一份报告。
+			// 既避开了「覆盖用户文件」这条禁令，也顺带保留了历次自检的记录——
+			// 换了设备或系统升级之后，能看出结论有没有变
+			const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+			const path = `LiteSync 平台自检 ${stamp}.md`;
+			await this.app.vault.create(path, md);
+			new Notice(
+				rep.hasDisagreement
+					? `自检完成：发现 ${rep.results.filter((r) => !r.agrees).length} 处与预期不符，已写入「${path}」`
+					: `自检完成：全部一致，已写入「${path}」`,
+			);
+		} catch (e) {
+			new Notice(`平台自检失败：${e instanceof Error ? e.message : String(e)}`);
+		}
 	}
 
 	/** 设置变化后重建忽略规则和定时器。 */

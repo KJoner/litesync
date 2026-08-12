@@ -8,14 +8,14 @@ import { requireFileId } from "../utils/validate";
 import { evalFailpoint, FP } from "../utils/failpoint";
 import { InvalidVaultPathError, validateAndCanonicalizeVaultPath } from "../utils/vault-path";
 import { attemptAutoMerge } from "./auto-merge";
-import { keepBothVersions } from "./conflict";
+import { keepBothVersions, keepIncomingAside } from "./conflict";
 import { SyncContext } from "./context";
 import {
 	assertMetaGeneration,
 	downloadPlain,
 	metaEncrypted,
 	metaFingerprintOf,
-	writeIfLocalUnchanged,
+	writeOrReportNonAtomic,
 } from "./transfer";
 
 const HEX32 = /^[0-9a-f]{32}$/;
@@ -760,7 +760,20 @@ async function applyRemoteChange(
 		// 本地 CAS（v9 TOCTOU 修复）：下载是网络等待，期间用户可能恰好编辑了
 		// 这个文件（且事件因 applyingRemote 被忽略）——写入前必须确认本地
 		// 仍是决策时刻的内容，否则用户刚敲下的新内容会被远端版本静默覆盖
-		if (await writeIfLocalUnchanged(ctx, path, dl.plain, localHash, dl.mtime)) {
+		const wrote = await writeOrReportNonAtomic(ctx, path, dl.plain, localHash, dl.mtime);
+		if (wrote === "non-atomic") {
+			// §8.8 门槛 11：本平台不能原子替换 → 直接退化为保留双方版本。
+			// 不走下面的「本地变了 → 合并」流程：本地根本没变，
+			// 走那条路会得出错误的诊断，还会白白再下载一次 base
+			const kept = await keepIncomingAside(ctx, path, dl.plain);
+			if (kept === null) return skip(note, "non-atomic-keep-both-failed");
+			ctx.notify(
+				`${path}：本设备不支持原子替换，已把远端版本另存为 ${kept}，` +
+					`原文件保持不变。请手动核对后合并。`,
+			);
+			return "conflict";
+		}
+		if (wrote === "written") {
 			const st = await adapter.stat(path);
 			ctx.store.update(path, {
 				hash: dl.plainHash,
