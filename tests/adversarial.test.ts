@@ -393,3 +393,66 @@ test("§8.6-2 前置: formatEpoch 回退 → 停机等人工确认，绝不自�
 	assert.notEqual(gate.sessionBlock(), null, "必须停机等待人工确认");
 	mgr.dispose();
 });
+
+// ---------------------------------------------------------------- §8.8 第 10 条
+
+test("§8.8-10: 每一个被确认的 sequence 都留下处置证据", async () => {
+	const store = await readyStore();
+	const vault = memVault();
+	// 三条变更：一条被忽略规则跳过、一条删除从未有过的文件、一条同上
+	const changes = [
+		{ sequence: 1, path: "ignored.md", action: "upsert" as const, revision: 1 },
+		{ sequence: 2, path: "never-had.md", action: "delete" as const, revision: 1 },
+		{ sequence: 3, path: "also-never.md", action: "delete" as const, revision: 1 },
+	];
+	const ctx = {
+		app: { vault: { adapter: vault.adapter } },
+		store,
+		queue: new PendingQueue(),
+		gate: new SyncGate(),
+		e2ee: new Keyring(),
+		committer: new LocalCommitter({ vault: { adapter: vault.adapter } } as never, PLUGIN_DIR),
+		client: {
+			changes: async (since: number): Promise<ChangesResponse> =>
+				since === 0
+					? { latestSequence: 3, hasMore: false, changes, repoEpoch: "epoch-1" }
+					: { latestSequence: 3, hasMore: false, changes: [], repoEpoch: "epoch-1" },
+		},
+		ignores: (p: string) => p === "ignored.md",
+		deviceName: () => "test",
+		pluginDir: () => PLUGIN_DIR,
+		log: () => {},
+		notify: () => {},
+	} as unknown as SyncContext;
+
+	await pullRemoteChanges(ctx);
+
+	const evidence = store.sequenceEvidence();
+	assert.equal(store.state.lastSequence, 3, "游标应当推进到 3");
+	assert.deepEqual(
+		evidence.map((e) => e.sequence),
+		[1, 2, 3],
+		"每一个被确认的 sequence 都必须有一条证据",
+	);
+	for (const e of evidence) {
+		assert.ok(
+			["applied", "conflict", "blocked", "skipped"].includes(e.outcome),
+			`处置结果必须是四种之一，得到 ${e.outcome}`,
+		);
+		if (e.outcome === "skipped") {
+			assert.ok(e.reason && e.reason !== "unspecified", `skipped 必须带原因（sequence ${e.sequence}）`);
+		}
+	}
+	assert.equal(evidence[0].reason, "ignored-by-rules");
+});
+
+test("§8.8-10: 证据账本有界，不会把状态文件撑大", async () => {
+	const store = await readyStore();
+	for (let i = 1; i <= 700; i++) {
+		store.recordSequenceEvidence({ sequence: i, outcome: "applied", at: 0 });
+	}
+	const ev = store.sequenceEvidence();
+	assert.equal(ev.length, 500, "超出保留条数时应当丢弃最旧的");
+	assert.equal(ev[ev.length - 1].sequence, 700, "最新的必须保留");
+	assert.equal(ev[0].sequence, 201);
+});

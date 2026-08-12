@@ -134,6 +134,27 @@ export interface BlockedChange {
 }
 
 /**
+ * 一条已自动确认的远端变更留下的处置证据（v0.14.0-RC / 计划书 §8.8 第 10 条）。
+ *
+ * 发布门槛要求「所有自动确认的 sequence 都有 applied/conflict/blocked 证据」。
+ * 没有这个账本，出问题时唯一能说的只有「游标推到了 5000」——
+ * 而中间哪些变更真的落地了、哪些被跳过了、为什么跳过，全都无从查起。
+ *
+ * 有界保存（只留最近若干条）：这是诊断材料，不是需要永久保留的业务数据，
+ * 让它无限增长只会把状态文件撑大。
+ */
+export interface SequenceEvidence {
+	sequence: number;
+	outcome: "applied" | "conflict" | "blocked" | "skipped";
+	/** skipped 的具体原因——「跳过」如果没有原因，就等于没有证据 */
+	reason?: string;
+	at: number;
+}
+
+/** 证据账本的保留条数。够覆盖一次典型的批量同步，又不会让状态文件明显变大。 */
+export const SEQUENCE_EVIDENCE_LIMIT = 500;
+
+/**
  * 一次进行到一半的名字互换（v0.13.2 / §6.9）。
  *
  * A ↔ B 的互换必须借道临时名，而临时文件放在插件目录里——用户看不见。
@@ -186,6 +207,8 @@ export interface PersistedState {
 	blockedChanges: Record<string, BlockedChange>;
 	/** 进行到一半的名字互换（v0.13.2 §6.9）：键为临时路径 */
 	pendingSwaps: Record<string, PendingSwap>;
+	/** 最近若干条已确认 sequence 的处置证据（v0.14.0-RC §8.8 第 10 条） */
+	sequenceEvidence: SequenceEvidence[];
 	/**
 	 * 已确认的绑定指纹（v0.12.1）：null = 尚未绑定（unbound），
 	 * 任何写操作在重新完成权威校验之前都被 gate 拦截
@@ -211,6 +234,7 @@ function emptyState(): PersistedState {
 		pendingOps: {},
 		blockedChanges: {},
 		pendingSwaps: {},
+		sequenceEvidence: [],
 		binding: null,
 		recovery: null,
 	};
@@ -763,6 +787,26 @@ export class StateStore {
 	pendingSwaps(): PendingSwap[] {
 		return Object.values(this.state.pendingSwaps);
 	}
+
+	// ---------- sequence 处置证据（v0.14.0-RC §8.8 第 10 条） ----------
+
+	/**
+	 * 记录一条已确认 sequence 的处置结果。
+	 *
+	 * 必须在推进游标**之前**调用：先有证据再确认，顺序反过来的话，
+	 * 中间崩溃会留下一个「确认了但没人知道为什么」的 sequence。
+	 */
+	recordSequenceEvidence(e: SequenceEvidence): void {
+		this.state.sequenceEvidence.push(e);
+		if (this.state.sequenceEvidence.length > SEQUENCE_EVIDENCE_LIMIT) {
+			this.state.sequenceEvidence.splice(0, this.state.sequenceEvidence.length - SEQUENCE_EVIDENCE_LIMIT);
+		}
+	}
+
+	/** 最近的处置证据（诊断用，最新的在最后）。 */
+	sequenceEvidence(): SequenceEvidence[] {
+		return this.state.sequenceEvidence;
+	}
 }
 
 /** 把任意来源（旧版/新版）的 payload 规整为完整 PersistedState。 */
@@ -780,6 +824,7 @@ function normalizeState(raw: Partial<PersistedState>): PersistedState {
 		pendingOps: normalizePendingOps(raw.pendingOps),
 		blockedChanges: normalizeBlockedChanges(raw.blockedChanges),
 		pendingSwaps: normalizePendingSwaps(raw.pendingSwaps),
+		sequenceEvidence: Array.isArray(raw.sequenceEvidence) ? raw.sequenceEvidence.slice(-SEQUENCE_EVIDENCE_LIMIT) : [],
 		binding: normalizeBinding(raw.binding),
 		recovery: raw.recovery && typeof raw.recovery === "object" ? raw.recovery : null,
 	};

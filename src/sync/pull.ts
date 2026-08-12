@@ -395,12 +395,21 @@ export async function pullRemoteChanges(ctx: SyncContext): Promise<PullResult> {
 				break;
 			}
 			for (const change of resp.changes) {
-				const outcome = await applyRemoteChange(ctx, change);
+				const note: OutcomeNote = {};
+				const outcome = await applyRemoteChange(ctx, change, note);
 				// §8.1 注入点：变更已应用、游标尚未推进。此刻崩溃会让这条变更
 				// 被重放一次——重放必须是幂等的，绝不能产生第二份内容或假冲突
 				await evalFailpoint(FP.cursorBeforeAck);
 				if (outcome === "applied") result.applied++;
 				if (outcome === "conflict") result.conflicts++;
+				// §8.8 第 10 条：先留下处置证据，再确认这个 sequence。
+				// 顺序反过来的话，中途崩溃会留下一个「确认了但没人知道为什么」的游标
+				ctx.store.recordSequenceEvidence({
+					sequence: change.sequence,
+					outcome,
+					...(outcome === "skipped" ? { reason: note.reason ?? "unspecified" } : {}),
+					at: Date.now(),
+				});
 				if (outcome === "blocked") {
 					// §6.4：blocked 记录必须先落盘并通过写后验证，才允许推进游标。
 					// 否则这条变更会同时从 changes 流和状态里消失——服务器不会再
@@ -576,7 +585,26 @@ export async function resolveSnapshotPaths(
 	return out;
 }
 
-async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promise<Outcome> {
+/**
+ * skipped 的可审计原因（v0.14.0-RC / §8.8 第 10 条）。
+ *
+ * 「跳过」如果没有原因，就等于没有证据：事后没人能分辨
+ * 「这条变更本来就不需要处理」和「我们漏掉了一条变更」。
+ */
+export interface OutcomeNote {
+	reason?: string;
+}
+
+function skip(note: OutcomeNote | undefined, reason: string): Outcome {
+	if (note) note.reason = reason;
+	return "skipped";
+}
+
+async function applyRemoteChange(
+	ctx: SyncContext,
+	change: RemoteChange,
+	note?: OutcomeNote,
+): Promise<Outcome> {
 	let path = change.path;
 	let serverPath: string | undefined;
 
@@ -584,7 +612,7 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 	if (metaEncrypted(ctx) && HEX32.test(change.path)) {
 		const resolved = await resolveMetaChange(ctx, change);
 		if (resolved === "blocked") return "blocked"; // 路径不安全，记录已登记
-		if (resolved === "skip" || resolved === null) return "skipped";
+		if (resolved === "skip" || resolved === null) return skip(note, "meta-change-not-applicable");
 		path = resolved.realPath;
 		serverPath = resolved.serverPath;
 
@@ -612,9 +640,9 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 		path = safe;
 	}
 
-	if (ctx.ignores(path)) return "skipped";
+	if (ctx.ignores(path)) return skip(note, "ignored-by-rules");
 	// 文件正在冲突处理中：冻结远端应用，避免来回覆盖；Resolver 解决时会重新取远端 HEAD
-	if (ctx.store.getConflict(path)) return "skipped";
+	if (ctx.store.getConflict(path)) return skip(note, "frozen-by-pending-conflict");
 
 	// §6.12：跨平台碰撞。两个只差大小写（或差在 NFC/NFD、尾随点）的远端对象，
 	// 在 Windows/macOS 上会落到同一个本地文件——后写的那个静默覆盖先写的那个。
@@ -665,7 +693,7 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 		if (!stat) {
 			ctx.store.markDeleted(path);
 			ctx.store.clearPendingDelete(path);
-			return "skipped";
+			return skip(note, "delete-of-untracked-file");
 		}
 		const localData = await adapter.readBinary(path);
 		const localHash = await sha256Hex(localData);
@@ -694,7 +722,7 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 	// 服务器该内容本设备已知（例如自己刚推送的变更）→ 只推进 revision
 	if (tracked && change.hash && change.hash === tracked.serverHash) {
 		ctx.store.update(path, { revision: change.revision, serverPseudonym: serverPath });
-		return "skipped";
+		return skip(note, "content-already-known");
 	}
 
 	let localHash: string | null = null;
@@ -715,7 +743,7 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 			size: stat?.size ?? localData!.byteLength,
 			serverPseudonym: serverPath,
 		});
-		return "skipped";
+		return skip(note, "local-content-already-identical");
 	}
 
 	const localChanged = stat !== null && (!tracked || localHash !== tracked.hash);
@@ -726,7 +754,7 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 		try {
 			dl = await downloadPlain(ctx, path, serverPath);
 		} catch (e) {
-			if (e instanceof NotFoundError) return "skipped"; // 已被后续 change 删除
+			if (e instanceof NotFoundError) return skip(note, "deleted-by-later-change");
 			throw e;
 		}
 		// 本地 CAS（v9 TOCTOU 修复）：下载是网络等待，期间用户可能恰好编辑了
@@ -752,7 +780,7 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 		// 重新读取现场，落入下方「双方都改」的合并/兜底流程
 		ctx.log(`pull: local changed during download of ${path}, rerouting to merge`);
 		const curStat = await adapter.stat(path);
-		if (!curStat) return "skipped"; // 下载期间被删除：交给扫描的 delete 流程
+		if (!curStat) return skip(note, "removed-locally-during-download");
 		localData = await adapter.readBinary(path);
 	}
 

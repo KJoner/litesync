@@ -1,12 +1,12 @@
 {
   "name": "litesync",
-  "version": "0.13.3",
+  "version": "0.14.0-rc.1",
   "description": "Sync your vault with your own self-hosted LiteSync server.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "test": "esbuild tests/unit.test.ts tests/merge.test.ts tests/crypto.test.ts tests/device-trust.test.ts tests/store.test.ts tests/trash.test.ts tests/bootstrap.test.ts tests/smart-merge.test.ts tests/lse3-guard.test.ts tests/meta.test.ts tests/v121.test.ts tests/v6.test.ts tests/v131.test.ts tests/v131b.test.ts tests/v132.test.ts tests/v132b.test.ts tests/v132c.test.ts tests/crashpoint.test.ts tests/adversarial.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./tests/mocks/obsidian.ts --outdir=.test-build && node --test .test-build/unit.test.js .test-build/merge.test.js .test-build/crypto.test.js .test-build/device-trust.test.js .test-build/store.test.js .test-build/trash.test.js .test-build/bootstrap.test.js .test-build/smart-merge.test.js .test-build/lse3-guard.test.js .test-build/meta.test.js .test-build/v121.test.js .test-build/v6.test.js .test-build/v131.test.js .test-build/v131b.test.js .test-build/v132.test.js .test-build/v132b.test.js .test-build/v132c.test.js .test-build/crashpoint.test.js .test-build/adversarial.test.js",
+    "test": "esbuild tests/unit.test.ts tests/merge.test.ts tests/crypto.test.ts tests/device-trust.test.ts tests/store.test.ts tests/trash.test.ts tests/bootstrap.test.ts tests/smart-merge.test.ts tests/lse3-guard.test.ts tests/meta.test.ts tests/v121.test.ts tests/v6.test.ts tests/v131.test.ts tests/v131b.test.ts tests/v132.test.ts tests/v132b.test.ts tests/v132c.test.ts tests/crashpoint.test.ts tests/adversarial.test.ts tests/crossplatform.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./tests/mocks/obsidian.ts --outdir=.test-build && node --test .test-build/unit.test.js .test-build/merge.test.js .test-build/crypto.test.js .test-build/device-trust.test.js .test-build/store.test.js .test-build/trash.test.js .test-build/bootstrap.test.js .test-build/smart-merge.test.js .test-build/lse3-guard.test.js .test-build/meta.test.js .test-build/v121.test.js .test-build/v6.test.js .test-build/v131.test.js .test-build/v131b.test.js .test-build/v132.test.js .test-build/v132b.test.js .test-build/v132c.test.js .test-build/crashpoint.test.js .test-build/adversarial.test.js .test-build/crossplatform.test.js",
     "test:mobile": "node scripts/check-mobile.mjs && npm run build && npm test",
     "lint": "eslint ."
   },
