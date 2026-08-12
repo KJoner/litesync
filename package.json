@@ -8,7 +8,9 @@
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "test": "node scripts/run-tests.mjs",
     "test:mobile": "node scripts/check-mobile.mjs && npm run build && npm test",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "check:adr": "node scripts/check-adr.mjs",
+    "check:inv": "node scripts/check-inv.mjs"
   },
   "keywords": [
     "obsidian",

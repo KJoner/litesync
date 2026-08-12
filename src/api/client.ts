@@ -53,6 +53,19 @@ export interface ServerInfo {
  */
 export const PLUGIN_PROTOCOL_VERSION = 6;
 
+/**
+ * 本插件的版本号，随每个请求上报（v0.17 / 计划书 §15 第 3 步）。
+ *
+ * §15 的第 3 步是「检查设备列表，无旧客户端」——它是**不可逆迁移的前置条件**：
+ * 只要还有一台旧客户端连着，它就会用 LSE1 覆盖 LSE3 的 HEAD（ADR-006 威胁 T-2），
+ * 或者读不懂伪名寻址。
+ *
+ * 在此之前服务器根本无从知道每台设备跑的是哪个版本，这一步没法执行。
+ * 协议版本号（6）粒度太粗：同一个协议版本下的两个插件版本，
+ * 修没修某个已知 bug 是不一样的。
+ */
+export const PLUGIN_VERSION = "0.17.0";
+
 /** 协议不兼容时返回给用户的提示；兼容返回 null。 */
 export function protocolError(info: ServerInfo): string | null {
 	const server = info.protocolVersion ?? 1;
@@ -337,6 +350,9 @@ export class ApiClient {
 			// 逐请求协议与世代校验（协议 v6 / ADR-006 §2.2、计划书 §5.3）：
 			// 服务器逐请求比对，不匹配即拒绝写入——绝不让本设备用过时的判断改数据
 			"X-LiteSync-Protocol": String(PLUGIN_PROTOCOL_VERSION),
+			// 客户端版本（§15 第 3 步）：让「所有设备都升级了吗」成为一个可查的事实，
+			// 而不是一句只能靠人挨个问的口头确认
+			"X-Client-Version": PLUGIN_VERSION,
 			...(formatEpoch > 0 ? { "X-Format-Epoch": String(formatEpoch) } : {}),
 			...(repoEpoch ? { "X-Repo-Epoch": repoEpoch } : {}),
 			...(keyEpoch > 0 ? { "X-Key-Epoch": String(keyEpoch) } : {}),
