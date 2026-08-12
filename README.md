@@ -105,6 +105,61 @@ is ever silently overwritten, and nothing is ever permanently deleted.
 - The server component is a separate open-source project:
   <https://github.com/KJoner/litesync-server>
 
+## Known limitations & remaining threats
+
+Being explicit about what LiteSync does **not** protect against is part of the
+design. The list below is accurate as of v0.14.0-rc.1.
+
+### What a malicious or compromised server can still do
+
+End-to-end encryption means the server cannot **read** your notes. It does not
+mean the server is trusted with everything else. Today the client detects and
+hard-fails on the attacks it can anchor locally:
+
+| Attack | Detected? | How |
+|---|---|---|
+| Return someone else's content as your file | ✅ | fileId must match the object we asked for |
+| Replay an older version of a file | ✅ | contentGeneration must not go backwards |
+| Replay older metadata (e.g. undo a rename) | ✅ | authenticated metaGeneration must not go backwards |
+| Serve two different metadata at the same generation | ✅ | metadata fingerprint mismatch = fork, sync stops |
+| Downgrade the encryption envelope | ✅ | repository-wide envelope floor, envelopes only move up |
+| Feed a path-traversal filename via crafted metadata | ✅ | decrypted paths are validated before touching disk |
+| Roll the repository back to an old backup | ✅ | repoEpoch change forces an explicit recovery merge |
+| **Withhold a file you have never seen** | ❌ | there is no local anchor for something you never had |
+| **Show device A one repository state and device B another** | ❌ | requires the signed manifest planned for v0.15 |
+
+The last two rows are the honest gap. Until signed manifests ship, **do not**
+assume LiteSync can prove that what the server showed you is the complete and
+current repository. It can prove that nothing you have already seen was
+tampered with or rolled back.
+
+### Path and filename encryption is still RC
+
+Disabled by default. The migration is resumable and keeps deletion barriers
+intact, but the final erasure step is irreversible and any backup taken before
+the migration still contains plaintext paths. Do not enable it on a vault that
+has no copy.
+
+### Platform limitations
+
+- On platforms that cannot guarantee an atomic file replace (some mobile
+  configurations), overwriting an existing file automatically degrades to
+  keeping both versions rather than risking a half-written file.
+- `Note.md` and `note.md` are treated as **the same file** regardless of which
+  operating system you are on. This is deliberate: judging by the local
+  platform would make a Linux device and a macOS device disagree about whether
+  two names collide, and they would then overwrite each other.
+- Network drives and cloud-sync folders (Dropbox, OneDrive, iCloud Drive) are
+  **not supported** as vault locations. Two synchronizers writing the same
+  files will corrupt each other's state.
+
+### Scale
+
+Officially supported and tested limits are documented in the
+[server README](https://github.com/KJoner/litesync-server#正式支持规模):
+20 000 files per vault, 100 MB per file, 90 days offline. Beyond those numbers
+things are not broken by design — they are simply untested.
+
 ## Manual installation
 
 Until LiteSync is available in Community Plugins:
