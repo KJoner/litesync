@@ -99,6 +99,7 @@ function managerCtx(store: StateStore, info: ServerInfo) {
 		refreshE2ee: async () => {},
 		syncObsidian: () => false,
 		padsSize: () => false,
+		reportedMtime: (ms: number) => ms,
 		ignores: () => false,
 		deviceName: () => "test-device",
 		log: () => {},
@@ -155,6 +156,7 @@ test("v6: 绑定材料缺失时拒绝上传，绝不回退到更弱的信封（I
 	const ctx = {
 		store,
 		padsSize: () => false,
+		reportedMtime: (ms: number) => ms,
 		queue: new PendingQueue(),
 		e2ee: keyring,
 		client: {

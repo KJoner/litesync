@@ -468,7 +468,18 @@ export async function uploadFromPlain(
 		}
 	}
 	const cipherHash = await sha256Hex(payload);
-	const res = await ctx.client.upload(serverPath, baseRevision, cipherHash, payload, mtime, action, sendFileId, meta);
+	// 时间混淆（§11.2）：出网的这一刻才量化。mtime 是**永久存储**的精确时间戳，
+	// 比请求时间更值得担心——请求日志会轮转，数据库不会。
+	const res = await ctx.client.upload(
+		serverPath,
+		baseRevision,
+		cipherHash,
+		payload,
+		ctx.reportedMtime(mtime),
+		action,
+		sendFileId,
+		meta,
+	);
 	// 服务器回报的身份必须合法；E2EE 下还必须与本地用于加密的 fileId 完全一致，
 	// 否则这份密文将来会因 AAD 不符而无法解密（LS-121-C03）
 	const confirmed = optionalFileId(res.fileId, `upload(${path}).fileId`) ?? sendFileId;

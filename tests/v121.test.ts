@@ -324,6 +324,7 @@ function managerCtx(store: StateStore, server: FakeServer, creds: { serverUrl: s
 		refreshE2ee: async () => {},
 		syncObsidian: () => false,
 		padsSize: () => false,
+		reportedMtime: (ms: number) => ms,
 		ignores: () => false,
 		deviceName: () => "test-device",
 		log: () => {},

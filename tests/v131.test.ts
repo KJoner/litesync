@@ -101,6 +101,7 @@ test("§5.1: bootstrap 期间的上传写 LSE3 而不是回退信封", async () 
 	const ctx = {
 		store,
 		padsSize: () => false,
+		reportedMtime: (ms: number) => ms,
 		queue: new PendingQueue(),
 		e2ee: keyring,
 		client: {
@@ -158,6 +159,7 @@ function managerCtx(store: StateStore, infoRef: { value: ServerInfo }) {
 		refreshE2ee: async () => {},
 		syncObsidian: () => false,
 		padsSize: () => false,
+		reportedMtime: (ms: number) => ms,
 		ignores: () => false,
 		deviceName: () => "test-device",
 		log: () => {},

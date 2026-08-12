@@ -1,6 +1,11 @@
 import { App, Notice, Platform, PluginSettingTab, SettingDefinitionItem } from "obsidian";
 import { isLoopbackUrl } from "./api/client";
 import type PrivateSyncPlugin from "./main";
+import {
+	DEFAULT_BATCH_SECONDS,
+	DEFAULT_MTIME_GRANULARITY_SECONDS,
+	timingDisclosure,
+} from "./utils/timing";
 
 export interface PluginSettings {
 	serverUrl: string;
@@ -48,6 +53,18 @@ export interface PluginSettings {
 	 * 而全库填充的成本会让人干脆把整个功能关掉。
 	 */
 	padPathPrefixes: string;
+	/**
+	 * 时间混淆（v0.17 / 计划书 §11.2）：把上传对齐到窗口网格并加抖动，
+	 * 同时量化上报的文件修改时间。
+	 *
+	 * 默认关闭。开启后同步会被推迟最多一个窗口——这不是「稍微慢一点」：
+	 * 跨设备可见延迟与冲突窗口都会随之变长。
+	 */
+	obfuscateTiming: boolean;
+	/** 批处理窗口（秒）。低于 30 秒起不到混淆作用，只是白白延迟。 */
+	timingBatchSeconds: number;
+	/** 上报 mtime 的量化粒度（秒）；0 表示不量化。 */
+	mtimeGranularitySeconds: number;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -65,6 +82,9 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	allowIrreversibleMetaErase: false,
 	padObjectSizes: false,
 	padPathPrefixes: "",
+	obfuscateTiming: false,
+	timingBatchSeconds: DEFAULT_BATCH_SECONDS,
+	mtimeGranularitySeconds: DEFAULT_MTIME_GRANULARITY_SECONDS,
 };
 
 /**
@@ -288,6 +308,26 @@ export class SyncSettingTab extends PluginSettingTab {
 							frag.appendText("· 仓库内去重不受影响（填充在密文内部，同样的内容仍得到同样的密文）。");
 						}),
 						control: { type: "toggle", key: "padObjectSizes" },
+					},
+					{
+						name: "混淆同步时机",
+						desc: createFragment((frag) => {
+							frag.appendText(
+								"把上传对齐到时间窗口并加随机抖动，服务器只能判断编辑发生在哪个窗口里，" +
+									"而不是精确到秒。请求节奏本身就是一份打字记录：作息、时区、" +
+									"工作日与假期、此刻是否醒着，都能从中推断。",
+							);
+							frag.createEl("br");
+							frag.appendText(
+								timingDisclosure(
+									plugin.settings.timingBatchSeconds,
+									plugin.settings.mtimeGranularitySeconds,
+								),
+							);
+							frag.createEl("br");
+							frag.appendText("·「立即同步」命令不受影响，用户显式要求的动作不会被推迟。");
+						}),
+						control: { type: "toggle", key: "obfuscateTiming" },
 					},
 					{
 						name: "只填充这些路径（每行一个前缀）",

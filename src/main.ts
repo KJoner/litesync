@@ -26,6 +26,7 @@ import { LocalCommitter } from "./sync/local-commit";
 import { PendingQueue } from "./sync/queue";
 import { SyncManager, SyncStatus } from "./sync/sync-manager";
 import { IgnoreMatcher } from "./utils/ignore";
+import { nextFlushDelay, quantizeMtime } from "./utils/timing";
 import { VaultKeyDoc } from "./crypto/crypto";
 
 /** vault key 的密钥材料是否发生变化（换库 / 轮换；影响绑定指纹）。 */
@@ -254,6 +255,7 @@ export default class PrivateSyncPlugin extends Plugin {
 			gate: this.gate,
 			syncObsidian: () => this.effectiveSyncObsidian(),
 			padsSize: (path) => this.padsSize(path),
+			reportedMtime: (ms) => this.reportedMtime(ms),
 			ignores: (path) => this.ignoreMatcher?.ignores(path) ?? false,
 			deviceName: () =>
 				this.settings.deviceName || `device-${(this.store?.state.deviceId ?? "").slice(0, 8)}`,
@@ -694,11 +696,37 @@ export default class PrivateSyncPlugin extends Plugin {
 
 	private scheduleDebounced(): void {
 		if (!this.settings.autoSync || !this.isConfigured()) return;
+		// 时间混淆（§11.2）：对齐到窗口网格再加抖动，让上传时刻与编辑时刻脱钩。
+		//
+		// 已经排上队的发车点**不重置**——每来一次编辑就往后推的话，
+		// 发车时刻会紧跟「最后一次编辑」，混淆就白做了。这与普通防抖相反：
+		// 防抖要的是「等你停下来」，这里要的恰恰是「和你停没停无关」。
+		if (this.settings.obfuscateTiming) {
+			if (this.debounceTimer !== null) return;
+			const delay = nextFlushDelay(Date.now(), this.settings.timingBatchSeconds);
+			this.debounceTimer = window.setTimeout(() => {
+				this.debounceTimer = null;
+				void this.manager?.sync("change");
+			}, delay);
+			return;
+		}
 		if (this.debounceTimer !== null) window.clearTimeout(this.debounceTimer);
 		this.debounceTimer = window.setTimeout(() => {
 			this.debounceTimer = null;
 			void this.manager?.sync("change");
 		}, DEBOUNCE_MS);
+	}
+
+	/**
+	 * 上报给服务器的 mtime（§11.2）。
+	 *
+	 * 文件修改时间是**永久存储**的精确时间戳，比请求时间更值得担心——
+	 * 请求日志会轮转，数据库不会。本地状态里仍然保存真实 mtime，
+	 * 量化只发生在出网的那一刻。
+	 */
+	reportedMtime(mtimeMs: number): number {
+		if (!this.settings.obfuscateTiming) return mtimeMs;
+		return quantizeMtime(mtimeMs, this.settings.mtimeGranularitySeconds);
 	}
 
 	private updateStatus(status: SyncStatus, detail?: string): void {

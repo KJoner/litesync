@@ -28,6 +28,14 @@ export interface SyncContext {
 	 * 而那些开关的变更时机与同步轮次并不同步。
 	 */
 	padsSize(path: string): boolean;
+	/**
+	 * 上报给服务器的 mtime（v0.17 / 计划书 §11.2）。
+	 *
+	 * 本地状态里保存的始终是真实 mtime；量化只发生在出网的那一刻。
+	 * 反过来做（本地也存量化值）会让每次扫描都认为文件变了，
+	 * 白白重算一遍哈希。
+	 */
+	reportedMtime(mtimeMs: number): number;
 	deviceName(): string;
 	/** 插件自己的目录（staging / recovery / swap 都放这里，永不参与同步） */
 	pluginDir(): string;

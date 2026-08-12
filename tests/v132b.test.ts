@@ -83,6 +83,7 @@ test("§6.5: 新文件的 fileId 在首次上传前就被预留并落盘", async
 	const ctx = {
 		store,
 		padsSize: () => false,
+		reportedMtime: (ms: number) => ms,
 		queue,
 		e2ee: await unlockedKeyring(),
 		gate: new SyncGate(),
@@ -144,6 +145,7 @@ test("§6.7: 服务器换掉 fileId → 硬失败、不写本地、不改 tracke
 	const ctx = {
 		store,
 		padsSize: () => false,
+		reportedMtime: (ms: number) => ms,
 		queue: new PendingQueue(),
 		gate,
 		e2ee: new Keyring(),
@@ -176,6 +178,7 @@ test("§6.7: 合法的 delete + 重建不会被误判（tracked 已清空，无�
 	const ctx = {
 		store,
 		padsSize: () => false,
+		reportedMtime: (ms: number) => ms,
 		queue: new PendingQueue(),
 		gate: new SyncGate(),
 		e2ee: new Keyring(),

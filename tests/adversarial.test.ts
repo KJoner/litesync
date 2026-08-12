@@ -380,6 +380,7 @@ test("§8.6-2 前置: formatEpoch 回退 → 停机等人工确认，绝不自�
 		refreshE2ee: async () => {},
 		syncObsidian: () => false,
 		padsSize: () => false,
+		reportedMtime: (ms: number) => ms,
 		ignores: () => false,
 		deviceName: () => "test",
 		pluginDir: () => PLUGIN_DIR,
