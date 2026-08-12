@@ -68,9 +68,11 @@ jobs:
 
       # 与 Android 用**同一份**探针：横向比较才有意义。
       # realfs.test.ts 依赖 Node，Android 上没有；这个 sh 探针两边都能跑
-      - name: FS probe（与 Android 同一份脚本）
+      - name: FS probe（与 Android 同一份脚本与判据）
         shell: bash
-        run: sh scripts/fs-probe.sh "${RUNNER_TEMP}/fsprobe"
+        run: |
+          sh scripts/fs-probe.sh "${RUNNER_TEMP}/fsprobe" | tee fs-probe.txt
+          sh scripts/check-fs-probe.sh fs-probe.txt "${{ matrix.os }}"
 
       # 文档约束（§14 的八个部分、§2 的 INV 标注）——只在一个平台上跑就够，
       # 它们与操作系统无关
@@ -123,18 +125,7 @@ jobs:
             echo "===== Android /sdcard 文件系统语义 ====="
             adb shell 'FS_PROBE_WAIT=180 sh /data/local/tmp/fs-probe.sh /sdcard/litesync-probe' | tee android-fs.txt
             adb shell 'rm -rf /sdcard/litesync-probe'
-
-            # 硬断言：最危险的那条必须被答上来。探针没跑完、或任何一项返回
-            # unwritable，都等于这一格没测——而"没测"绝不能表现为"通过"
-            grep -q '^PROBE_OK=1' android-fs.txt || { echo '探针未跑完'; exit 1; }
-            if grep -q 'unwritable' android-fs.txt; then
-              echo '有检查项因不可写而未完成，这一格不算通过：'
-              grep 'unwritable' android-fs.txt
-              exit 1
-            fi
-            grep -qE '^CASE_INSENSITIVE=(yes|no)$' android-fs.txt || { echo '大小写敏感性未测出'; exit 1; }
-            echo '--- Android /sdcard 取证完成 ---'
-            cat android-fs.txt
+            sh scripts/check-fs-probe.sh android-fs.txt android-emulator
 
       - uses: actions/upload-artifact@v4
         if: always()
