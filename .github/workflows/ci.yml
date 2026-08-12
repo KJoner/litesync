@@ -1,0 +1,75 @@
+# 跨平台实机矩阵（计划书 §8.4、§8.8 门槛 3）。
+#
+# tests/realfs.test.ts 在**真实文件系统**上验证我们的路径规则是否正确预言了
+# 这台机器的实际行为——大小写、Unicode 归一、尾随点与空格、保留名、超长组件、
+# rename 语义。它自报运行平台，因此在不同 runner 上跑就是在不同平台上取证。
+#
+# 为什么这件事必须放进 CI：
+#
+# §8.4 要求覆盖 Windows / macOS / Linux。开发机只有一台，于是 macOS 那一格
+# 长期记着「需要硬件」——而 GitHub 一直提供 macos-latest runner，用的正是
+# **默认大小写不敏感的 APFS**，恰好是我们最需要取证的那个配置。
+#
+# 把它当成「需要买台 Mac」是个判断错误。真正买不到的只有移动端：
+# Obsidian Mobile 没法在 runner 里跑，那一格靠插件内的「平台兼容性自检」命令
+# 由用户在真机上执行。
+name: CI
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一个平台失败不掩盖其他平台的结果：跨平台矩阵的价值就在于看到差异
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      # 记录这台 runner 的文件系统到底是什么——同为 "macos-latest"，
+      # 换一代镜像可能换文件系统，而结论会跟着变
+      - name: Record filesystem
+        shell: bash
+        run: |
+          echo "OS: ${{ matrix.os }}"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            diskutil info / | grep -Ei "file system personality|name \(user visible\)" || true
+          elif [ "${{ runner.os }}" = "Linux" ]; then
+            df -T . | tail -1
+          else
+            fsutil.exe fsinfo volumeinfo C: 2>/dev/null | head -5 || true
+          fi
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      # §8.4 的实机取证在这里发生。realfs.test.ts 会打印出本机的实际行为，
+      # 因此这一步的日志本身就是门槛 3 的证据
+      - name: Test (含 §8.4 真实文件系统矩阵)
+        run: npm test
+
+      # 文档约束（§14 的八个部分、§2 的 INV 标注）——只在一个平台上跑就够，
+      # 它们与操作系统无关
+      - name: Doc invariants
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          npm run check:adr
+          npm run check:inv
