@@ -93,6 +93,16 @@ jobs:
   android-fs:
     name: android-emulator (/sdcard)
     runs-on: ubuntu-latest
+    # 不作为门禁：模拟器本身会抖（adb 掉线、/sdcard 挂载时机不定），
+    # 五次运行里失败过三次，而每次失败都不是代码问题。
+    #
+    # 更重要的是：这一格现在有**真机**证据了（0.17.0-rc.1 的自检报告），
+    # 而真机与模拟器在关键项上并不一致——模拟器的 /sdcard 会归一 Unicode，
+    # 真机不会。用一个会说谎的替身去 gate 一个已有真身的结论，是本末倒置。
+    #
+    # 保留它的价值在于：它是免费的回归信号，跑通时能提前发现「Android 的
+    # 文件系统语义变了」。跑不通时不该拦住任何人。
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
