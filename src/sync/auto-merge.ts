@@ -78,7 +78,7 @@ export async function attemptAutoMerge(
 
 			const result = smartThreeWayMerge({ base: baseText, local: localText, remote: remoteText });
 			if (!result.clean) {
-				ctx.store.setConflict(path, {
+				ctx.store.recordConflict(path, {
 					baseRevision: tracked.revision,
 					remoteRevision: remote.revision,
 					createdAt: Date.now(),

@@ -5,6 +5,7 @@ import { PendingOp } from "../sync/queue";
 import { sha256Hex } from "../utils/hash";
 import { encodeUtf8 } from "../utils/text";
 import { isFileId, isGeneration } from "../utils/validate";
+import { platformCollisionKey } from "../utils/vault-path";
 
 /**
  * 每个已同步文件的本地状态缓存。
@@ -28,6 +29,13 @@ export interface FileState {
 	/** 元数据世代（v9.3 三期，meta 模式）：改名 = 世代 +1 */
 	metaGeneration?: number;
 	/**
+	 * 该 metaGeneration 对应元数据的认证摘要（v0.13.2 / §6.8）。
+	 *
+	 * 没有它就无法区分「同一份元数据又收到一次」（幂等重复，正常）和
+	 * 「同一个世代上出现了两份不同的元数据」（分叉，必须硬失败）。
+	 */
+	metaFingerprint?: string;
+	/**
 	 * 服务器可见路径（v0.12.1）：meta 模式下为伪名（=fileId），明文模式为空。
 	 * 显式记录后，任何请求都不需要再从真实路径「猜」服务器路径。
 	 */
@@ -43,7 +51,35 @@ export interface FileState {
  * metaGeneration 丢失 → 改名 CAS 永远失败。
  * 因此所有「更新已有文件」的写入都必须走 {@link StateStore.update}。
  */
-export const FILE_IDENTITY_FIELDS = ["fileId", "generation", "metaGeneration", "serverPseudonym"] as const;
+export const FILE_IDENTITY_FIELDS = [
+	"fileId",
+	"generation",
+	"metaGeneration",
+	"metaFingerprint",
+	"serverPseudonym",
+] as const;
+
+/** 内容相关字段（v0.13.2 §6.11）：只描述「这份内容是什么」，不含对象身份。 */
+export type ContentPatch = Partial<Pick<FileState, "hash" | "serverHash" | "revision" | "mtime" | "size">>;
+
+/** 对象身份字段（v0.13.2 §6.11）：只由服务器的响应决定，业务代码不得自行编造。 */
+export type RemoteIdentity = Partial<
+	Pick<FileState, "fileId" | "generation" | "metaGeneration" | "metaFingerprint" | "serverPseudonym">
+>;
+
+/**
+ * 某个路径此刻处于哪一种状态（v0.13.2 §6.11 的类型层区分）。
+ *
+ * 有了它，业务代码就不需要「先 get，再 getConflict，再查 blocked，再查
+ * pendingDelete」——漏查任何一项都会让流程对着错误的前提做决定。
+ */
+export type ObjectView =
+	| { kind: "untracked"; path: string }
+	| { kind: "tracked"; path: string; state: FileState }
+	| { kind: "conflict"; path: string; state?: FileState; conflict: PendingConflict }
+	| { kind: "blocked"; path: string; state?: FileState; blocked: BlockedChange }
+	| { kind: "pending-delete"; path: string }
+	| { kind: "bootstrap-pending"; path: string; state?: FileState };
 
 /** 未解决冲突的登记信息（计划书 Phase 15：Pending Conflict）。 */
 export interface PendingConflict {
@@ -60,10 +96,50 @@ export interface ShareRecord {
 	expiresAt: number;
 }
 
-/** 被本地条件阻塞、必须持续重试的远端变更（v9：skipped 不再静默 ACK）。 */
+/**
+ * 被本地条件阻塞、必须持续重试的远端变更（v9：skipped 不再静默 ACK；
+ * v0.13.2 / §6.4 起保存**完整的远端变更身份**）。
+ *
+ * 只记 `{path, reason}` 是不够的：重试时就只能拿真实路径去「合成」一条
+ * upsert——那条合成变更的 revision/hash/metaGeneration 全是编造的，会让
+ * 冲突判定和改名判定同时失真。这里把原始变更的全部字段留下来，重试时
+ * 原样重放，重新走 resolveMetaChange → 路径校验 → 提交。
+ */
 export interface BlockedChange {
+	/** 该变更在服务器 changes 流中的序号（重放时原样使用） */
+	sequence: number;
+	action: "upsert" | "delete" | "rename";
+	fileId?: string;
+	/** meta 模式下的服务器寻址名（重试时用它请求服务器，绝不用真实路径） */
+	serverPseudonym?: string;
+	revision?: number;
+	contentHash?: string;
+	contentGeneration?: number;
+	metaGeneration?: number;
+	/** 解密并通过安全校验后的本地路径；路径校验失败时为空串 */
+	realPath: string;
+	renameFrom?: string;
+	renameTo?: string;
 	reason: string;
+	retryCount: number;
+	operationId: string;
 	at: number;
+}
+
+/**
+ * 一次进行到一半的名字互换（v0.13.2 / §6.9）。
+ *
+ * A ↔ B 的互换必须借道临时名，而临时文件放在插件目录里——用户看不见。
+ * 崩溃时如果没有这条记录，那份内容就静静地留在插件目录里等于丢失。
+ * 因此意图先落盘、再动文件系统。
+ */
+export interface PendingSwap {
+	/** 临时文件路径（插件目录下的 swap 命名空间） */
+	tempPath: string;
+	/** 临时文件里装的是哪个对象 */
+	fileId: string;
+	/** 它最终应该落到哪个真实路径 */
+	targetPath: string;
 }
 
 /**
@@ -101,6 +177,8 @@ export interface PersistedState {
 	pendingOps: Record<string, PendingOp>;
 	/** 被阻塞的远端变更（v9）：如远端文件与本地文件夹同名；每轮同步重试 */
 	blockedChanges: Record<string, BlockedChange>;
+	/** 进行到一半的名字互换（v0.13.2 §6.9）：键为临时路径 */
+	pendingSwaps: Record<string, PendingSwap>;
 	/**
 	 * 已确认的绑定指纹（v0.12.1）：null = 尚未绑定（unbound），
 	 * 任何写操作在重新完成权威校验之前都被 gate 拦截
@@ -125,17 +203,34 @@ function emptyState(): PersistedState {
 		bootstrap: { ...PENDING_BOOTSTRAP },
 		pendingOps: {},
 		blockedChanges: {},
+		pendingSwaps: {},
 		binding: null,
 		recovery: null,
 	};
 }
 
-/** A/B 副本信封：generation 单调递增 + payload 校验和。 */
+/**
+ * A/B 副本信封：generation 单调递增 + payload 校验和 + 写入所有权标记。
+ *
+ * owner 是每次写入的随机 token（v0.13.2 / §6.2）：读回时必须是我们刚写的那个。
+ * 只比 generation 无法区分「我写成功了」和「另一个实例恰好写了同样的 generation」。
+ * 旧版本（v0.12.x）写出的信封没有这个字段，读取时按 "" 处理，不影响升级。
+ */
 interface StateEnvelope {
 	schemaVersion: 2;
 	generation: number;
 	checksum: string;
+	owner?: string;
 	payload: PersistedState;
+}
+
+/** 每次写入的随机所有权标记。 */
+function newOwnershipToken(): string {
+	const raw = new Uint8Array(8);
+	crypto.getRandomValues(raw);
+	let out = "";
+	for (const b of raw) out += b.toString(16).padStart(2, "0");
+	return out;
 }
 
 /**
@@ -159,6 +254,15 @@ export class StateStore {
 	private activeSlot: "a" | "b" | null = null;
 	private generation = 0;
 
+	/**
+	 * 保存串行化（v0.13.2 / §6.2）：任意时刻只有一个保存过程在跑。
+	 * dirtyGeneration 每次 save() 递增，savedGeneration 记录已落盘到哪一版——
+	 * 两者相等即「盘上的状态就是内存里的状态」。
+	 */
+	private saveChain: Promise<void> = Promise.resolve();
+	private dirtyGeneration = 0;
+	private savedGeneration = 0;
+
 	constructor(
 		private adapter: DataAdapter,
 		private path: string,
@@ -176,6 +280,7 @@ export class StateStore {
 			if (env.schemaVersion !== 2 || typeof env.generation !== "number" || !env.payload) return null;
 			const expect = await sha256Hex(encodeUtf8(JSON.stringify(env.payload)));
 			if (env.checksum !== expect) return null;
+			if (env.owner === undefined) env.owner = ""; // v0.12.x 写出的旧信封
 			return env;
 		} catch {
 			return null;
@@ -231,31 +336,78 @@ export class StateStore {
 	}
 
 	/**
-	 * 保存状态：写非活动副本 → 读回校验 → 切换活动槽。
-	 * corrupted 停机状态下拒绝写入（同步已被阻断，不允许覆盖现场）。
+	 * 保存状态（v0.13.2 / 计划书 §6.2：串行化）。
+	 *
+	 * 之前每次 `save()` 都直接开写。同步流程里有大量并发的 `await store.save()`
+	 * （pull/push/迁移各自都会存），两次保存可以交错成：
+	 *
+	 *   A 序列化了旧快照 → B 序列化了新快照 → B 写盘 → A 写盘（覆盖了 B）
+	 *
+	 * 于是**较早的状态覆盖了较新的状态**，重启后 lastSequence 回退、
+	 * 刚建立的身份字段消失。这里改成单条 promise 链：任意时刻只有一个保存过程，
+	 * 并且每次保存都在链上重新序列化当前 state——排队期间产生的新变更一定被带上。
 	 */
 	async save(): Promise<void> {
 		if (this.corrupted) {
 			console.error("[litesync] refusing to save over corrupt state");
 			return;
 		}
+		this.dirtyGeneration++;
+		// 链上排队：前一次保存失败也不能中断后续保存（否则状态永远停在旧版本）
+		const chained = this.saveChain.then(
+			() => this.persistOnce(),
+			() => this.persistOnce(),
+		);
+		this.saveChain = chained.catch(() => {});
+		return chained;
+	}
+
+	/**
+	 * 实际落盘一次：写非活动副本 → 读回校验（generation + checksum + ownership
+	 * token 三项都要对）→ 切换活动槽。
+	 *
+	 * ownership token 是本次写入的随机标记：读回时它必须是我们刚写的那一个。
+	 * 只比对 generation 无法区分「我写成功了」与「另一个进程/另一份插件实例
+	 * 恰好写了同样的 generation」——那种情况下两边会互相覆盖而谁都不报错。
+	 */
+	private async persistOnce(): Promise<void> {
+		if (this.corrupted) return;
 		const target: "a" | "b" = this.activeSlot === "a" ? "b" : "a";
+		// 在链上序列化：排队期间新增的变更一定包含在内（后写的不会被先写的盖掉）
+		const snapshotGeneration = this.dirtyGeneration;
 		const payloadJson = JSON.stringify(this.state);
 		const env: StateEnvelope = {
 			schemaVersion: 2,
 			generation: this.generation + 1,
 			checksum: await sha256Hex(encodeUtf8(payloadJson)),
+			owner: newOwnershipToken(),
 			payload: JSON.parse(payloadJson) as PersistedState,
 		};
 		const p = this.slotPath(target);
 		await this.adapter.write(p, JSON.stringify(env));
-		// 读回校验：写坏（磁盘满/中断）时保留另一份完好副本并报错
+
+		// 读回校验：写坏（磁盘满/中断）或被别人覆盖时保留另一份完好副本并报错
 		const check = await this.readEnvelope(target);
 		if (check === null || check.generation !== env.generation) {
 			throw new Error(`state replica write verification failed (${p})`);
 		}
+		if (check.checksum !== env.checksum) {
+			throw new Error(`state replica checksum mismatch after write-back (${p})`);
+		}
+		if (check.owner !== env.owner) {
+			throw new Error(
+				`state replica was overwritten by another writer (${p})；` +
+					`请确认没有第二个 Obsidian 实例打开同一个 Vault`,
+			);
+		}
 		this.generation = env.generation;
 		this.activeSlot = target;
+		this.savedGeneration = snapshotGeneration;
+	}
+
+	/** 是否还有尚未落盘的变更（测试与关闭流程用）。 */
+	get hasUnsavedChanges(): boolean {
+		return this.dirtyGeneration > this.savedGeneration;
 	}
 
 	get(path: string): FileState | undefined {
@@ -265,9 +417,92 @@ export class StateStore {
 	/**
 	 * 全量替换某路径的状态（仅用于「这是一个全新对象」的场景）。
 	 * 更新已有对象请一律使用 {@link update}——否则会丢身份字段（LS-121-C04）。
+	 *
+	 * v0.13.2 §6.11：同步业务代码**禁止**直接调用本方法（ESLint 规则强制），
+	 * 请改用下方的具名转换 {@link replaceWithNewObject} 等。
 	 */
 	set(path: string, fs: FileState): void {
 		this.state.files[path] = fs;
+	}
+
+	// ---------- §6.11 强类型 FileState 转换 ----------
+	//
+	// 业务代码只应通过这几个具名转换修改 FileState。每个转换对应一个真实发生的
+	// 事件，读代码时能直接看出「这里发生了什么」，而不是看到一个 patch 对象后
+	// 还要反推它有没有漏字段。
+
+	/**
+	 * 内容更新：只改内容相关字段，身份字段一律沿用。
+	 * 用于「同一个对象的内容变了」——本地保存、下载远端新版本、合并结果落地。
+	 */
+	patchContentState(path: string, patch: ContentPatch): FileState {
+		return this.update(path, patch);
+	}
+
+	/**
+	 * 采纳服务器返回的对象身份（上传/下载成功后）。
+	 *
+	 * 身份字段只允许经这里进入 FileState。注意它**不改内容字段**：
+	 * 「服务器确认了身份」和「本地内容变了」是两件事，混在一起写最容易出错。
+	 */
+	applyRemoteIdentity(path: string, id: RemoteIdentity): FileState {
+		return this.update(path, id);
+	}
+
+	/**
+	 * 元数据改名落地：状态整体搬到新路径，身份不变，metaGeneration 前进。
+	 * fileId / contentGeneration 绝不在改名时变化（INV-05）。
+	 */
+	applyMetaRenameState(from: string, to: string, id: RemoteIdentity & ContentPatch): void {
+		this.rename(from, to, id);
+	}
+
+	/**
+	 * 建立一个全新对象的状态（本地新建、或首次见到的远端对象）。
+	 * 这是唯一允许**从零构造** FileState 的入口。
+	 */
+	replaceWithNewObject(path: string, fs: FileState): void {
+		this.set(path, fs);
+	}
+
+	/**
+	 * 不再跟踪该路径（本地或远端删除已完成）。
+	 *
+	 * 注意：服务器侧的 tombstone 由服务器维护（ADR-002），本地这里只是
+	 * 「这台设备不再持有该对象的状态」。
+	 */
+	markDeleted(path: string): void {
+		delete this.state.files[path];
+	}
+
+	/** 删除后重建：走服务器的 restore 语义，身份与 revision 连续（INV-06）。 */
+	restoreObject(path: string, fs: FileState): void {
+		this.set(path, fs);
+	}
+
+	/** 登记未解决冲突。 */
+	recordConflict(path: string, c: PendingConflict): void {
+		this.setConflict(path, c);
+	}
+
+	/**
+	 * 某路径此刻的状态视图（§6.11 要求的类型层区分）。
+	 *
+	 * 一个路径可能同时挂着 tracked 状态、冲突登记、blocked 记录、待手动删除标记，
+	 * 各处业务代码各查各的很容易漏掉一种。这里按**优先级**给出唯一答案：
+	 * 冲突 > 阻塞 > 待手动删除 > 已跟踪 > 未跟踪。
+	 */
+	viewOf(path: string): ObjectView {
+		const state = this.state.files[path];
+		const conflict = this.state.conflicts[path];
+		if (conflict !== undefined) return { kind: "conflict", path, state, conflict };
+		const blockedKey = state?.fileId ?? path;
+		const blocked = this.state.blockedChanges[blockedKey] ?? this.state.blockedChanges[path];
+		if (blocked !== undefined) return { kind: "blocked", path, state, blocked };
+		if (this.state.pendingDeletes[path] !== undefined) return { kind: "pending-delete", path };
+		if (this.state.bootstrap.status === "pending") return { kind: "bootstrap-pending", path, state };
+		if (state !== undefined) return { kind: "tracked", path, state };
+		return { kind: "untracked", path };
 	}
 
 	/**
@@ -289,6 +524,7 @@ export class StateStore {
 			...(prev?.fileId !== undefined ? { fileId: prev.fileId } : {}),
 			...(prev?.generation !== undefined ? { generation: prev.generation } : {}),
 			...(prev?.metaGeneration !== undefined ? { metaGeneration: prev.metaGeneration } : {}),
+			...(prev?.metaFingerprint !== undefined ? { metaFingerprint: prev.metaFingerprint } : {}),
 			...(prev?.serverPseudonym !== undefined ? { serverPseudonym: prev.serverPseudonym } : {}),
 		};
 		for (const [k, v] of Object.entries(patch)) {
@@ -323,6 +559,28 @@ export class StateStore {
 	pathByFileId(fileId: string): string | undefined {
 		for (const [path, fs] of Object.entries(this.state.files)) {
 			if (fs.fileId === fileId) return path;
+		}
+		return undefined;
+	}
+
+	/**
+	 * 跨平台碰撞检查（v0.13.2 / §6.12）。
+	 *
+	 * 返回一条已跟踪的、与 `path` 不同但在某个受支持平台上会映射到同一个文件的路径
+	 * （大小写折叠、NFC/NFD、尾随点与空格、Windows 保留名）。
+	 *
+	 * `exceptFileId` 是「这次要落地的那个对象」自己的身份：同一个对象改大小写
+	 * 不算碰撞，别的对象撞上来才算。
+	 *
+	 * 用途：Windows/macOS 上把两个只差大小写的远端文件写到本地，会让后写的那个
+	 * 静默覆盖先写的那个——必须在写之前拦住，而不是事后发现内容丢了。
+	 */
+	collidingPath(path: string, exceptFileId?: string): string | undefined {
+		const key = platformCollisionKey(path);
+		for (const [p, fs] of Object.entries(this.state.files)) {
+			if (p === path) continue;
+			if (exceptFileId !== undefined && fs.fileId === exceptFileId) continue;
+			if (platformCollisionKey(p) === key) return p;
 		}
 		return undefined;
 	}
@@ -442,18 +700,54 @@ export class StateStore {
 		this.state.binding = null;
 	}
 
-	// ---------- 被阻塞的远端变更（v9） ----------
+	// ---------- 被阻塞的远端变更（v9；v0.13.2 §6.4 完整记录） ----------
 
-	setBlockedChange(path: string, reason: string): void {
-		this.state.blockedChanges[path] = { reason, at: Date.now() };
+	/**
+	 * 登记/更新一条被阻塞的远端变更，返回它的键。
+	 *
+	 * 键优先取 fileId：同一个对象改名后真实路径会变，用路径当键会在改名后
+	 * 留下一条永远不会被清除的孤儿记录。
+	 *
+	 * 重复登记同一条时累加 retryCount 并保留原 operationId——它是这次「重放」
+	 * 的幂等键，重试必须沿用。
+	 */
+	setBlockedChange(rec: Omit<BlockedChange, "retryCount" | "at" | "operationId">): string {
+		const key = rec.fileId ?? rec.realPath;
+		const prev = this.state.blockedChanges[key];
+		this.state.blockedChanges[key] = {
+			...rec,
+			retryCount: (prev?.retryCount ?? 0) + 1,
+			operationId: prev?.operationId ?? newOwnershipToken() + newOwnershipToken(),
+			at: Date.now(),
+		};
+		return key;
 	}
 
-	clearBlockedChange(path: string): void {
-		delete this.state.blockedChanges[path];
+	getBlockedChange(key: string): BlockedChange | undefined {
+		return this.state.blockedChanges[key];
 	}
 
-	blockedChangePaths(): string[] {
-		return Object.keys(this.state.blockedChanges);
+	clearBlockedChange(key: string): void {
+		delete this.state.blockedChanges[key];
+	}
+
+	/** 当前所有被阻塞的变更（键 + 记录）。 */
+	blockedChanges(): Array<[string, BlockedChange]> {
+		return Object.entries(this.state.blockedChanges);
+	}
+
+	// ---------- 名字互换的中断恢复（v0.13.2 §6.9） ----------
+
+	setPendingSwap(swap: PendingSwap): void {
+		this.state.pendingSwaps[swap.tempPath] = { ...swap };
+	}
+
+	clearPendingSwap(tempPath: string): void {
+		delete this.state.pendingSwaps[tempPath];
+	}
+
+	pendingSwaps(): PendingSwap[] {
+		return Object.values(this.state.pendingSwaps);
 	}
 }
 
@@ -470,7 +764,8 @@ function normalizeState(raw: Partial<PersistedState>): PersistedState {
 		bootstrap:
 			raw.bootstrap && typeof raw.bootstrap === "object" ? raw.bootstrap : { ...PENDING_BOOTSTRAP },
 		pendingOps: normalizePendingOps(raw.pendingOps),
-		blockedChanges: raw.blockedChanges && typeof raw.blockedChanges === "object" ? raw.blockedChanges : {},
+		blockedChanges: normalizeBlockedChanges(raw.blockedChanges),
+		pendingSwaps: normalizePendingSwaps(raw.pendingSwaps),
 		binding: normalizeBinding(raw.binding),
 		recovery: raw.recovery && typeof raw.recovery === "object" ? raw.recovery : null,
 	};
@@ -548,6 +843,56 @@ function normalizeBinding(raw: unknown): BindingFingerprint | null {
 		return null;
 	}
 	return { serverUrl: b.serverUrl, tokenDigest: b.tokenDigest, deviceId: b.deviceId, vaultKeyDigest: b.vaultKeyDigest };
+}
+
+/**
+ * blockedChanges 规整（v0.13.2 §6.4）：v9~v0.13.1 的记录只有 `{reason, at}` 且以
+ * 真实路径为键。升级时把它们补成完整记录——缺的身份字段留空，
+ * 第一次重试会重新解析（宁可多做一次解析，也不凭空编造 revision/hash）。
+ */
+function normalizeBlockedChanges(raw: unknown): Record<string, BlockedChange> {
+	if (!raw || typeof raw !== "object") return {};
+	const out: Record<string, BlockedChange> = {};
+	for (const [key, v] of Object.entries(raw as Record<string, unknown>)) {
+		if (!v || typeof v !== "object") continue;
+		const b = v as Partial<BlockedChange>;
+		const action = b.action === "delete" || b.action === "rename" ? b.action : "upsert";
+		out[key] = {
+			sequence: typeof b.sequence === "number" ? b.sequence : 0,
+			action,
+			realPath: typeof b.realPath === "string" ? b.realPath : key,
+			reason: typeof b.reason === "string" ? b.reason : "（升级前登记，原因未记录）",
+			retryCount: typeof b.retryCount === "number" ? b.retryCount : 0,
+			operationId: typeof b.operationId === "string" ? b.operationId : "",
+			at: typeof b.at === "number" ? b.at : Date.now(),
+			...definedOnly({
+				fileId: b.fileId,
+				serverPseudonym: b.serverPseudonym,
+				revision: b.revision,
+				contentHash: b.contentHash,
+				contentGeneration: b.contentGeneration,
+				metaGeneration: b.metaGeneration,
+				renameFrom: b.renameFrom,
+				renameTo: b.renameTo,
+			}),
+		};
+	}
+	return out;
+}
+
+/** pendingSwaps 规整：字段不全的记录一律丢弃（宁可不做，也不能搬错文件）。 */
+function normalizePendingSwaps(raw: unknown): Record<string, PendingSwap> {
+	if (!raw || typeof raw !== "object") return {};
+	const out: Record<string, PendingSwap> = {};
+	for (const [key, v] of Object.entries(raw as Record<string, unknown>)) {
+		if (!v || typeof v !== "object") continue;
+		const s = v as Partial<PendingSwap>;
+		if (typeof s.tempPath !== "string" || typeof s.fileId !== "string" || typeof s.targetPath !== "string") {
+			continue;
+		}
+		out[key] = { tempPath: s.tempPath, fileId: s.fileId, targetPath: s.targetPath };
+	}
+	return out;
 }
 
 /** pendingOps 规整：兼容 v9.2 之前的字符串形式（"upsert"/"delete"）。 */

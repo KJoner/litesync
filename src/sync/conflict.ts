@@ -1,9 +1,8 @@
 import { NotFoundError } from "../api/client";
 import { conflictPathFor } from "../utils/conflict-name";
 import { sha256Hex } from "../utils/hash";
-import { ensureParentFolder } from "../utils/path";
 import { SyncContext } from "./context";
-import { downloadPlain, MetaPathUnresolvedError } from "./transfer";
+import { downloadPlain, MetaPathUnresolvedError, writeIfLocalUnchanged } from "./transfer";
 
 /**
  * 冲突处理核心：保留两个版本，绝不丢弃任何一份内容。
@@ -25,8 +24,11 @@ export async function keepBothVersions(
 		conflictPath = conflictPathFor(path, ctx.deviceName(), new Date());
 	}
 
-	await ensureParentFolder(adapter, conflictPath);
-	await adapter.writeBinary(conflictPath, localData);
+	// §6.1：冲突副本是一份**新文件**，前置条件「本地不存在」——
+	// 万一同名副本已存在，宁可失败也不覆盖（上面的循环已尽力挑唯一名字）
+	if (!(await writeIfLocalUnchanged(ctx, conflictPath, localData, null))) {
+		throw new Error(`无法创建冲突副本（目标已存在）：${conflictPath}`);
+	}
 
 	let dl;
 	try {
@@ -41,7 +43,18 @@ export async function keepBothVersions(
 			// meta 模式下还不知道该文件的服务器伪名（LS-121-C05）：
 			// 绝不用真实路径去请求服务器，也绝不动本地内容——登记 blocked 后重试
 			await adapter.remove(conflictPath);
-			ctx.store.setBlockedChange(path, "元数据加密仓库中尚未解析出该文件的服务器伪名");
+			const tracked = ctx.store.get(path);
+			ctx.store.setBlockedChange({
+				sequence: ctx.store.state.lastSequence,
+				action: "upsert",
+				fileId: tracked?.fileId,
+				revision: tracked?.revision,
+				contentHash: tracked?.serverHash,
+				contentGeneration: tracked?.generation,
+				metaGeneration: tracked?.metaGeneration,
+				realPath: path,
+				reason: "元数据加密仓库中尚未解析出该文件的服务器伪名",
+			});
 			ctx.notify(`已暂缓处理冲突（尚未解析出服务器伪名）：${path}\n本地内容未被修改，下轮同步会自动重试`);
 			return null;
 		}
@@ -53,10 +66,7 @@ export async function keepBothVersions(
 	// 保留用户当前内容（旧内容已在冲突副本中）；tracked 不更新，
 	// 后续扫描会把当前内容按普通冲突流程继续处理
 	const localHash = await sha256Hex(localData);
-	const stat0 = await adapter.stat(path);
-	const currentHash = stat0 ? await sha256Hex(await adapter.readBinary(path)) : null;
-	if (currentHash === localHash) {
-		await adapter.writeBinary(path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
+	if (await writeIfLocalUnchanged(ctx, path, dl.plain, localHash, dl.mtime)) {
 		const stat = await adapter.stat(path);
 		ctx.store.update(path, {
 			hash: dl.plainHash,
@@ -73,7 +83,7 @@ export async function keepBothVersions(
 	}
 
 	// 冲突副本作为新文件推送到服务器，让其他设备也能看到
-	ctx.queue.add(conflictPath, "upsert");
+	ctx.queue.stage(conflictPath, { action: "upsert" });
 	ctx.notify(`同步冲突: ${path}\n本地版本已保存为 ${conflictPath}`);
 	return conflictPath;
 }

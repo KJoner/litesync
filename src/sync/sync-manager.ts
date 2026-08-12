@@ -4,7 +4,7 @@ import { BindingFingerprint, computeBinding } from "../state/store";
 import { isKeyEpoch } from "../utils/validate";
 import { SyncContext, SyncCounters } from "./context";
 import { syncGateBlock } from "./gate";
-import { pullRemoteChanges } from "./pull";
+import { pullRemoteChanges, recoverInterruptedSwaps } from "./pull";
 import { pushPendingChanges, scanLocalChanges } from "./push";
 
 export type SyncStatus = "idle" | "syncing" | "synced" | "conflict" | "offline" | "locked";
@@ -188,6 +188,9 @@ export class SyncManager {
 			}
 
 			this.applyingRemote = true;
+			// §6.9：上一轮的名字互换可能停在临时名上（进程被杀 / 应用被系统回收）。
+			// 那份内容此刻只存在于插件目录里，用户看不见——先把它放回去再做别的
+			await recoverInterruptedSwaps(this.ctx);
 			const pull1 = await pullRemoteChanges(this.ctx);
 			this.applyingRemote = false;
 

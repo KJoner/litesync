@@ -153,6 +153,7 @@ test("v6: 绑定材料缺失时拒绝上传，绝不回退到更弱的信封（I
 	const uploaded: string[] = [];
 	const ctx = {
 		store,
+		queue: new PendingQueue(),
 		e2ee: keyring,
 		client: {
 			upload: async (p: string) => {

@@ -149,7 +149,7 @@ async function migratePath(
 		raw = await ctx.client.download(path);
 	} catch (e) {
 		if (e instanceof NotFoundError) {
-			ctx.store.delete(path); // 同步后又被删除，跳过
+			ctx.store.markDeleted(path); // 同步后又被删除，跳过
 			return;
 		}
 		throw e;

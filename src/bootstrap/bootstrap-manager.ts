@@ -8,12 +8,11 @@
  */
 import { ConflictError, ServerInfo, SnapshotFile } from "../api/client";
 import { sha256Hex } from "../utils/hash";
-import { ensureParentFolder } from "../utils/path";
 import { keepBothVersions } from "../sync/conflict";
 import { SyncContext } from "../sync/context";
 import { resolveSnapshotPaths, trashLocal } from "../sync/pull";
 import { isStaleResurrection } from "../sync/push";
-import { downloadPlain, uploadFromPlain } from "../sync/transfer";
+import { downloadPlain, uploadFromPlain, writeIfLocalUnchanged } from "../sync/transfer";
 
 export interface PreflightResult {
 	info: ServerInfo;
@@ -151,13 +150,39 @@ export async function bootstrapRemoteWins(
 			// 保留原文件并登记 blocked，普通同步的冲突流程接手（本地新内容不会丢）
 			if (!(await trashLocal(ctx.app, f.path))) {
 				blocked++;
-				ctx.store.setBlockedChange(f.path, "bootstrap remote-wins：回收站不可用，未覆盖本地内容");
+				ctx.store.setBlockedChange({
+				sequence: f.revision,
+				action: "upsert",
+				fileId: f.fileId,
+				serverPseudonym: serverPseudonymOf(f),
+				revision: f.revision,
+				contentHash: f.hash,
+				metaGeneration: f.metaGeneration,
+				realPath: f.path,
+				reason: "bootstrap remote-wins：回收站不可用，未覆盖本地内容",
+			});
 				ctx.notify(`无法移入回收站，已保留本地内容（未被远端覆盖）：${f.path}`);
 				continue;
 			}
 		}
-		await ensureParentFolder(adapter, f.path);
-		await adapter.writeBinary(f.path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
+		// §6.1：remote-wins 也必须走统一提交器。此刻本地文件已进回收站（或本来就不存在），
+		// 因此前置条件是「本地不存在」——若在这个空隙里又出现了文件，绝不覆盖
+		if (!(await writeIfLocalUnchanged(ctx, f.path, dl.plain, null, dl.mtime))) {
+			blocked++;
+			ctx.store.setBlockedChange({
+				sequence: f.revision,
+				action: "upsert",
+				fileId: f.fileId,
+				serverPseudonym: serverPseudonymOf(f),
+				revision: f.revision,
+				contentHash: f.hash,
+				metaGeneration: f.metaGeneration,
+				realPath: f.path,
+				reason: "bootstrap remote-wins：写入前本地又出现了文件，未覆盖",
+			});
+			ctx.notify(`已保留本地新出现的文件（未被远端覆盖）：${f.path}`);
+			continue;
+		}
 		const st = await adapter.stat(f.path);
 		ctx.store.update(f.path, {
 			hash: dl.plainHash,
@@ -177,9 +202,9 @@ export async function bootstrapRemoteWins(
 		if (remoteSet.has(path)) continue;
 		onProgress({ done: ++done, total, current: path });
 		if (await trashLocal(ctx.app, path)) {
-			ctx.store.delete(path);
+			ctx.store.markDeleted(path);
 		} else {
-			ctx.store.delete(path);
+			ctx.store.markDeleted(path);
 			ctx.store.setPendingDelete(path);
 			ctx.notify(`无法移入回收站，已保留本地文件（不会重新上传）：${path}\n请手动删除`);
 		}
@@ -221,8 +246,9 @@ export async function bootstrapMerge(
 		const stat = await adapter.stat(f.path);
 		if (!stat) {
 			const dl = await downloadPlain(ctx, f.path, serverPseudonymOf(f));
-			await ensureParentFolder(adapter, f.path);
-			await adapter.writeBinary(f.path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
+			// §6.1：本地此刻不存在该文件才写（下载期间用户新建了同名文件 → 不覆盖，
+			// 留给下一轮普通同步按冲突处理）
+			if (!(await writeIfLocalUnchanged(ctx, f.path, dl.plain, null, dl.mtime))) continue;
 			const st = await adapter.stat(f.path);
 			ctx.store.update(f.path, {
 				hash: dl.plainHash,
@@ -258,7 +284,7 @@ export async function bootstrapMerge(
 		// 双方都有但内容不同：首次接入没有共同祖先（Base）
 		if (isMarkdownLike(f.path)) {
 			// 交给 Resolver（无 Base 时按“本地 vs 远端”整体对比）；期间该文件冻结同步
-			ctx.store.setConflict(f.path, { baseRevision: 0, remoteRevision: dl.revision, createdAt: Date.now() });
+			ctx.store.recordConflict(f.path, { baseRevision: 0, remoteRevision: dl.revision, createdAt: Date.now() });
 			ctx.onConflictsChanged();
 			result.conflicts++;
 		} else {

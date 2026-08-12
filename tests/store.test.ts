@@ -177,7 +177,19 @@ test("StateStore: pendingOps / blockedChanges 持久化（v9）", async () => {
 	const store = new StateStore(adapter, "state.json");
 	await store.load();
 	store.state.pendingOps = { "a.md": { action: "upsert" }, "n.md": { action: "move", from: "o.md" } };
-	store.setBlockedChange("dir.md", "远端文件与本地文件夹同名");
+	// v0.13.2 §6.4：完整记录，键取 fileId（改名后仍指向同一个对象）
+	const key = store.setBlockedChange({
+		sequence: 41,
+		action: "upsert",
+		fileId: "a".repeat(32),
+		serverPseudonym: "a".repeat(32),
+		revision: 7,
+		contentHash: "c".repeat(64),
+		metaGeneration: 3,
+		realPath: "dir.md",
+		reason: "远端文件与本地文件夹同名",
+	});
+	assert.equal(key, "a".repeat(32));
 	await store.save();
 
 	const store2 = new StateStore(adapter, "state.json");
@@ -186,7 +198,54 @@ test("StateStore: pendingOps / blockedChanges 持久化（v9）", async () => {
 		"a.md": { action: "upsert" },
 		"n.md": { action: "move", from: "o.md" },
 	});
-	assert.deepEqual(store2.blockedChangePaths(), ["dir.md"]);
-	store2.clearBlockedChange("dir.md");
-	assert.deepEqual(store2.blockedChangePaths(), []);
+	const rec = store2.getBlockedChange(key);
+	// 重试要能原样重放这条变更 → 全部字段必须活过一次落盘/加载
+	assert.equal(rec?.sequence, 41);
+	assert.equal(rec?.action, "upsert");
+	assert.equal(rec?.serverPseudonym, "a".repeat(32));
+	assert.equal(rec?.revision, 7);
+	assert.equal(rec?.contentHash, "c".repeat(64));
+	assert.equal(rec?.metaGeneration, 3);
+	assert.equal(rec?.realPath, "dir.md");
+	assert.equal(rec?.retryCount, 1);
+	assert.ok((rec?.operationId ?? "").length > 0);
+
+	// 再次登记同一条：retryCount 自增，operationId（重放幂等键）保持不变
+	store2.setBlockedChange({ sequence: 41, action: "upsert", fileId: "a".repeat(32), realPath: "dir.md", reason: "x" });
+	assert.equal(store2.getBlockedChange(key)?.retryCount, 2);
+	assert.equal(store2.getBlockedChange(key)?.operationId, rec?.operationId);
+
+	store2.clearBlockedChange(key);
+	assert.deepEqual(store2.blockedChanges(), []);
+});
+
+test("StateStore: 旧版 blockedChanges 升级为完整记录（v0.13.2 §6.4）", async () => {
+	const adapter = memAdapter();
+	// v9~v0.13.1 的盘上形态：以真实路径为键，只有 {reason, at}
+	await adapter.write(
+		"state.json.a",
+		JSON.stringify({
+			schemaVersion: 2,
+			generation: 1,
+			checksum: "",
+			payload: { blockedChanges: { "dir.md": { reason: "远端文件与本地文件夹同名", at: 123 } } },
+		}),
+	);
+	const store = new StateStore(adapter, "state.json");
+	await store.load();
+	// 校验和不匹配 → 该副本无效，落到空状态（不能把损坏数据当合法输入）
+	assert.deepEqual(store.blockedChanges(), []);
+
+	// 直接走规整路径验证升级语义
+	const store2 = new StateStore(adapter, "state.json");
+	await store2.load();
+	store2.state.blockedChanges = { "dir.md": { reason: "旧记录", at: 123 } as never };
+	await store2.save();
+	const store3 = new StateStore(adapter, "state.json");
+	await store3.load();
+	const rec = store3.getBlockedChange("dir.md");
+	assert.equal(rec?.realPath, "dir.md", "缺 realPath 时用键补齐");
+	assert.equal(rec?.action, "upsert");
+	assert.equal(rec?.sequence, 0);
+	assert.equal(rec?.retryCount, 0);
 });

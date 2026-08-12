@@ -101,14 +101,14 @@ test("conflictPathFor: 同一秒两次生成不同名（P1-18 碰撞防护）", 
 	assert.ok(seen.size > 1, "随机后缀必须使同秒副本名可区分");
 });
 
-test("PendingQueue: generation 防 lost wake-up（v9 P1-10）", () => {
+test("PendingQueue: generation 防 lost wake-up（v9 P1-10）", async () => {
 	const q = new PendingQueue();
-	q.add("note.md", "upsert");
+	await q.add("note.md", "upsert");
 	const [[path, op, gen]] = q.entries();
 	assert.equal(path, "note.md");
 	assert.equal(op.action, "upsert");
 	// 上传期间用户又编辑 → 重新入队拿到新 generation
-	q.add("note.md", "upsert");
+	await q.add("note.md", "upsert");
 	// 旧上传完成回调用旧 gen 移除 → 必须无效
 	q.remove("note.md", gen);
 	assert.equal(q.size, 1, "新入队的条目不能被旧 generation 移除");
@@ -118,20 +118,23 @@ test("PendingQueue: generation 防 lost wake-up（v9 P1-10）", () => {
 	assert.equal(q.size, 0);
 });
 
-test("PendingQueue: 持久化镜像与恢复（v9；v9.3 结构化 + 旧格式兼容）", () => {
+test("PendingQueue: 持久化镜像与恢复（v9；v9.3 结构化 + 旧格式兼容）", async () => {
 	const q = new PendingQueue();
 	let mirror: Record<string, PendingOp> = {};
 	q.onChange = (e) => {
 		mirror = e;
 	};
-	q.add("a.md", "upsert");
-	q.add("b.md", "delete");
-	q.addMove("new.md", "old.md");
-	assert.deepEqual(mirror, {
-		"a.md": { action: "upsert" },
-		"b.md": { action: "delete" },
-		"new.md": { action: "move", from: "old.md" },
-	});
+	await q.add("a.md", "upsert");
+	await q.add("b.md", "delete");
+	await q.addMove("new.md", "old.md");
+	assert.deepEqual(Object.keys(mirror).sort(), ["a.md", "b.md", "new.md"]);
+	assert.equal(mirror["a.md"].action, "upsert");
+	assert.equal(mirror["b.md"].action, "delete");
+	assert.equal(mirror["new.md"].action, "move");
+	assert.equal(mirror["new.md"].from, "old.md");
+	// v0.13.2 §6.3：每条操作都带幂等键与状态，重试时原样沿用
+	assert.match(mirror["a.md"].operationId ?? "", /^[0-9a-f]{24}$/);
+	assert.equal(mirror["a.md"].status, "queued");
 	q.remove("a.md");
 	assert.equal(mirror["a.md"], undefined);
 
@@ -140,27 +143,63 @@ test("PendingQueue: 持久化镜像与恢复（v9；v9.3 结构化 + 旧格式�
 	q2.restore({
 		"b.md": "delete",
 		"c.md": { action: "upsert" },
-		"new.md": { action: "move", from: "old.md" },
+		"new.md": { action: "move", from: "old.md", operationId: "aabbccddeeff001122334455" },
 	});
 	assert.equal(q2.size, 3);
-	assert.deepEqual(q2.getOp("b.md"), { action: "delete" });
-	assert.deepEqual(q2.getOp("new.md"), { action: "move", from: "old.md" });
+	assert.equal(q2.getOp("b.md")?.action, "delete");
+	assert.equal(q2.getOp("new.md")?.from, "old.md");
+	// 重启后必须沿用盘上的 operationId——这正是「响应丢失后重试不产生第二个对象」的依据
+	assert.equal(q2.getOp("new.md")?.operationId, "aabbccddeeff001122334455");
+	// 旧格式没有 operationId → 补一个，避免重试时缺幂等键
+	assert.match(q2.getOp("b.md")?.operationId ?? "", /^[0-9a-f]{24}$/);
 });
 
-test("PendingQueue: move 条目被后续 upsert 覆盖（退化为 delete+upsert 的入口）", () => {
+test("PendingQueue: 入队先落盘、失败即回滚（v0.13.2 §6.3）", async () => {
 	const q = new PendingQueue();
-	q.addMove("new.md", "old.md");
+	let fail = false;
+	const saved: number[] = [];
+	q.persist = async () => {
+		if (fail) throw new Error("disk full");
+		saved.push(q.size);
+	};
+	await q.add("a.md", "upsert");
+	assert.deepEqual(saved, [1], "add() 必须在返回前完成一次落盘");
+
+	// 落盘失败 → 该操作不能被当作已接受，队列里不能留下假象
+	fail = true;
+	await assert.rejects(() => q.add("b.md", "upsert"), /disk full/);
+	assert.equal(q.size, 1);
+	assert.equal(q.getOp("b.md"), undefined);
+
+	// stage() 不落盘（同一轮内处理的批量路径），由调用方统一保存
+	fail = false;
+	q.stage("c.md", { action: "upsert" });
+	assert.equal(saved.length, 1);
+	assert.equal(q.size, 2);
+});
+
+test("PendingQueue: move 条目被后续 upsert 覆盖（退化为 delete+upsert 的入口）", async () => {
+	const q = new PendingQueue();
+	await q.addMove("new.md", "old.md");
 	assert.equal(q.getOp("new.md")?.action, "move");
+	const moveId = q.getOp("new.md")?.operationId;
+	q.rememberIdentity("new.md", { fileId: "f".repeat(32) });
 	// 改名后立即编辑：modify 事件的 upsert 覆盖 move（旧路径由扫描兜底补 delete）
-	q.add("new.md", "upsert");
-	assert.deepEqual(q.getOp("new.md"), { action: "upsert" });
+	await q.add("new.md", "upsert");
+	const op = q.getOp("new.md");
+	assert.equal(op?.action, "upsert");
+	assert.equal(op?.from, undefined);
+	// 换了动作就是另一个逻辑操作：幂等键必须换新，否则服务器会返回 move 的缓存结果
+	assert.notEqual(op?.operationId, moveId);
+	// 但对象身份与动作无关，必须保留
+	assert.equal(op?.fileId, "f".repeat(32));
 });
 
-test("PendingQueue: 按路径去重，后到动作覆盖", () => {
+test("PendingQueue: 按路径去重，后到动作覆盖", async () => {
 	const q = new PendingQueue();
-	q.add("a.md", "upsert");
-	q.add("a.md", "delete");
-	q.add("b.md", "upsert");
+	await q.add("a.md", "upsert");
+	await q.add("a.md", "delete");
+	await q.add("b.md", "upsert");
 	assert.equal(q.size, 2);
 	const entries = q.toRecord();
 	assert.equal(entries["a.md"].action, "delete");

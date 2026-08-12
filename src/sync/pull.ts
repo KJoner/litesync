@@ -1,13 +1,21 @@
 import { App, Platform } from "obsidian";
 import { NotFoundError, RemoteChange, SnapshotFile } from "../api/client";
 import { decryptMeta } from "../crypto/crypto";
+import { BlockedChange } from "../state/store";
 import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
 import { requireFileId } from "../utils/validate";
+import { InvalidVaultPathError, validateAndCanonicalizeVaultPath } from "../utils/vault-path";
 import { attemptAutoMerge } from "./auto-merge";
 import { keepBothVersions } from "./conflict";
 import { SyncContext } from "./context";
-import { downloadPlain, metaEncrypted, writeIfLocalUnchanged } from "./transfer";
+import {
+	assertMetaGeneration,
+	downloadPlain,
+	metaEncrypted,
+	metaFingerprintOf,
+	writeIfLocalUnchanged,
+} from "./transfer";
 
 const HEX32 = /^[0-9a-f]{32}$/;
 
@@ -19,7 +27,7 @@ const HEX32 = /^[0-9a-f]{32}$/;
 async function resolveMetaChange(
 	ctx: SyncContext,
 	change: RemoteChange,
-): Promise<{ realPath: string; serverPath: string } | "skip" | null> {
+): Promise<{ realPath: string; serverPath: string } | "skip" | "blocked" | null> {
 	const pseudonym = requireFileId(change.path, `change@${change.sequence}.path`);
 	const known = ctx.store.pathByFileId(pseudonym);
 	if (known !== undefined) return { realPath: known, serverPath: pseudonym };
@@ -38,14 +46,176 @@ async function resolveMetaChange(
 	const keys = await ctx.e2ee.metaKeys();
 	const dec = await decryptMeta(keys, meta.metaEnc, bind.remoteVaultId ?? "", pseudonym);
 	if (dec === null) throw new Error(`无法解密文件元数据（${pseudonym}）：密钥不匹配或数据被篡改，已停止同步`);
-	return { realPath: dec.meta.path, serverPath: pseudonym };
+	// §6.12：解密 ≠ 可信。路径要用来写文件系统，先过安全校验
+	const safe = requireSafeRemotePath(ctx, dec.meta.path, {
+		sequence: change.sequence,
+		action: "upsert", // delete 已在上面提前返回
+		fileId: pseudonym,
+		serverPseudonym: pseudonym,
+		revision: change.revision,
+		contentHash: change.hash,
+		metaGeneration: change.metaGeneration ?? dec.metaGeneration,
+	});
+	if (safe === null) return "blocked";
+	return { realPath: safe, serverPath: pseudonym };
+}
+
+/**
+ * 远端路径安全校验（v0.13.2 / §6.12）。
+ *
+ * meta 模式下真实路径来自解密后的元数据：服务器伪造不了，但一台被攻陷或有 bug 的
+ * **旧设备**可以把 `../../.ssh/authorized_keys` 之类的字符串加密进去。所以在拿它
+ * 去 stat / rename / writeBinary 之前必须校验。
+ *
+ * 拒绝时登记 blocked 而不是抛错：一条坏路径不该让整轮同步（以及后面所有正常
+ * 文件）停摆；记录留在状态里，用户可见、可诊断，修好后自动重试。
+ */
+function requireSafeRemotePath(
+	ctx: SyncContext,
+	path: string,
+	rec: Omit<BlockedChange, "retryCount" | "at" | "operationId" | "realPath" | "reason">,
+): string | null {
+	try {
+		return validateAndCanonicalizeVaultPath(path);
+	} catch (e) {
+		if (!(e instanceof InvalidVaultPathError)) throw e;
+		// realPath 留空：这条路径本身就是被拒绝的对象，绝不能被当作有效本地路径使用
+		ctx.store.setBlockedChange({ ...rec, realPath: "", reason: `远端路径不安全：${e.reason}` });
+		ctx.log(`pull: rejected unsafe remote path (${e.reason}, ${e.shape})`);
+		ctx.notify(`已拒绝一条不安全的远端路径（${e.reason}），同步继续；请检查其他设备的版本`);
+		return null;
+	}
+}
+
+/**
+ * 两个文件交换名称的两阶段收敛（v0.13.2 / 计划书 §6.9）。
+ *
+ * 远端把 A 改成 B、把 B 改成 A 时，两条改名各自看到「目标已被占用」，
+ * 于是双双 blocked——而且永远解不开：谁都在等对方先让位。
+ *
+ * 正确做法是引入一个临时名：
+ *
+ *   A → temp  ,  B → A  ,  temp → B
+ *
+ * 临时名放在插件目录的 swap 命名空间里：不与用户文件冲突、不参与同步，
+ * 并且**每一步之前都把意图写进状态并落盘**——中途崩溃时，
+ * {@link recoverInterruptedSwaps} 能把它接着做完。
+ *
+ * 返回 null 表示「这不是一次名字互换」，调用方继续走原来的 blocked 流程。
+ */
+async function tryResolveNameSwap(
+	ctx: SyncContext,
+	realPath: string,
+	newPath: string,
+	pseudonym: string,
+	metaGeneration: number,
+	fingerprint: string,
+): Promise<Outcome | null> {
+	const occupant = ctx.store.get(newPath);
+	const occupantPseudonym = occupant?.serverPseudonym ?? occupant?.fileId;
+	if (!occupant || occupantPseudonym === undefined || occupantPseudonym === pseudonym) return null;
+
+	// 占位者自己的远端目标名是什么？
+	let occupantTarget: string;
+	let occupantMetaGeneration: number;
+	let occupantFingerprint: string;
+	try {
+		const meta = await ctx.client.getFileMeta(occupantPseudonym);
+		const keys = await ctx.e2ee.metaKeys();
+		const vaultId = ctx.store.state.bootstrap.remoteVaultId ?? "";
+		const dec = await decryptMeta(keys, meta.metaEnc, vaultId, occupantPseudonym);
+		if (dec === null) return null;
+		occupantTarget = dec.meta.path;
+		occupantMetaGeneration = dec.metaGeneration;
+		occupantFingerprint = await metaFingerprintOf(meta.metaEnc);
+	} catch {
+		return null; // 拿不到占位者的状态 → 按普通阻塞处理
+	}
+	// 只有真正的互换（占位者要搬到我这里）才用临时名破环。
+	// 占位者要搬去第三个位置时，让它自己那条 change 先做完更简单也更安全
+	if (occupantTarget !== realPath) return null;
+
+	const adapter = ctx.app.vault.adapter;
+	const temp = `${ctx.pluginDir()}/swap/${pseudonym}`;
+
+	// 意图先落盘：崩溃后 recoverInterruptedSwaps 靠这条记录把交换做完
+	ctx.store.setPendingSwap({ tempPath: temp, fileId: pseudonym, targetPath: newPath });
+	await ctx.store.save();
+
+	try {
+		await ensureParentFolder(adapter, temp);
+		await adapter.rename(realPath, temp); // A → temp
+		await ensureParentFolder(adapter, realPath);
+		await adapter.rename(newPath, realPath); // B → A
+		await ensureParentFolder(adapter, newPath);
+		await adapter.rename(temp, newPath); // temp → B
+	} catch (e) {
+		ctx.log(`swap: 交换 ${realPath} ↔ ${newPath} 失败：${String(e)}（临时副本保留在插件目录，下轮自动续做）`);
+		return "blocked";
+	}
+
+	ctx.store.clearPendingSwap(temp);
+	// 两个对象的状态同时换位。不能顺序调用两次 rename——第一次就会把
+	// 对方的状态覆盖掉；先把两份状态取出来，再各自落到新键上。
+	// 身份字段（fileId / contentGeneration）原样带走（INV-05）。
+	const mine = ctx.store.get(realPath)!;
+	const theirs = ctx.store.get(newPath)!;
+	ctx.store.markDeleted(realPath);
+	ctx.store.markDeleted(newPath);
+	ctx.store.replaceWithNewObject(newPath, {
+		...mine,
+		metaGeneration,
+		metaFingerprint: fingerprint,
+		serverPseudonym: pseudonym,
+	});
+	ctx.store.replaceWithNewObject(realPath, {
+		...theirs,
+		metaGeneration: occupantMetaGeneration,
+		metaFingerprint: occupantFingerprint,
+		serverPseudonym: occupantPseudonym,
+	});
+	await ctx.store.save();
+	ctx.log(`pull: swapped ${realPath} <-> ${newPath} via ${temp}`);
+	return "applied";
+}
+
+/**
+ * 续做被中断的名字互换（v0.13.2 / §6.9）。
+ *
+ * 临时文件放在插件目录里，用户看不见也搜索不到——如果崩溃后没人管，
+ * 那份内容就等于丢了。每轮同步开始时先把它放回该去的地方。
+ */
+export async function recoverInterruptedSwaps(ctx: SyncContext): Promise<void> {
+	const adapter = ctx.app.vault.adapter;
+	for (const swap of ctx.store.pendingSwaps()) {
+		if (!(await adapter.stat(swap.tempPath))) {
+			ctx.store.clearPendingSwap(swap.tempPath); // 已经搬完了
+			continue;
+		}
+		// 目标还被占着说明第二步（B → A）没做完；此时把临时文件放回原位更安全
+		const target = (await adapter.stat(swap.targetPath)) ? null : swap.targetPath;
+		if (target === null) {
+			ctx.log(`swap: ${swap.targetPath} 仍被占用，临时副本继续保留（下轮重试）`);
+			continue;
+		}
+		await ensureParentFolder(adapter, target);
+		await adapter.rename(swap.tempPath, target);
+		ctx.store.clearPendingSwap(swap.tempPath);
+		ctx.log(`swap: 已续做中断的交换 → ${target}`);
+	}
+	await ctx.store.save();
 }
 
 /**
  * 元数据改名应用（v9.3 三期）：内容未变、metaGeneration 变新 → 本地 rename。
  * 目标已被占用时登记 blocked（不覆盖任何本地内容）。
  */
-async function applyMetaRename(ctx: SyncContext, realPath: string, pseudonym: string): Promise<Outcome> {
+async function applyMetaRename(
+	ctx: SyncContext,
+	realPath: string,
+	pseudonym: string,
+	sequence: number,
+): Promise<Outcome> {
 	const tracked = ctx.store.get(realPath);
 	if (!tracked) return "skipped";
 	const meta = await ctx.client.getFileMeta(pseudonym);
@@ -53,27 +223,75 @@ async function applyMetaRename(ctx: SyncContext, realPath: string, pseudonym: st
 	const keys = await ctx.e2ee.metaKeys();
 	const dec = await decryptMeta(keys, meta.metaEnc, bind.remoteVaultId ?? "", pseudonym);
 	if (dec === null) throw new Error(`无法解密文件元数据（${pseudonym}）`);
-	const newPath = dec.meta.path;
+	// §6.8：判据取**认证后**的 dec.metaGeneration，不是服务器 Header。
+	// 回退与同世代分叉都在这里硬失败（会顺带停掉该仓库的自动同步）
+	const fingerprint = await metaFingerprintOf(meta.metaEnc);
+	if (assertMetaGeneration(ctx, realPath, dec.metaGeneration, fingerprint) === "idempotent") {
+		return "skipped"; // 同一份元数据又收到一次：什么都不用做
+	}
+	// §6.12：解密出来的路径由「某台设备」写入，不是可信输入——先过安全校验，
+	// 拒绝的路径绝不落到文件系统上
+	const newPath = requireSafeRemotePath(ctx, dec.meta.path, {
+		sequence,
+		action: "rename",
+		fileId: tracked.fileId,
+		serverPseudonym: pseudonym,
+		metaGeneration: dec.metaGeneration,
+		renameFrom: realPath,
+	});
+	if (newPath === null) return "blocked";
 	// 身份字段一律经 store.update/rename 保留（LS-121-C04）：改名不改 fileId、
 	// 不改 contentGeneration，也不改服务器伪名
 	if (newPath === realPath) {
-		ctx.store.update(realPath, { metaGeneration: dec.metaGeneration, serverPseudonym: pseudonym });
+		ctx.store.applyRemoteIdentity(realPath, {
+			metaGeneration: dec.metaGeneration,
+			metaFingerprint: fingerprint,
+			serverPseudonym: pseudonym,
+		});
 		return "skipped";
 	}
 	const adapter = ctx.app.vault.adapter;
 	if (await adapter.stat(newPath)) {
-		ctx.store.setBlockedChange(newPath, `远端改名目标已被本地文件占用（原 ${realPath}）`);
+		// §6.9 两个文件交换名称：目标被占用不一定是死结——占着位子的那个文件
+		// 可能自己也正要搬走。先试着用临时名把环解开
+		const swapped = await tryResolveNameSwap(ctx, realPath, newPath, pseudonym, dec.metaGeneration, fingerprint);
+		if (swapped !== null) return swapped;
+
+		// §6.4：记下完整的改名变更（含 fileId / metaGeneration / 新旧路径），
+		// 重试时原样重放，不再靠真实路径合成一条假的 upsert
+		ctx.store.setBlockedChange({
+			sequence,
+			action: "rename",
+			fileId: tracked.fileId,
+			serverPseudonym: pseudonym,
+			revision: tracked.revision,
+			contentHash: tracked.serverHash,
+			contentGeneration: tracked.generation,
+			metaGeneration: dec.metaGeneration,
+			realPath,
+			renameFrom: realPath,
+			renameTo: newPath,
+			reason: "远端改名目标已被本地文件占用",
+		});
 		ctx.notify(`远端将 ${realPath} 改名为 ${newPath}，但目标已存在本地文件，已暂缓`);
 		return "blocked";
 	}
 	if (!(await adapter.stat(realPath))) {
 		// 本地原文件不在（可能刚被用户移走）：只更新状态键，内容由扫描收敛
-		ctx.store.rename(realPath, newPath, { metaGeneration: dec.metaGeneration, serverPseudonym: pseudonym });
+		ctx.store.applyMetaRenameState(realPath, newPath, {
+			metaGeneration: dec.metaGeneration,
+			metaFingerprint: fingerprint,
+			serverPseudonym: pseudonym,
+		});
 		return "applied";
 	}
 	await ensureParentFolder(adapter, newPath);
 	await adapter.rename(realPath, newPath);
-	ctx.store.rename(realPath, newPath, { metaGeneration: dec.metaGeneration, serverPseudonym: pseudonym });
+	ctx.store.applyMetaRenameState(realPath, newPath, {
+		metaGeneration: dec.metaGeneration,
+		metaFingerprint: fingerprint,
+		serverPseudonym: pseudonym,
+	});
 	ctx.log(`pull: renamed ${realPath} -> ${newPath} (metaGen ${dec.metaGeneration})`);
 	return "applied";
 }
@@ -158,6 +376,12 @@ export async function pullRemoteChanges(ctx: SyncContext): Promise<PullResult> {
 				const outcome = await applyRemoteChange(ctx, change);
 				if (outcome === "applied") result.applied++;
 				if (outcome === "conflict") result.conflicts++;
+				if (outcome === "blocked") {
+					// §6.4：blocked 记录必须先落盘并通过写后验证，才允许推进游标。
+					// 否则这条变更会同时从 changes 流和状态里消失——服务器不会再
+					// 发第二次，本地也没有重试线索，该文件永远补不回来。
+					await ctx.store.save();
+				}
 				ctx.store.state.lastSequence = change.sequence;
 			}
 			if (!resp.hasMore) break;
@@ -174,16 +398,34 @@ export async function pullRemoteChanges(ctx: SyncContext): Promise<PullResult> {
  * 即使服务器不再产生新的 change。
  */
 async function retryBlockedChanges(ctx: SyncContext, result: PullResult): Promise<void> {
-	for (const path of ctx.store.blockedChangePaths()) {
-		const stat = await ctx.app.vault.adapter.stat(path);
-		if (stat?.type === "folder") continue; // 阻塞条件仍在
-		const outcome = await applyRemoteChange(ctx, {
-			sequence: ctx.store.state.lastSequence,
-			path,
-			action: "upsert",
-			revision: 0,
-		});
-		if (outcome !== "blocked") ctx.store.clearBlockedChange(path);
+	for (const [key, rec] of ctx.store.blockedChanges()) {
+		// 阻塞条件仍在（同名文件夹没被移走）→ 不必重试
+		if (rec.realPath !== "" && (await ctx.app.vault.adapter.stat(rec.realPath))?.type === "folder") continue;
+
+		let outcome: Outcome;
+		if (rec.action === "rename" && rec.serverPseudonym && rec.renameFrom) {
+			// 改名重放：重新取元数据、重新校验路径、重新判断目标是否仍被占用
+			outcome = await applyMetaRename(ctx, rec.renameFrom, rec.serverPseudonym, rec.sequence);
+		} else {
+			// §6.4：用记录里的原始字段重放这条变更，**不**用真实路径合成一条假的 upsert。
+			// serverPseudonym 在时以它寻址（meta 模式下服务器只认伪名）。
+			const replayPath = rec.serverPseudonym ?? rec.realPath;
+			if (replayPath === "") {
+				// 路径被判为不安全的记录：没有可用的寻址名 → 只能等对方设备改正
+				continue;
+			}
+			outcome = await applyRemoteChange(ctx, {
+				sequence: rec.sequence,
+				path: replayPath,
+				action: rec.action === "delete" ? "delete" : "upsert",
+				revision: rec.revision ?? 0,
+				...(rec.contentHash !== undefined ? { hash: rec.contentHash } : {}),
+				...(rec.metaGeneration !== undefined ? { metaGeneration: rec.metaGeneration } : {}),
+			});
+		}
+		// blocked 时 applyRemoteChange/applyMetaRename 会重新登记（retryCount 自增），
+		// 这里只负责在不再阻塞时清除
+		if (outcome !== "blocked") ctx.store.clearBlockedChange(key);
 		if (outcome === "applied") result.applied++;
 		if (outcome === "conflict") result.conflicts++;
 	}
@@ -201,7 +443,7 @@ async function resyncFromSnapshot(ctx: SyncContext): Promise<PullResult> {
 	await guardRepoEpoch(ctx, snap.repoEpoch);
 
 	// meta 模式（v9.3 三期）：快照条目是伪名 + 加密元数据 → 先解出真实路径
-	const files = await resolveSnapshotPaths(ctx, snap.files);
+	const files = await resolveSnapshotPaths(ctx, snap.files, snap.sequence);
 	const snapPaths = new Set(files.map((f) => f.path));
 
 	// 已跟踪但快照中不存在 → 远端已删除
@@ -224,7 +466,7 @@ async function resyncFromSnapshot(ctx: SyncContext): Promise<PullResult> {
 		if (f.fileId && f.serverPseudonym) {
 			const existing = ctx.store.pathByFileId(f.fileId);
 			if (existing !== undefined && existing !== f.path) {
-				const outcome = await applyMetaRename(ctx, existing, f.serverPseudonym);
+				const outcome = await applyMetaRename(ctx, existing, f.serverPseudonym, snap.sequence);
 				if (outcome === "applied") result.applied++;
 				if (outcome === "blocked") continue;
 			}
@@ -232,12 +474,13 @@ async function resyncFromSnapshot(ctx: SyncContext): Promise<PullResult> {
 		const tracked = ctx.store.get(f.path);
 		if (tracked && tracked.serverHash === f.hash) {
 			if (tracked.revision !== f.revision || tracked.metaGeneration !== f.metaGeneration) {
-				ctx.store.update(f.path, {
-					revision: f.revision,
+				ctx.store.applyRemoteIdentity(f.path, {
 					metaGeneration: f.metaGeneration,
+					metaFingerprint: f.metaFingerprint,
 					fileId: f.fileId,
 					serverPseudonym: f.serverPseudonym,
 				});
+				ctx.store.patchContentState(f.path, { revision: f.revision });
 			}
 			continue;
 		}
@@ -262,12 +505,15 @@ async function resyncFromSnapshot(ctx: SyncContext): Promise<PullResult> {
 interface ResolvedSnapshotFile extends SnapshotFile {
 	/** meta 模式下的服务器伪名（path 已替换为解密出的真实路径） */
 	serverPseudonym?: string;
+	/** 该份元数据的认证摘要（§6.8：同世代分叉判定的依据） */
+	metaFingerprint?: string;
 }
 
 /** 快照条目的元数据解密（明文模式原样返回）。 */
 export async function resolveSnapshotPaths(
 	ctx: SyncContext,
 	files: SnapshotFile[],
+	sequence = 0,
 ): Promise<ResolvedSnapshotFile[]> {
 	if (!files.some((f) => f.metaEnc)) return files;
 	const vaultId = ctx.store.state.bootstrap.remoteVaultId ?? "";
@@ -282,7 +528,25 @@ export async function resolveSnapshotPaths(
 		if (dec === null) {
 			throw new Error(`无法解密文件元数据（${f.fileId}）：密钥不匹配或数据被篡改，已停止同步`);
 		}
-		out.push({ ...f, path: dec.meta.path, metaGeneration: dec.metaGeneration, serverPseudonym: f.fileId });
+		// §6.12：快照里的路径同样要过安全校验——被拒绝的条目登记 blocked 后跳过，
+		// 不让一条坏路径把整次全量对账拖垮
+		const safe = requireSafeRemotePath(ctx, dec.meta.path, {
+			sequence,
+			action: "upsert",
+			fileId: f.fileId,
+			serverPseudonym: f.fileId,
+			revision: f.revision,
+			contentHash: f.hash,
+			metaGeneration: dec.metaGeneration,
+		});
+		if (safe === null) continue;
+		out.push({
+			...f,
+			path: safe,
+			metaGeneration: dec.metaGeneration,
+			metaFingerprint: await metaFingerprintOf(f.metaEnc),
+			serverPseudonym: f.fileId,
+		});
 	}
 	return out;
 }
@@ -294,6 +558,7 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 	// meta 模式（v9.3 三期）：变更携带伪名，先解析出真实路径
 	if (metaEncrypted(ctx) && HEX32.test(change.path)) {
 		const resolved = await resolveMetaChange(ctx, change);
+		if (resolved === "blocked") return "blocked"; // 路径不安全，记录已登记
 		if (resolved === "skip" || resolved === null) return "skipped";
 		path = resolved.realPath;
 		serverPath = resolved.serverPath;
@@ -307,20 +572,65 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 			change.hash === tracked.serverHash &&
 			(change.metaGeneration ?? 0) > (tracked.metaGeneration ?? 0)
 		) {
-			return applyMetaRename(ctx, path, resolved.serverPath);
+			return applyMetaRename(ctx, path, resolved.serverPath, change.sequence);
 		}
+	} else {
+		// 明文模式：路径直接来自服务器，同样不是可信输入（§6.12）
+		const safe = requireSafeRemotePath(ctx, path, {
+			sequence: change.sequence,
+			action: change.action === "delete" ? "delete" : "upsert",
+			revision: change.revision,
+			contentHash: change.hash,
+			metaGeneration: change.metaGeneration,
+		});
+		if (safe === null) return "blocked";
+		path = safe;
 	}
 
 	if (ctx.ignores(path)) return "skipped";
 	// 文件正在冲突处理中：冻结远端应用，避免来回覆盖；Resolver 解决时会重新取远端 HEAD
 	if (ctx.store.getConflict(path)) return "skipped";
 
+	// §6.12：跨平台碰撞。两个只差大小写（或差在 NFC/NFD、尾随点）的远端对象，
+	// 在 Windows/macOS 上会落到同一个本地文件——后写的那个静默覆盖先写的那个。
+	// 必须在写之前拦住：登记 blocked，两份内容都留在服务器上。
+	// 删除不拦：删除不会造成覆盖，而拦下来反而会让本地留着不该留的文件。
+	if (change.action !== "delete") {
+		const collides = ctx.store.collidingPath(path, serverPath ?? ctx.store.get(path)?.fileId);
+		if (collides !== undefined) {
+			ctx.store.setBlockedChange({
+				sequence: change.sequence,
+				action: "upsert",
+				fileId: serverPath,
+				serverPseudonym: serverPath,
+				revision: change.revision,
+				contentHash: change.hash,
+				metaGeneration: change.metaGeneration,
+				realPath: path,
+				reason: `与已有文件在本平台上重名（${collides}）`,
+			});
+			ctx.notify(`已暂缓：${path} 与本地已有的 ${collides} 在本平台上是同一个文件名\n请在任一设备上改名后自动恢复`);
+			return "blocked";
+		}
+	}
+
 	const adapter = ctx.app.vault.adapter;
 	const stat = await adapter.stat(path);
 	if (stat?.type === "folder") {
 		// v9：不再静默 ACK——持久化 blocked 记录，每轮同步重试，
 		// 用户移走同名文件夹后即使没有新 change 也能补回该文件
-		ctx.store.setBlockedChange(path, "远端文件与本地文件夹同名");
+		// v0.13.2 §6.4：记录带上完整身份，重试时重放的是原始变更本身
+		ctx.store.setBlockedChange({
+			sequence: change.sequence,
+			action: change.action === "delete" ? "delete" : "upsert",
+			fileId: serverPath ?? ctx.store.get(path)?.fileId,
+			serverPseudonym: serverPath,
+			revision: change.revision,
+			contentHash: change.hash,
+			metaGeneration: change.metaGeneration,
+			realPath: path,
+			reason: "远端文件与本地文件夹同名",
+		});
 		ctx.notify(`已暂缓：远端文件与本地文件夹同名 ${path}\n移走该文件夹后会自动补齐`);
 		return "blocked";
 	}
@@ -328,7 +638,7 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 
 	if (change.action === "delete") {
 		if (!stat) {
-			ctx.store.delete(path);
+			ctx.store.markDeleted(path);
 			ctx.store.clearPendingDelete(path);
 			return "skipped";
 		}
@@ -337,20 +647,20 @@ async function applyRemoteChange(ctx: SyncContext, change: RemoteChange): Promis
 		if (tracked && localHash === tracked.hash) {
 			// 本地未修改 → 跟随远端删除（进回收站，保底不丢数据）
 			if (await trashLocal(ctx.app, path)) {
-				ctx.store.delete(path);
+				ctx.store.markDeleted(path);
 				ctx.log(`pull: deleted ${path}`);
 				return "applied";
 			}
 			// 删除安全（所有平台）：回收站失败时宁可多留一份，绝不永久删除。
 			// 记入 pendingDeletes：扫描时跳过（不会被当作新文件重新上传），等用户手动删除
-			ctx.store.delete(path);
+			ctx.store.markDeleted(path);
 			ctx.store.setPendingDelete(path);
 			ctx.notify(`无法移入回收站，已保留本地文件（不会重新上传）：${path}\n请手动删除`);
 			return "applied";
 		}
 		// 本地有未同步修改 → 保留本地内容，转为新文件重新上传
-		ctx.store.delete(path);
-		ctx.queue.add(path, "upsert");
+		ctx.store.markDeleted(path);
+		ctx.queue.stage(path, { action: "upsert" });
 		ctx.notify(`远端已删除但本地有修改，已保留本地文件: ${path}`);
 		return "conflict";
 	}

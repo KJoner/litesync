@@ -215,6 +215,12 @@ export class ApiError extends Error {
 		public code?: string,
 		/** 服务器标注该错误是否值得重试 */
 		public retryable?: boolean,
+		/**
+		 * 422 CANONICAL_COLLISION 专用：与本次请求归一化后同名的**现有对象**的
+		 * 服务器寻址名（meta 模式为伪名 = fileId，明文模式为真实路径）。
+		 * §6.5 靠它去取冲突对象的元数据，判断是同一个逻辑文件还是两端同名新建。
+		 */
+		public existing?: string,
 	) {
 		super(message);
 		this.name = "ApiError";
@@ -939,6 +945,7 @@ function apiError(status: number, prefix: string, text: string): ApiError {
 		`${prefix}: HTTP ${status}${serverErrText(text)}`,
 		typeof body?.code === "string" ? body.code : undefined,
 		typeof body?.retryable === "boolean" ? body.retryable : undefined,
+		typeof body?.existing === "string" ? body.existing : undefined,
 	);
 }
 

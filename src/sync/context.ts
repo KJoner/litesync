@@ -3,6 +3,7 @@ import { ApiClient } from "../api/client";
 import { Keyring } from "../crypto/keyring";
 import { StateStore } from "../state/store";
 import { SyncGate } from "./gate";
+import { LocalCommitter } from "./local-commit";
 import { PendingQueue } from "./queue";
 
 /** 同步流程共享的依赖集合，由 main.ts 组装。 */
@@ -11,10 +12,17 @@ export interface SyncContext {
 	client: ApiClient;
 	store: StateStore;
 	queue: PendingQueue;
+	/**
+	 * 统一本地提交器（v0.13.2 / §6.1）：**唯一**允许覆盖 Vault 中已有文件的入口。
+	 * 任何同步路径都不得绕开它直接 writeBinary 到用户文件。
+	 */
+	committer: LocalCommitter;
 	/** 是否需要同步 .obsidian 配置目录 */
 	syncObsidian(): boolean;
 	ignores(path: string): boolean;
 	deviceName(): string;
+	/** 插件自己的目录（staging / recovery / swap 都放这里，永不参与同步） */
+	pluginDir(): string;
 	log(msg: string): void;
 	notify(msg: string): void;
 	/** pending conflicts 集合变化后调用（刷新状态栏等） */

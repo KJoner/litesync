@@ -14,7 +14,6 @@ import {
 	canonicalPathHmac,
 	decryptFile,
 	decryptFileV3,
-	encryptFile,
 	encryptFileV3,
 	encryptMeta,
 	FileKeyBinding,
@@ -24,9 +23,10 @@ import {
 } from "../crypto/crypto";
 import { E2eeLockedError } from "../crypto/keyring";
 import { sha256Hex } from "../utils/hash";
-import { ensureParentFolder } from "../utils/path";
+import { encodeUtf8 } from "../utils/text";
 import { optionalFileId, optionalGeneration, requireFileId, requireKeyEpoch } from "../utils/validate";
 import { SyncContext } from "./context";
+import { newOperationId } from "./queue";
 
 /** 元数据加密模式（v9.3 三期）：服务器只见伪名（=fileId），真实路径在 LSM1 里。 */
 export function metaEncrypted(ctx: SyncContext): boolean {
@@ -62,6 +62,86 @@ export class MetaPathUnresolvedError extends Error {
 		);
 		this.name = "MetaPathUnresolvedError";
 	}
+}
+
+/**
+ * 服务器返回的对象身份与预期不符（v0.13.2 / §6.7）。
+ *
+ * 这不是「冲突」而是**完整性事件**：本地绝不写入，tracked 的 fileId 绝不修改，
+ * 并且该仓库的自动同步会被 gate 停住等待人工确认。
+ */
+export class FileIdMismatchError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "FileIdMismatchError";
+	}
+}
+
+/** 元数据世代回退（§6.8）：同样按完整性事件处理，硬失败。 */
+export class MetaGenerationRollbackError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "MetaGenerationRollbackError";
+	}
+}
+
+/** 同一 metaGeneration 上出现了两份不同的元数据（§6.8 的「同世代分叉」）。 */
+export class MetaForkError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "MetaForkError";
+	}
+}
+
+/**
+ * 认证后的 metaGeneration 判定（v0.13.2 / 计划书 §6.8）。
+ *
+ * 判据必须取自**解密并通过 AAD 认证**的元数据，而不是服务器 Header：
+ * Header 是明文、可被任意改写，拿它做安全判断等于没做。
+ *
+ *   dec <  tracked  → 回退，硬失败
+ *   dec == tracked  → 指纹相同 = 幂等重复（正常，什么都不用做）
+ *                     指纹不同 = 同世代分叉，硬失败
+ *   dec >  tracked  → 正常应用
+ *
+ * `fingerprint` 是这份元数据的认证摘要；本地保存它，才有能力区分后两种情况。
+ */
+export function assertMetaGeneration(
+	ctx: SyncContext,
+	path: string,
+	decMetaGeneration: number,
+	fingerprint: string,
+): "apply" | "idempotent" {
+	const tracked = ctx.store.get(path);
+	const known = tracked?.metaGeneration;
+	if (known === undefined) return "apply";
+
+	if (decMetaGeneration < known) {
+		const msg = `检测到元数据回退（${path}：认证后的 metaGeneration ${decMetaGeneration} < 本地已见 ${known}），已停止同步`;
+		ctx.gate.markIntegrityError(msg);
+		throw new MetaGenerationRollbackError(msg);
+	}
+	if (decMetaGeneration === known) {
+		if (tracked?.metaFingerprint === undefined || tracked.metaFingerprint === fingerprint) {
+			return "idempotent"; // 同一份元数据又收到一次
+		}
+		const msg =
+			`同一元数据世代上出现了两份不同的内容（${path}：metaGeneration ${decMetaGeneration}），` +
+			`服务器可能对不同设备返回了不同结果，已停止同步`;
+		ctx.gate.markIntegrityError(msg);
+		throw new MetaForkError(msg);
+	}
+	return "apply";
+}
+
+/**
+ * 元数据的认证摘要（§6.8）。
+ *
+ * 直接对密文信封取 hash：信封已经过 GCM 认证并绑定 vaultId/keyEpoch/fileId/
+ * metaGeneration，因此「摘要相同」等价于「同一份被认证过的元数据」。
+ */
+export async function metaFingerprintOf(metaEnc: string): Promise<string> {
+	return sha256Hex(encodeUtf8(metaEnc));
 }
 
 /**
@@ -137,6 +217,35 @@ async function decode(
 	// 绝不带着被截断的 fileId/metaGeneration 继续解密或更新本地状态
 	const fileId = optionalFileId(dl.fileId, `download(${path}).X-File-Id`);
 	const metaGeneration = optionalGeneration(dl.metaGeneration, `download(${path}).X-Meta-Generation`);
+
+	// §6.7 fileId 匹配保护：请求的是这个对象，返回的必须还是这个对象。
+	// 换掉 fileId 意味着服务器（或中间人）把另一份内容当成了这个文件——
+	// 一旦采纳，本地内容会被别的文件覆盖，且 LSE3 的 AAD 也随之被换掉。
+	// 合法的 delete + 重建不会走到这里：删除时 tracked 已被清掉，没有可比对象。
+	const trackedBefore = ctx.store.get(path);
+	if (trackedBefore?.fileId !== undefined && fileId !== undefined && trackedBefore.fileId !== fileId) {
+		const msg =
+			`服务器为 ${path} 返回了不同的文件身份（期望 ${trackedBefore.fileId.slice(0, 8)}…，` +
+			`实际 ${fileId.slice(0, 8)}…），已停止该仓库的自动同步`;
+		ctx.gate.markIntegrityError(msg);
+		throw new FileIdMismatchError(msg);
+	}
+
+	// §6.8 metaGeneration 回退保护：世代只能前进。
+	// 注意这里用的是**服务器 Header**，只作为早期廉价拦截；真正的安全判断在
+	// decryptMeta 之后用经 AAD 认证的 dec.metaGeneration 做（见 assertMetaGeneration）。
+	if (
+		opts.enforceGeneration &&
+		trackedBefore?.metaGeneration !== undefined &&
+		metaGeneration !== undefined &&
+		metaGeneration < trackedBefore.metaGeneration
+	) {
+		const msg =
+			`检测到元数据回退（${path}：服务器 metaGeneration ${metaGeneration} < ` +
+			`本地已见 ${trackedBefore.metaGeneration}），已停止同步`;
+		ctx.gate.markIntegrityError(msg);
+		throw new MetaGenerationRollbackError(msg);
+	}
 
 	// LSE3（v9.3）：AAD = vaultId + keyEpoch(信封头) + fileId(服务器提供) + generation(信封头)。
 	// fileId 造假 → GCM 认证直接失败；generation 经 AAD 认证后做回退检查。
@@ -236,14 +345,23 @@ export async function writeIfLocalUnchanged(
 	data: ArrayBuffer,
 	expectedLocalHash: string | null,
 	mtime?: number,
+	operationId?: string,
 ): Promise<boolean> {
-	const adapter = ctx.app.vault.adapter;
-	const stat = await adapter.stat(path);
-	const currentHash = stat ? await sha256Hex(await adapter.readBinary(path)) : null;
-	if (currentHash !== expectedLocalHash) return false;
-	await ensureParentFolder(adapter, path);
-	await adapter.writeBinary(path, data, mtime !== undefined && mtime > 0 ? { mtime } : undefined);
-	return true;
+	const res = await ctx.committer.commitRemoteChange({
+		operationId: operationId ?? newOperationId(),
+		realPath: path,
+		expectedLocalHash,
+		incoming: data,
+		incomingHash: await sha256Hex(data),
+		conflictPolicy: "fail",
+		...(mtime !== undefined && mtime > 0 ? { incomingMtime: mtime } : {}),
+	});
+	if (res.status === "rejected") {
+		// 路径不安全 / 文件夹占用 / 平台无原子替换：一律不写，由调用方走冲突或 blocked
+		ctx.log(`commit rejected: ${res.reason}`);
+		return false;
+	}
+	return res.status === "committed";
 }
 
 export interface UploadOutcome {
@@ -259,6 +377,26 @@ export interface UploadOutcome {
 	metaGeneration?: number;
 	/** 本次实际使用的服务器可见路径（meta 模式为伪名，明文模式为空） */
 	serverPseudonym?: string;
+}
+
+/**
+ * 为一个尚未跟踪的新文件**预留**并持久化 fileId（v0.13.2 / §6.5 第 1、2 步）。
+ *
+ * 这一步是「响应丢失后重试不产生第二个对象」的关键：如果每次尝试都现生成一个
+ * 新 fileId，那么第一次上传其实成功、只是响应没回来的时候，重试会用一个全新的
+ * 身份再建一个对象——服务器上于是出现两个内容相同、路径相同的对象，随后每一次
+ * 上传都撞 422，用户看到的是「这个文件永远同步不上去」。
+ *
+ * 预留值放在待推送队列里（队列在入队时就落盘，§6.3），因此它能活过重启。
+ */
+async function reserveFileId(ctx: SyncContext, path: string): Promise<string> {
+	const reserved = ctx.queue.getOp(path)?.fileId;
+	if (reserved !== undefined) return requireFileId(reserved, `reserved(${path}).fileId`);
+	const fileId = newFileId();
+	ctx.queue.rememberIdentity(path, { fileId });
+	// 落盘后才算预留成功：否则崩溃重启会重新生成一个不同的 id
+	await ctx.store.save();
+	return fileId;
 }
 
 /** 上传明文内容（E2EE 启用时自动加密，默认 LSE3；meta 模式自动伪名 + 挂元数据）。 */
@@ -291,7 +429,9 @@ export async function uploadFromPlain(
 			// 已跟踪文件沿用原身份，但先校验一遍——被改坏的 fileId 会让这份
 			// 密文的 AAD 与将来重建的 AAD 不一致，永久无法解密（LS-121-C03）
 			const fileId =
-				tracked?.fileId === undefined ? newFileId() : requireFileId(tracked.fileId, `upload(${path}).fileId`);
+				tracked?.fileId === undefined
+					? await reserveFileId(ctx, path)
+					: requireFileId(tracked.fileId, `upload(${path}).fileId`);
 			generation = (tracked?.fileId === fileId ? (tracked?.generation ?? 0) : 0) + 1;
 			payload = await encryptFileV3(
 				ctx.e2ee.requireKey(),

@@ -2,11 +2,11 @@ import { Platform } from "obsidian";
 import { ApiError, ConflictError, NotFoundError } from "../api/client";
 import { E2eeLockedError } from "../crypto/keyring";
 import { sha256Hex } from "../utils/hash";
-import { ensureParentFolder } from "../utils/path";
+import { pathsCollide } from "../utils/vault-path";
 import { attemptAutoMerge } from "./auto-merge";
 import { keepBothVersions } from "./conflict";
 import { SyncContext } from "./context";
-import { canonicalPathHmac, encryptMeta } from "../crypto/crypto";
+import { canonicalPathHmac, decryptMeta, encryptMeta } from "../crypto/crypto";
 import { FileState } from "../state/store";
 import {
 	downloadPlain,
@@ -14,8 +14,10 @@ import {
 	metaEncrypted,
 	removeRemote,
 	serverPathOf,
+	metaFingerprintOf,
 	uploadFromPlain,
 	versionPlain,
+	writeIfLocalUnchanged,
 } from "./transfer";
 
 export interface PushResult {
@@ -52,7 +54,7 @@ export async function scanLocalChanges(ctx: SyncContext): Promise<void> {
 		if (ctx.queue.getOp(path)?.action === "move") continue;
 		const tracked = ctx.store.get(path);
 		if (!tracked || tracked.mtime !== file.stat.mtime || tracked.size !== file.stat.size) {
-			ctx.queue.add(path, "upsert");
+			ctx.queue.stage(path, { action: "upsert" });
 		}
 	}
 
@@ -66,14 +68,14 @@ export async function scanLocalChanges(ctx: SyncContext): Promise<void> {
 			if (!stat) continue;
 			const tracked = ctx.store.get(path);
 			if (!tracked || tracked.mtime !== stat.mtime || tracked.size !== stat.size) {
-				ctx.queue.add(path, "upsert");
+				ctx.queue.stage(path, { action: "upsert" });
 			}
 		}
 	}
 
 	for (const path of ctx.store.paths()) {
 		if (ctx.ignores(path) || seen.has(path) || moveFroms.has(path)) continue;
-		ctx.queue.add(path, "delete");
+		ctx.queue.stage(path, { action: "delete" });
 	}
 }
 
@@ -146,30 +148,53 @@ async function pushMove(ctx: SyncContext, toPath: string, fromPath: string): Pro
 	const tracked = fromPath ? ctx.store.get(fromPath) : undefined;
 	const stat = await adapter.stat(toPath);
 
-	const fallback = async (): Promise<Outcome> => {
+	/**
+	 * 退化路径（v0.13.2 / §6.10）：**先建后删**，且绝不主动删除远端活对象。
+	 *
+	 * v0.12.x 这里是「先 delete 旧远端对象，再创建新对象」——一旦第二步失败
+	 *（断网、409、体积超限……），服务器上就只剩一个 tombstone，那份内容从
+	 * 其他设备的角度看等于被删除了。现在顺序反过来：新路径先推上去（内容有了
+	 * 落点），旧路径**不在这里删**，交给正常扫描发出的、完整的 delete 操作。
+	 */
+	const degrade = async (): Promise<Outcome> => {
 		let outcome: Outcome = "skipped";
-		if (tracked && !(await adapter.stat(fromPath))) {
-			const d = await pushDelete(ctx, fromPath);
-			if (d === "conflict") outcome = "conflict";
-		}
 		if (stat) {
 			const u = await pushUpsert(ctx, toPath);
-			if (u === "pushed" && outcome === "skipped") outcome = "pushed";
+			if (u === "pushed") outcome = "pushed";
 			if (u === "conflict") outcome = "conflict";
+			// 新内容必须**确实存在于服务器上**才允许继续。
+			// 不能只看 outcome：pushUpsert 在「文件超过服务器上限」等情况下返回
+			// skipped，那时新内容一个字节都没上去——此时再删旧对象，这份内容
+			// 就从所有设备上消失了。以「新路径已被跟踪且有 revision」为判据。
+			const landed = (ctx.store.get(toPath)?.revision ?? 0) > 0;
+			if (!landed) {
+				ctx.log(`move degrade: ${toPath} 未能落到服务器，保留旧对象不删`);
+				return outcome;
+			}
+		}
+		if (tracked && !(await adapter.stat(fromPath))) {
+			// 旧路径的文件确实已经不在本地了，且新内容已在服务器上
+			// → 这才是一次真实、完整、可以安全执行的删除
+			const d = await pushDelete(ctx, fromPath);
+			if (d === "conflict") outcome = "conflict";
 		}
 		return outcome;
 	};
 
-	// 前提：旧路径已同步、新路径存在、内容未变、无冲突冻结
+	// 前提：旧路径已同步、新路径存在、无冲突冻结
 	if (!tracked || !stat || ctx.store.getConflict(fromPath) || ctx.store.getConflict(toPath)) {
-		return fallback();
+		return degrade();
 	}
+
 	const data = await adapter.readBinary(toPath);
 	const hash = await sha256Hex(data);
-	if (hash !== tracked.hash) return fallback(); // 改名后又编辑：内容需要正常上传
+	// §6.9 rename + edit：改名与编辑同时发生时，**先改名再传内容**。
+	// 反过来（先按新路径当新文件上传、再补改名）会造出第二个对象，
+	// 也会让「内容写在旧路径上但已记下新 metaGeneration」这种半截状态出现。
+	const contentChanged = hash !== tracked.hash;
 
 	const meta = await renameMetadata(ctx, tracked, toPath);
-	if (meta === "unavailable") return fallback();
+	if (meta === "unavailable") return degrade();
 
 	// meta 模式下服务器可见的寻址名不变（伪名），只更新加密元数据；
 	// 明文模式下寻址名就是真实路径
@@ -178,7 +203,7 @@ async function pushMove(ctx: SyncContext, toPath: string, fromPath: string): Pro
 
 	try {
 		const out = await ctx.client.rename(serverFrom, serverTo, tracked.metaGeneration ?? 0, meta);
-		ctx.store.rename(fromPath, toPath, {
+		ctx.store.applyMetaRenameState(fromPath, toPath, {
 			mtime: stat.mtime,
 			size: stat.size,
 			revision: out.revision,
@@ -187,14 +212,84 @@ async function pushMove(ctx: SyncContext, toPath: string, fromPath: string): Pro
 			serverPseudonym: metaEncrypted(ctx) ? out.toPath : undefined,
 		});
 		ctx.log(`push: renamed ${fromPath} -> ${toPath} (metaGen ${out.metaGeneration})`);
-		return "pushed";
+		if (!contentChanged) return "pushed";
+		// 改名已落地，现在把新内容推到**同一个对象**上（身份、历史都不断）
+		const u = await pushUpsert(ctx, toPath);
+		return u === "conflict" ? "conflict" : "pushed";
 	} catch (e) {
-		if (e instanceof ConflictError || e instanceof NotFoundError) return fallback();
+		if (e instanceof ConflictError || e instanceof NotFoundError) {
+			return reconcileFailedRename(ctx, fromPath, toPath, degrade);
+		}
 		if (e instanceof ApiError && (e.status === 400 || e.status === 404 || e.status === 412 || e.status === 422)) {
-			return fallback(); // 并发改名 CAS / 同名占用 / 非法目标
+			// 并发改名 CAS / 同名占用 / 非法目标
+			return reconcileFailedRename(ctx, fromPath, toPath, degrade);
 		}
 		throw e;
 	}
+}
+
+/**
+ * 改名失败后的收敛（v0.13.2 / 计划书 §6.10）。
+ *
+ * 失败**不等于**「本地赢，把远端推平」。先去看服务器现在到底是什么状态：
+ *
+ *  1. 远端已经改成了我们想要的名字（另一台设备抢先做了同样的改名，或者我们的
+ *     请求其实成功了只是响应丢了）→ 直接采纳，不再重试；
+ *  2. 远端 metaGeneration 前进了但改成了别的名字 → 那是另一台设备的改名，
+ *     交给 pull 处理，本地这次操作作罢（绝不覆盖）；
+ *  3. 拿不到服务器状态 → 走 create-then-delete 的退化路径。
+ *
+ * 无论哪一条，都不会主动删除远端那个仍然活着的对象。
+ */
+async function reconcileFailedRename(
+	ctx: SyncContext,
+	fromPath: string,
+	toPath: string,
+	degrade: () => Promise<Outcome>,
+): Promise<Outcome> {
+	const tracked = ctx.store.get(fromPath);
+	if (!tracked || !metaEncrypted(ctx) || !tracked.serverPseudonym) return degrade();
+
+	let remotePath: string;
+	let remoteMetaGeneration: number;
+	let fingerprint: string;
+	try {
+		const meta = await ctx.client.getFileMeta(tracked.serverPseudonym);
+		const bind = e2eeBinding(ctx);
+		const keys = await ctx.e2ee.metaKeys();
+		const dec = await decryptMeta(keys, meta.metaEnc, bind?.vaultId ?? "", tracked.serverPseudonym);
+		if (dec === null) throw new Error("元数据无法解密");
+		remotePath = dec.meta.path;
+		remoteMetaGeneration = dec.metaGeneration;
+		fingerprint = await metaFingerprintOf(meta.metaEnc);
+	} catch (e) {
+		if (e instanceof E2eeLockedError) throw e;
+		ctx.log(`rename reconcile: 无法读取服务器状态（${String(e)}）→ 退化为先建后删`);
+		return degrade();
+	}
+
+	if (remotePath === toPath) {
+		// 情况 1：远端已是目标名字。本地状态对齐即可，源文件与远端对象都完好
+		ctx.store.applyMetaRenameState(fromPath, toPath, {
+			metaGeneration: remoteMetaGeneration,
+			metaFingerprint: fingerprint,
+		});
+		ctx.log(`rename reconcile: 远端已改名为 ${toPath}，已采纳`);
+		return "skipped";
+	}
+
+	if (remoteMetaGeneration > (tracked.metaGeneration ?? 0)) {
+		// 情况 2：另一台设备把它改成了别的名字。两个改名都是用户的真实意图，
+		// 由 pull 把远端那次改名应用下来，本地这次让位——绝不删除任何一边
+		ctx.store.applyRemoteIdentity(fromPath, {
+			metaGeneration: remoteMetaGeneration,
+			metaFingerprint: fingerprint,
+		});
+		ctx.notify(`另一台设备已把该文件改名为 ${remotePath}，本次改名未生效；下一轮同步会对齐`);
+		return "conflict";
+	}
+
+	return degrade();
 }
 
 /**
@@ -401,8 +496,134 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 			ctx.notify(`Skipped large file（超过服务器大小限制）: ${path}`);
 			return "skipped";
 		}
+		if (e instanceof ApiError && e.is("CANONICAL_COLLISION")) {
+			return resolveCanonicalCollision(ctx, path, data, hash, e);
+		}
 		throw e;
 	}
+}
+
+/**
+ * 422 canonical collision 收敛（v0.13.2 / 计划书 §6.5）。
+ *
+ * 触发场景只有两类，处理方式完全不同，绝不能一概而论：
+ *
+ *  A. **两台设备离线创建了同一个路径**——服务器上已经有一个别的 fileId 占着这个
+ *     归一化名字。此时如果两边内容相同，直接采纳既有对象的身份即可（这也是
+ *     「上传成功但响应丢失、且身份没能持久化」的收敛路径）；内容不同则保留双方。
+ *
+ *  B. **跨平台重名**——本地这个名字与服务器上另一个不同的真实路径在归一化后
+ *     相同（大小写、NFC/NFD、尾随点）。两个都是有效文件，谁也不该被丢掉。
+ *
+ * 无论走哪条分支，这次操作都必须**有结论**：计划书明确要求「不得让该操作永久
+ * 阻塞后续队列」。因此这里不会把同一个必然再次 422 的请求原样重排。
+ */
+async function resolveCanonicalCollision(
+	ctx: SyncContext,
+	path: string,
+	data: ArrayBuffer,
+	localHash: string,
+	err: ApiError,
+): Promise<Outcome> {
+	const existing = err.existing;
+	if (!existing) {
+		// 旧服务器没告诉我们是谁占着这个名字 → 无法判断，保留双方（本地内容不丢）
+		ctx.notify(`服务器上已存在同名文件，本地版本已另存: ${path}`);
+		const kept = await keepBothVersions(ctx, path, data);
+		return kept === null ? "skipped" : "conflict";
+	}
+
+	// 第 4 步：取冲突对象的元数据，解出它的真实路径
+	let existingPath = existing;
+	if (metaEncrypted(ctx)) {
+		try {
+			const meta = await ctx.client.getFileMeta(existing);
+			const bind = e2eeBinding(ctx);
+			const keys = await ctx.e2ee.metaKeys();
+			const dec = await decryptMeta(keys, meta.metaEnc, bind?.vaultId ?? "", existing);
+			if (dec === null) throw new Error("元数据无法解密");
+			existingPath = dec.meta.path;
+		} catch (metaErr) {
+			if (metaErr instanceof E2eeLockedError) throw metaErr;
+			ctx.log(`collision: 无法解析既有对象的真实路径（${existing}）：${String(metaErr)}`);
+			const kept = await keepBothVersions(ctx, path, data);
+			return kept === null ? "skipped" : "conflict";
+		}
+	}
+
+	// 第 5 步：分类
+	if (existingPath === path) {
+		// A：同一个逻辑路径。先看内容是否已经一致（等价于「我其实已经传上去了」）
+		let remote;
+		try {
+			remote = await downloadPlain(ctx, path, existing);
+		} catch (dlErr) {
+			if (dlErr instanceof E2eeLockedError) throw dlErr;
+			remote = null;
+		}
+		if (remote !== null && remote.plainHash === localHash) {
+			// 采纳既有对象的身份：此后重试都会走「已跟踪」分支，422 不再出现
+			ctx.store.applyRemoteIdentity(path, {
+				fileId: remote.fileId,
+				generation: remote.generation,
+				metaGeneration: remote.metaGeneration,
+				serverPseudonym: metaEncrypted(ctx) ? existing : undefined,
+			});
+			ctx.store.patchContentState(path, {
+				hash: localHash,
+				serverHash: remote.cipherHash,
+				revision: remote.revision,
+			});
+			ctx.log(`collision: adopted existing object for ${path} (rev ${remote.revision})`);
+			return "skipped";
+		}
+		// 内容不同：两台设备各自新建了同名文件 → 保留双方（本地进冲突副本，
+		// 远端版本写回原路径），随后按普通冲突流程收敛
+		const kept = await keepBothVersions(ctx, path, data);
+		ctx.notify(`另一台设备已创建同名文件: ${path}\n本地版本已另存为副本`);
+		return kept === null ? "skipped" : "conflict";
+	}
+
+	// B：跨平台重名。两个不同的真实路径在本平台上会指向同一个文件——
+	// 本地这个必须换个名字，否则它永远传不上去，而且下载回来还会互相覆盖
+	const renamed = await renameLocalAsideForCollision(ctx, path, existingPath);
+	ctx.notify(
+		`文件名 ${path} 与已同步的 ${existingPath} 在部分系统上会被视为同一个文件；\n` +
+			(renamed === null ? "请手动改名后再同步" : `本地已改名为 ${renamed} 以便两份都能保留`),
+	);
+	return "conflict";
+}
+
+/**
+ * 把与远端重名的本地文件改成一个不碰撞的名字（§6.5 第 6 步的 keep-both 形态）。
+ * 返回新路径；找不到可用名字时返回 null（此时保持原样，交给用户处理）。
+ */
+async function renameLocalAsideForCollision(
+	ctx: SyncContext,
+	path: string,
+	existingPath: string,
+): Promise<string | null> {
+	const adapter = ctx.app.vault.adapter;
+	const dot = path.lastIndexOf(".");
+	const slash = path.lastIndexOf("/");
+	const hasExt = dot > slash + 1;
+	const stem = hasExt ? path.slice(0, dot) : path;
+	const ext = hasExt ? path.slice(dot) : "";
+	for (let i = 1; i <= 20; i++) {
+		const candidate = `${stem} (${ctx.deviceName()}${i === 1 ? "" : ` ${i}`})${ext}`;
+		if (await adapter.stat(candidate)) continue;
+		if (pathsCollide(candidate, existingPath)) continue;
+		try {
+			await adapter.rename(path, candidate);
+		} catch {
+			return null;
+		}
+		// 身份整体搬到新路径：这仍然是同一份本地内容，只是换了个不碰撞的名字
+		ctx.store.applyMetaRenameState(path, candidate, {});
+		ctx.queue.stage(candidate, { action: "upsert" });
+		return candidate;
+	}
+	return null;
 }
 
 /**
@@ -438,23 +659,27 @@ async function pushDelete(ctx: SyncContext, path: string): Promise<Outcome> {
 
 	try {
 		await removeRemote(ctx, path, tracked.revision);
-		ctx.store.delete(path);
+		ctx.store.markDeleted(path);
 		ctx.log(`push: deleted ${path}`);
 		return "pushed";
 	} catch (e) {
 		if (e instanceof NotFoundError) {
-			ctx.store.delete(path);
+			ctx.store.markDeleted(path);
 			return "skipped";
 		}
 		if (e instanceof ConflictError) {
 			if (e.server.deleted) {
-				ctx.store.delete(path);
+				ctx.store.markDeleted(path);
 				return "skipped";
 			}
 			// 本地删除后服务器又有了新版本 → 数据安全优先：恢复服务器版本，不执行删除
 			const dl = await downloadPlain(ctx, path);
-			await ensureParentFolder(adapter, path);
-			await adapter.writeBinary(path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
+			// §6.1：本地文件此刻应当不存在（正是因为它被删掉才走到这里）。
+			// 若用户在这期间又建了同名文件，绝不覆盖——留给下一轮按冲突处理
+			if (!(await writeIfLocalUnchanged(ctx, path, dl.plain, null, dl.mtime))) {
+				ctx.notify(`该文件在其他设备上已更新，但本地又出现了同名文件，已暂缓恢复: ${path}`);
+				return "conflict";
+			}
 			const st = await adapter.stat(path);
 			ctx.store.update(path, {
 				hash: dl.plainHash,

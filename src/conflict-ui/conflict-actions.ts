@@ -24,8 +24,8 @@ export async function loadConflict(ctx: SyncContext, path: string): Promise<Load
 		if (e instanceof NotFoundError) {
 			// 远端文件已被删除：本地内容即最新，解除冲突并按新文件重新上传
 			ctx.store.clearConflict(path);
-			ctx.store.delete(path);
-			ctx.queue.add(path, "upsert");
+			ctx.store.markDeleted(path);
+			ctx.queue.stage(path, { action: "upsert" });
 			await ctx.store.save();
 			throw new Error("远端文件已被删除，本地内容将在下次同步时重新上传");
 		}
@@ -57,7 +57,7 @@ export async function loadConflict(ctx: SyncContext, path: string): Promise<Load
 
 	// 记录最新远端 revision（Race Protection 的锚点）
 	pending.remoteRevision = remote.revision;
-	ctx.store.setConflict(path, pending);
+	ctx.store.recordConflict(path, pending);
 
 	return {
 		path,

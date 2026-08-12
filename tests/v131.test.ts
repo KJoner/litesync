@@ -100,6 +100,7 @@ test("§5.1: bootstrap 期间的上传写 LSE3 而不是回退信封", async () 
 	let uploaded: ArrayBuffer | null = null;
 	const ctx = {
 		store,
+		queue: new PendingQueue(),
 		e2ee: keyring,
 		client: {
 			upload: async (p: string, _base: number, _hash: string, data: ArrayBuffer) => {

@@ -21,6 +21,7 @@ import { ShareManageModal, ShareModal } from "./share/share-modal";
 import { StateStore } from "./state/store";
 import { SyncContext } from "./sync/context";
 import { SyncBlockedError, SyncGate } from "./sync/gate";
+import { LocalCommitter } from "./sync/local-commit";
 import { PendingQueue } from "./sync/queue";
 import { SyncManager, SyncStatus } from "./sync/sync-manager";
 import { IgnoreMatcher } from "./utils/ignore";
@@ -45,6 +46,7 @@ export default class PrivateSyncPlugin extends Plugin {
 
 	private store: StateStore | null = null;
 	private queue = new PendingQueue();
+	private committer!: LocalCommitter;
 	private client: ApiClient | null = null;
 	private manager: SyncManager | null = null;
 	private ctx: SyncContext | null = null;
@@ -172,6 +174,11 @@ export default class PrivateSyncPlugin extends Plugin {
 		this.queue.onChange = (entries) => {
 			if (this.store) this.store.state.pendingOps = entries;
 		};
+		// §6.3：入队 → 落盘 → 才算被接受。串行化的 save 保证排队期间
+		// 新增的条目一定被带上（§6.2）
+		this.queue.persist = async () => {
+			await this.store?.save();
+		};
 		this.queue.restore(this.store.state.pendingOps);
 
 		// API Token：读取 SecretStorage（旧版 data.json 明文值迁入后抹除）
@@ -216,16 +223,25 @@ export default class PrivateSyncPlugin extends Plugin {
 			new Notice("移动端不同步 Obsidian 配置目录（桌面与移动端的界面配置互不兼容），普通笔记与附件不受影响");
 		}
 
+		// §6.1：唯一的本地写入口。staging/recovery 都放在插件目录下，
+		// 那里被 IgnoreMatcher 无条件排除，永远不会被当成用户笔记同步出去
+		this.committer = new LocalCommitter(this.app, pluginDir, (m) => {
+			if (this.settings.debug) console.debug(`[litesync] ${m}`);
+		});
+		void this.committer.sweep(Date.now());
+
 		const ctx: SyncContext = {
 			app: this.app,
 			client: this.client,
 			store: this.store,
 			queue: this.queue,
+			committer: this.committer,
 			gate: this.gate,
 			syncObsidian: () => this.effectiveSyncObsidian(),
 			ignores: (path) => this.ignoreMatcher?.ignores(path) ?? false,
 			deviceName: () =>
 				this.settings.deviceName || `device-${(this.store?.state.deviceId ?? "").slice(0, 8)}`,
+			pluginDir: () => pluginDir,
 			log: (msg) => {
 				// 仅在用户显式开启 Debug 时输出；用 debug 级别不污染默认控制台
 				if (this.settings.debug) console.debug(`[litesync] ${msg}`);
@@ -563,12 +579,19 @@ export default class PrivateSyncPlugin extends Plugin {
 	}
 
 	private registerVaultEvents(): void {
+		// 队列落盘失败不能静默：用户会以为这次修改已经被接受
+		const enqueue = (p: Promise<void>): void => {
+			void p.catch((e: unknown) => {
+				new Notice(`LiteSync：无法记录待同步变更（${e instanceof Error ? e.message : String(e)}）`, 8000);
+			});
+		};
 		const track = (file: TAbstractFile, action: "upsert" | "delete"): void => {
 			// pull 应用远端变更产生的事件不入队（随后的扫描兜底覆盖用户同时的编辑）
 			if (this.manager?.applyingRemote) return;
 			if (this.ignoreMatcher?.ignores(file.path)) return;
 			if (file instanceof TFile) {
-				this.queue.add(file.path, action);
+				// §6.3：入队即落盘——此后即使立刻退出 Obsidian，这次修改也不会丢
+				enqueue(this.queue.add(file.path, action));
 				this.scheduleDebounced();
 			}
 		};
@@ -582,7 +605,7 @@ export default class PrivateSyncPlugin extends Plugin {
 				if (f instanceof TFolder) {
 					// 文件夹删除：把状态缓存中该目录下的所有文件标记为删除
 					for (const path of this.store?.paths() ?? []) {
-						if (path.startsWith(f.path + "/")) this.queue.add(path, "delete");
+						if (path.startsWith(f.path + "/")) enqueue(this.queue.add(path, "delete"));
 					}
 					this.scheduleDebounced();
 					return;
@@ -607,24 +630,24 @@ export default class PrivateSyncPlugin extends Plugin {
 						if (!path.startsWith(oldPath + "/")) continue;
 						const newPath = f.path + "/" + path.slice(oldPath.length + 1);
 						if (!this.ignoreMatcher?.ignores(newPath) && canMove(path)) {
-							this.queue.addMove(newPath, path);
+							enqueue(this.queue.addMove(newPath, path));
 						} else {
-							this.queue.add(path, "delete");
+							enqueue(this.queue.add(path, "delete"));
 						}
 					}
 					for (const file of this.app.vault.getFiles()) {
 						if (!file.path.startsWith(f.path + "/") || this.ignoreMatcher?.ignores(file.path)) continue;
 						if (this.queue.getOp(file.path)?.action === "move") continue; // 不覆盖已排队的 move
-						this.queue.add(file.path, "upsert");
+						enqueue(this.queue.add(file.path, "upsert"));
 					}
 				} else {
 					const ignoredOld = this.ignoreMatcher?.ignores(oldPath) ?? false;
 					const ignoredNew = this.ignoreMatcher?.ignores(f.path) ?? false;
 					if (!ignoredOld && !ignoredNew && canMove(oldPath)) {
-						this.queue.addMove(f.path, oldPath);
+						enqueue(this.queue.addMove(f.path, oldPath));
 					} else {
-						if (!ignoredOld) this.queue.add(oldPath, "delete");
-						if (!ignoredNew) this.queue.add(f.path, "upsert");
+						if (!ignoredOld) enqueue(this.queue.add(oldPath, "delete"));
+						if (!ignoredNew) enqueue(this.queue.add(f.path, "upsert"));
 					}
 				}
 				this.scheduleDebounced();

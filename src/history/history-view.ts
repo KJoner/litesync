@@ -3,8 +3,8 @@ import { ConflictError, NotFoundError, VersionEntry } from "../api/client";
 import { DiffTooLargeError, diffLinesView } from "../merge/diff";
 import { SyncContext } from "../sync/context";
 import { requireSyncSafe } from "../sync/gate";
-import { historyOf, uploadFromPlain, versionPlain } from "../sync/transfer";
-import { ensureParentFolder } from "../utils/path";
+import { historyOf, uploadFromPlain, versionPlain, writeIfLocalUnchanged } from "../sync/transfer";
+import { sha256Hex } from "../utils/hash";
 import { decodeUtf8Strict } from "../utils/text";
 
 const ACTION_LABEL: Record<string, string> = {
@@ -135,9 +135,17 @@ export class HistoryModal extends Modal {
 				dl.mtime || Date.now(),
 				"restore",
 			);
+			// §6.1 / §6.13：恢复期间用户可能正在编辑这个文件。以「打开历史时看到的
+			// 那份内容」为前置条件写回；不符合就把恢复结果另存为副本，绝不覆盖新编辑
 			const adapter = this.ctx.app.vault.adapter;
-			await ensureParentFolder(adapter, this.path);
-			await adapter.writeBinary(this.path, dl.plain, dl.mtime > 0 ? { mtime: dl.mtime } : undefined);
+			const cur = await adapter.stat(this.path);
+			const curHash = cur ? await sha256Hex(await adapter.readBinary(this.path)) : null;
+			if (!(await writeIfLocalUnchanged(this.ctx, this.path, dl.plain, curHash, dl.mtime))) {
+				const copy = await this.writeSideCopy(dl.plain, v.revision);
+				new Notice(`本地文件在恢复期间被修改，已把 Revision ${v.revision} 另存为 ${copy}`);
+				this.close();
+				return;
+			}
 			const stat = await adapter.stat(this.path);
 			// 恢复不改变文件身份（LS-121-C04）：fileId / 伪名保持不变，
 			// generation 与 metaGeneration 取本次上传返回的新值
@@ -170,19 +178,30 @@ export class HistoryModal extends Modal {
 		try {
 			requireSyncSafe(this.ctx, "另存历史版本");
 			const dl = await versionPlain(this.ctx, this.path, v.revision);
-			const slash = this.path.lastIndexOf("/");
-			const dot = this.path.lastIndexOf(".");
-			const hasExt = dot > slash + 1;
-			const stem = hasExt ? this.path.slice(0, dot) : this.path;
-			const ext = hasExt ? this.path.slice(dot) : "";
-			const copyPath = `${stem}.rev-${v.revision}${ext}`;
-			const adapter = this.ctx.app.vault.adapter;
-			await ensureParentFolder(adapter, copyPath);
-			await adapter.writeBinary(copyPath, dl.plain);
+			const copyPath = await this.writeSideCopy(dl.plain, v.revision);
 			new Notice(`已另存为 ${copyPath}`);
 		} catch (e) {
 			if (e instanceof NotFoundError) new Notice("该版本内容已被服务器清理");
 			else new Notice(`另存失败：${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	/**
+	 * 把某个历史版本写成一份**新文件**（§6.1）。
+	 *
+	 * 目标名被占用时换一个，绝不覆盖已有文件——历史副本的存在价值就是「多留一份」，
+	 * 为它覆盖掉别的内容是本末倒置。
+	 */
+	private async writeSideCopy(plain: ArrayBuffer, revision: number): Promise<string> {
+		const slash = this.path.lastIndexOf("/");
+		const dot = this.path.lastIndexOf(".");
+		const hasExt = dot > slash + 1;
+		const stem = hasExt ? this.path.slice(0, dot) : this.path;
+		const ext = hasExt ? this.path.slice(dot) : "";
+		for (let i = 0; ; i++) {
+			const candidate = i === 0 ? `${stem}.rev-${revision}${ext}` : `${stem}.rev-${revision}-${i}${ext}`;
+			if (await writeIfLocalUnchanged(this.ctx, candidate, plain, null)) return candidate;
+			if (i >= 20) throw new Error("无法创建历史副本：目标文件名均已被占用");
 		}
 	}
 }
