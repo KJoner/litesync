@@ -66,6 +66,12 @@ jobs:
       - name: Test (含 §8.4 真实文件系统矩阵)
         run: npm test
 
+      # 与 Android 用**同一份**探针：横向比较才有意义。
+      # realfs.test.ts 依赖 Node，Android 上没有；这个 sh 探针两边都能跑
+      - name: FS probe（与 Android 同一份脚本）
+        shell: bash
+        run: sh scripts/fs-probe.sh "${RUNNER_TEMP}/fsprobe"
+
       # 文档约束（§14 的八个部分、§2 的 INV 标注）——只在一个平台上跑就够，
       # 它们与操作系统无关
       - name: Doc invariants
@@ -73,3 +79,50 @@ jobs:
         run: |
           npm run check:adr
           npm run check:inv
+
+  # Android 的文件系统语义（§8.4 的 Android 格）。
+  #
+  # Obsidian Mobile 是一个 App，没法在 runner 里跑——但**文件系统语义**可以
+  # 单独取证，而碰撞规则的正确性恰恰只取决于文件系统。这一格验证的是最危险的
+  # 那条假设：我们以为两个名字不同、文件系统认为相同，后写的静默覆盖先写的。
+  #
+  # 探针跑在 /sdcard 上，也就是 Obsidian 在 Android 上真正使用的那个 FUSE 层，
+  # 而不是 /data 下的 ext4——两者语义不同，测错地方等于没测。
+  android-fs:
+    name: android-emulator (/sdcard)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 模拟器需要 KVM
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Probe /sdcard on Android
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          script: |
+            adb wait-for-device
+            adb push scripts/fs-probe.sh /data/local/tmp/fs-probe.sh
+            adb shell 'mkdir -p /sdcard/litesync-probe'
+            echo "===== Android /sdcard 文件系统语义 ====="
+            adb shell 'sh /data/local/tmp/fs-probe.sh /sdcard/litesync-probe' | tee android-fs.txt
+            adb shell 'rm -rf /sdcard/litesync-probe'
+            # 硬断言：最危险的一条必须被答上来。探针没跑完就等于这一格没测，
+            # 而"没测"绝不能表现为"通过"
+            grep -q '^PROBE_OK=1' android-fs.txt || { echo '探针未跑完'; exit 1; }
+            grep -q '^CASE_INSENSITIVE=\(yes\|no\)' android-fs.txt || { echo '大小写敏感性未测出'; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-fs-probe
+          path: android-fs.txt
+          if-no-files-found: warn
