@@ -6,10 +6,11 @@ import { sha256Hex } from "../utils/hash";
 import { ensureParentFolder } from "../utils/path";
 import { requireFileId } from "../utils/validate";
 import { evalFailpoint, FP } from "../utils/failpoint";
-import { InvalidVaultPathError, validateAndCanonicalizeVaultPath } from "../utils/vault-path";
+import { InvalidVaultPathError, pathsCollide, validateAndCanonicalizeVaultPath } from "../utils/vault-path";
 import { attemptAutoMerge } from "./auto-merge";
 import { keepBothVersions, keepIncomingAside } from "./conflict";
 import { SyncContext } from "./context";
+import { newOperationId } from "./queue";
 import {
 	assertMetaGeneration,
 	downloadPlain,
@@ -140,7 +141,7 @@ async function tryResolveNameSwap(
 	const temp = `${ctx.pluginDir()}/swap/${pseudonym}`;
 
 	// 意图先落盘：崩溃后 recoverInterruptedSwaps 靠这条记录把交换做完
-	ctx.store.setPendingSwap({ tempPath: temp, fileId: pseudonym, targetPath: newPath });
+	ctx.store.setPendingSwap({ tempPath: temp, fileId: pseudonym, targetPath: newPath, sourcePath: realPath });
 	await ctx.store.save();
 
 	try {
@@ -199,6 +200,16 @@ export async function recoverInterruptedSwaps(ctx: SyncContext): Promise<void> {
 		// 目标还被占着说明第二步（B → A）没做完；此时把临时文件放回原位更安全
 		const target = (await adapter.stat(swap.targetPath)) ? null : swap.targetPath;
 		if (target === null) {
+			// 0.17.0-rc.3：目标被**真实文件**占着可能永远不会空出来（比如大小写探测
+			// 中途崩溃、占用者是另一个文件）。原路径空着就放回去——文件回到用户
+			// 眼前，改名意图由下一轮 change 重放重新走完整判定
+			if (swap.sourcePath !== undefined && !(await adapter.stat(swap.sourcePath))) {
+				await ensureParentFolder(adapter, swap.sourcePath);
+				await adapter.rename(swap.tempPath, swap.sourcePath);
+				ctx.store.clearPendingSwap(swap.tempPath);
+				ctx.log(`swap: ${swap.targetPath} 被占用，已把临时副本放回原路径 ${swap.sourcePath}`);
+				continue;
+			}
 			ctx.log(`swap: ${swap.targetPath} 仍被占用，临时副本继续保留（下轮重试）`);
 			continue;
 		}
@@ -208,6 +219,164 @@ export async function recoverInterruptedSwaps(ctx: SyncContext): Promise<void> {
 		ctx.log(`swap: 已续做中断的交换 → ${target}`);
 	}
 	await ctx.store.save();
+}
+
+/**
+ * 把本地文件从 fromPath 搬到 toPath，正确处理「目标 stat 命中的其实是自己」的
+ * 大小写 / Unicode 归一化改名（v0.17 / 验收 T3.5）。
+ *
+ * 在大小写不敏感（或做 Unicode 归一化）的文件系统上，`stat(toPath)` 会命中
+ * fromPath 指向的同一个物理文件——把它当「目标被占用」会让纯大小写改名永远
+ * blocked。但反过来在大小写敏感的系统上，同名异例的文件确实可能是另一个文件，
+ * 直接 rename 会**覆盖**它。两种情况无法只靠 stat 区分，用两步探测消歧：
+ * 先把源文件挪到插件目录的临时名（意图先落盘，崩溃后可恢复），再看目标是否
+ * 仍然存在——消失了就是同一个文件（安全改名），仍在就是真实占用（挪回去）。
+ */
+async function renameLocalFile(
+	ctx: SyncContext,
+	fromPath: string,
+	toPath: string,
+	fileId: string | undefined,
+): Promise<"renamed" | "occupied"> {
+	const adapter = ctx.app.vault.adapter;
+	const occupied = await adapter.stat(toPath);
+	if (!occupied) {
+		await ensureParentFolder(adapter, toPath);
+		await adapter.rename(fromPath, toPath);
+		return "renamed";
+	}
+	// 目标被一个**已跟踪的其他对象**占着：这是真实占用，不必探测
+	if (ctx.store.get(toPath) !== undefined || !pathsCollide(fromPath, toPath)) {
+		return "occupied";
+	}
+	const temp = `${ctx.pluginDir()}/swap/${fileId ?? newOperationId()}`;
+	ctx.store.setPendingSwap({ tempPath: temp, fileId: fileId ?? "", targetPath: toPath, sourcePath: fromPath });
+	await ctx.store.save();
+	await ensureParentFolder(adapter, temp);
+	await adapter.rename(fromPath, temp);
+	if (await adapter.stat(toPath)) {
+		// 目标仍在 → 真实占用（大小写敏感系统上的另一个文件）：原样放回
+		await adapter.rename(temp, fromPath);
+		ctx.store.clearPendingSwap(temp);
+		await ctx.store.save();
+		return "occupied";
+	}
+	// 目标消失了 → stat 命中的就是源文件本身（大小写/归一化改名）：落到新名字
+	await ensureParentFolder(adapter, toPath);
+	await adapter.rename(temp, toPath);
+	ctx.store.clearPendingSwap(temp);
+	await ctx.store.save();
+	return "renamed";
+}
+
+/**
+ * 明文模式的改名应用（协议 v6 / ADR-001 §3.4）。
+ *
+ * v6 的改名是一次元数据更新：服务器只发一条「新路径 + 同 fileId + hash 未变 +
+ * metaGeneration 变新」的 upsert change，**不发 delete**——旧路径没有任何后续
+ * 变更来清理它。客户端必须按 fileId 认出这是改名并把本地文件搬过去；
+ * 认不出来的话新路径会被当成新文件下载，旧文件成为孤儿，
+ * 用户看到「新旧名各一个文件」（验收 T3.2 的失败形态）。
+ */
+async function applyPlainRename(
+	ctx: SyncContext,
+	fromPath: string,
+	toPath: string,
+	change: {
+		sequence: number;
+		fileId?: string;
+		revision?: number;
+		hash?: string;
+		metaGeneration?: number;
+	},
+	occupantTargets?: Map<string, string>,
+): Promise<Outcome> {
+	const tracked = ctx.store.get(fromPath);
+	if (!tracked) return "skipped";
+	// 陈旧改名（重放的旧 change）：本地已见过更新的元数据世代 → 不往回搬
+	if (
+		tracked.metaGeneration !== undefined &&
+		change.metaGeneration !== undefined &&
+		change.metaGeneration < tracked.metaGeneration
+	) {
+		return "skipped";
+	}
+	const adapter = ctx.app.vault.adapter;
+
+	if (!(await adapter.stat(fromPath))) {
+		// 本地原文件不在（可能刚被用户移走）：只更新状态键，内容由扫描收敛；
+		// 用户自己的改名意图（pending move op）跟着换基，随后作为正常改名推送（T3.4）
+		ctx.store.applyMetaRenameState(fromPath, toPath, { metaGeneration: change.metaGeneration });
+		ctx.queue.rebaseMoveFrom(fromPath, toPath);
+		return "applied";
+	}
+
+	// §6.9 两个文件交换名称（全量对账场景）：目标被另一个「自己也正要搬走、
+	// 且要搬到我这里」的文件占着 → 用临时名破环，与 meta 模式的 swap 同构
+	const occupant = ctx.store.get(toPath);
+	if (occupant !== undefined && (await adapter.stat(toPath))) {
+		const occupantTarget = occupant.fileId !== undefined ? occupantTargets?.get(occupant.fileId) : undefined;
+		if (occupantTarget === fromPath) {
+			return applyPlainSwap(ctx, fromPath, toPath, change);
+		}
+	}
+
+	if ((await renameLocalFile(ctx, fromPath, toPath, change.fileId ?? tracked.fileId)) === "occupied") {
+		ctx.store.setBlockedChange({
+			sequence: change.sequence,
+			action: "rename",
+			fileId: change.fileId ?? tracked.fileId,
+			revision: change.revision ?? tracked.revision,
+			contentHash: change.hash ?? tracked.serverHash,
+			contentGeneration: tracked.generation,
+			metaGeneration: change.metaGeneration,
+			realPath: toPath,
+			renameFrom: fromPath,
+			renameTo: toPath,
+			reason: "远端改名目标已被本地文件占用",
+		});
+		ctx.notify(`远端将 ${fromPath} 改名为 ${toPath}，但目标已存在本地文件，已暂缓`);
+		return "blocked";
+	}
+	ctx.store.applyMetaRenameState(fromPath, toPath, { metaGeneration: change.metaGeneration });
+	ctx.queue.rebaseMoveFrom(fromPath, toPath);
+	ctx.log(`pull: renamed ${fromPath} -> ${toPath}`);
+	return "applied";
+}
+
+/** 明文模式的名字互换（A → temp，B → A，temp → B），与 tryResolveNameSwap 同构。 */
+async function applyPlainSwap(
+	ctx: SyncContext,
+	realPath: string,
+	newPath: string,
+	change: { fileId?: string; metaGeneration?: number },
+): Promise<Outcome> {
+	const adapter = ctx.app.vault.adapter;
+	const temp = `${ctx.pluginDir()}/swap/${change.fileId ?? newOperationId()}`;
+	ctx.store.setPendingSwap({ tempPath: temp, fileId: change.fileId ?? "", targetPath: newPath, sourcePath: realPath });
+	await ctx.store.save();
+	try {
+		await ensureParentFolder(adapter, temp);
+		await adapter.rename(realPath, temp); // A → temp
+		await evalFailpoint(FP.swapAfterFirstStep);
+		await ensureParentFolder(adapter, realPath);
+		await adapter.rename(newPath, realPath); // B → A
+		await ensureParentFolder(adapter, newPath);
+		await adapter.rename(temp, newPath); // temp → B
+	} catch (e) {
+		ctx.log(`swap: 交换 ${realPath} ↔ ${newPath} 失败：${String(e)}（临时副本保留在插件目录，下轮自动续做）`);
+		return "blocked";
+	}
+	ctx.store.clearPendingSwap(temp);
+	const mine = ctx.store.get(realPath)!;
+	const theirs = ctx.store.get(newPath)!;
+	ctx.store.markDeleted(realPath);
+	ctx.store.markDeleted(newPath);
+	ctx.store.replaceWithNewObject(newPath, { ...mine, metaGeneration: change.metaGeneration });
+	ctx.store.replaceWithNewObject(realPath, { ...theirs });
+	await ctx.store.save();
+	ctx.log(`pull: swapped ${realPath} <-> ${newPath} via ${temp}`);
+	return "applied";
 }
 
 /**
@@ -255,14 +424,9 @@ async function applyMetaRename(
 		return "skipped";
 	}
 	const adapter = ctx.app.vault.adapter;
-	if (await adapter.stat(newPath)) {
-		// §6.9 两个文件交换名称：目标被占用不一定是死结——占着位子的那个文件
-		// 可能自己也正要搬走。先试着用临时名把环解开
-		const swapped = await tryResolveNameSwap(ctx, realPath, newPath, pseudonym, dec.metaGeneration, fingerprint);
-		if (swapped !== null) return swapped;
-
-		// §6.4：记下完整的改名变更（含 fileId / metaGeneration / 新旧路径），
-		// 重试时原样重放，不再靠真实路径合成一条假的 upsert
+	// §6.4：记下完整的改名变更（含 fileId / metaGeneration / 新旧路径），
+	// 重试时原样重放，不再靠真实路径合成一条假的 upsert
+	const registerBlocked = (): Outcome => {
 		ctx.store.setBlockedChange({
 			sequence,
 			action: "rename",
@@ -279,23 +443,40 @@ async function applyMetaRename(
 		});
 		ctx.notify(`远端将 ${realPath} 改名为 ${newPath}，但目标已存在本地文件，已暂缓`);
 		return "blocked";
+	};
+	// 「目标被占用」必须排除「stat 命中的是自己」：大小写不敏感/归一化的文件系统上，
+	// 纯大小写改名的 stat(newPath) 命中的就是 realPath 那个文件（T3.5）——
+	// 那不是占用，交给 renameLocalFile 的两步探测消歧
+	const occupiedByOther =
+		(await adapter.stat(newPath)) !== null &&
+		(ctx.store.get(newPath) !== undefined || !pathsCollide(realPath, newPath));
+	if (occupiedByOther) {
+		// §6.9 两个文件交换名称：目标被占用不一定是死结——占着位子的那个文件
+		// 可能自己也正要搬走。先试着用临时名把环解开
+		const swapped = await tryResolveNameSwap(ctx, realPath, newPath, pseudonym, dec.metaGeneration, fingerprint);
+		if (swapped !== null) return swapped;
+		return registerBlocked();
 	}
 	if (!(await adapter.stat(realPath))) {
-		// 本地原文件不在（可能刚被用户移走）：只更新状态键，内容由扫描收敛
+		// 本地原文件不在（可能刚被用户移走）：只更新状态键，内容由扫描收敛；
+		// 用户自己的改名意图（pending move op）跟着换基，随后作为正常改名推送（T3.4）
 		ctx.store.applyMetaRenameState(realPath, newPath, {
 			metaGeneration: dec.metaGeneration,
 			metaFingerprint: fingerprint,
 			serverPseudonym: pseudonym,
 		});
+		ctx.queue.rebaseMoveFrom(realPath, newPath);
 		return "applied";
 	}
-	await ensureParentFolder(adapter, newPath);
-	await adapter.rename(realPath, newPath);
+	if ((await renameLocalFile(ctx, realPath, newPath, tracked.fileId)) === "occupied") {
+		return registerBlocked();
+	}
 	ctx.store.applyMetaRenameState(realPath, newPath, {
 		metaGeneration: dec.metaGeneration,
 		metaFingerprint: fingerprint,
 		serverPseudonym: pseudonym,
 	});
+	ctx.queue.rebaseMoveFrom(realPath, newPath);
 	ctx.log(`pull: renamed ${realPath} -> ${newPath} (metaGen ${dec.metaGeneration})`);
 	return "applied";
 }
@@ -440,6 +621,15 @@ async function retryBlockedChanges(ctx: SyncContext, result: PullResult): Promis
 		if (rec.action === "rename" && rec.serverPseudonym && rec.renameFrom) {
 			// 改名重放：重新取元数据、重新校验路径、重新判断目标是否仍被占用
 			outcome = await applyMetaRename(ctx, rec.renameFrom, rec.serverPseudonym, rec.sequence);
+		} else if (rec.action === "rename" && rec.renameFrom && rec.renameTo) {
+			// 明文模式的改名重放（v6）：同样原样重放，不合成假 upsert
+			outcome = await applyPlainRename(ctx, rec.renameFrom, rec.renameTo, {
+				sequence: rec.sequence,
+				fileId: rec.fileId,
+				revision: rec.revision,
+				hash: rec.contentHash,
+				metaGeneration: rec.metaGeneration,
+			});
 		} else {
 			// §6.4：用记录里的原始字段重放这条变更，**不**用真实路径合成一条假的 upsert。
 			// serverPseudonym 在时以它寻址（meta 模式下服务器只认伪名）。
@@ -453,6 +643,7 @@ async function retryBlockedChanges(ctx: SyncContext, result: PullResult): Promis
 				path: replayPath,
 				action: rec.action === "delete" ? "delete" : "upsert",
 				revision: rec.revision ?? 0,
+				...(rec.fileId !== undefined ? { fileId: rec.fileId } : {}),
 				...(rec.contentHash !== undefined ? { hash: rec.contentHash } : {}),
 				...(rec.metaGeneration !== undefined ? { metaGeneration: rec.metaGeneration } : {}),
 			});
@@ -479,11 +670,19 @@ async function resyncFromSnapshot(ctx: SyncContext): Promise<PullResult> {
 	// meta 模式（v9.3 三期）：快照条目是伪名 + 加密元数据 → 先解出真实路径
 	const files = await resolveSnapshotPaths(ctx, snap.files, snap.sequence);
 	const snapPaths = new Set(files.map((f) => f.path));
+	// fileId → 快照中的目标路径：改名判定与名字互换破环都靠它
+	const snapTargets = new Map<string, string>();
+	for (const f of files) {
+		if (f.fileId) snapTargets.set(f.fileId, f.path);
+	}
 
 	// 已跟踪但快照中不存在 → 远端已删除
 	for (const path of ctx.store.paths()) {
 		if (ctx.ignores(path) || snapPaths.has(path)) continue;
 		const tracked = ctx.store.get(path);
+		// 同 fileId 仍在快照的另一条路径下：这是**改名**不是删除——
+		// 交给下面的 rename pass 处理，否则会先把文件送进回收站再全量重下载
+		if (tracked?.fileId !== undefined && snapTargets.has(tracked.fileId)) continue;
 		const outcome = await applyRemoteChange(ctx, {
 			sequence: snap.sequence,
 			path: metaEncrypted(ctx) && tracked?.fileId ? tracked.fileId : path,
@@ -497,10 +696,25 @@ async function resyncFromSnapshot(ctx: SyncContext): Promise<PullResult> {
 	for (const f of files) {
 		if (ctx.ignores(f.path)) continue;
 		// 离线期间的远端改名：同 fileId 挂在别的本地路径上 → 先做本地 rename
-		if (f.fileId && f.serverPseudonym) {
+		//（meta 模式经加密元数据；明文模式直接按快照路径）
+		if (f.fileId) {
 			const existing = ctx.store.pathByFileId(f.fileId);
 			if (existing !== undefined && existing !== f.path) {
-				const outcome = await applyMetaRename(ctx, existing, f.serverPseudonym, snap.sequence);
+				const outcome = f.serverPseudonym
+					? await applyMetaRename(ctx, existing, f.serverPseudonym, snap.sequence)
+					: await applyPlainRename(
+							ctx,
+							existing,
+							f.path,
+							{
+								sequence: snap.sequence,
+								fileId: f.fileId,
+								revision: f.revision,
+								hash: f.hash,
+								metaGeneration: f.metaGeneration,
+							},
+							snapTargets,
+						);
 				if (outcome === "applied") result.applied++;
 				if (outcome === "blocked") continue;
 			}
@@ -616,28 +830,58 @@ async function applyRemoteChange(
 		path = resolved.realPath;
 		serverPath = resolved.serverPath;
 
-		// 内容未变但元数据世代变新 = 仅改名
+		// 元数据世代变新 = 带着改名。§6.9：rename+edit 必须**先改名再写内容**——
+		// 反过来会把内容写回旧路径、还顺手记下新 metaGeneration，改名信号从此被吞掉
 		const tracked = ctx.store.get(path);
-		if (
-			change.action === "upsert" &&
-			tracked &&
-			change.hash &&
-			change.hash === tracked.serverHash &&
-			(change.metaGeneration ?? 0) > (tracked.metaGeneration ?? 0)
-		) {
-			return applyMetaRename(ctx, path, resolved.serverPath, change.sequence);
+		if (change.action === "upsert" && tracked && (change.metaGeneration ?? 0) > (tracked.metaGeneration ?? 0)) {
+			const renameOnly = change.hash !== undefined && change.hash === tracked.serverHash;
+			const ren = await applyMetaRename(ctx, path, resolved.serverPath, change.sequence);
+			if (renameOnly || ren === "blocked") return ren;
+			// 改名已落地（或状态已对齐），内容继续在新路径上应用
+			path = ctx.store.pathByFileId(resolved.serverPath) ?? path;
 		}
 	} else {
 		// 明文模式：路径直接来自服务器，同样不是可信输入（§6.12）
 		const safe = requireSafeRemotePath(ctx, path, {
 			sequence: change.sequence,
 			action: change.action === "delete" ? "delete" : "upsert",
+			fileId: change.fileId,
 			revision: change.revision,
 			contentHash: change.hash,
 			metaGeneration: change.metaGeneration,
 		});
 		if (safe === null) return "blocked";
 		path = safe;
+
+		// v6 改名检测（验收 T3.2）：同一 fileId 已跟踪在另一条本地路径上 →
+		// 这条 change 是改名（可能还带着编辑），先把本地文件搬过去，
+		// 绝不能当成新文件下载——那会把旧文件留成孤儿（新旧名各一）
+		if (change.action !== "delete" && change.fileId !== undefined) {
+			const existing = ctx.store.pathByFileId(change.fileId);
+			if (existing !== undefined && existing !== path) {
+				const existingState = ctx.store.get(existing);
+				if (existingState?.serverPseudonym === change.path) {
+					// 伪名化回声（验收 T6.4）：元数据迁移期间产生的 change 的 path 是
+					// 伪名（= 该对象已记录的 serverPseudonym）。abort 后 metaState 回到
+					// plain，这些 change 回放进明文分支——它们**不是改名**，绝不能把
+					// 真实文件改名成 32-hex；按真实本地路径应用内容、按伪名寻址服务器
+					path = existing;
+					serverPath = change.path;
+				} else {
+					const ren = await applyPlainRename(ctx, existing, path, change);
+					if (ren === "blocked") return "blocked";
+					// 陈旧改名（重放的旧 change）：文件的现名比这条 change 更新，
+					// 绝不能落到下面的内容应用——那会按旧名字重新造出一个文件
+					if (ren === "skipped") return skip(note, "stale-rename-change");
+					const moved = ctx.store.get(path);
+					// 纯改名（内容未变）：改名即全部；rename+edit 继续在新路径上应用内容
+					if (change.hash !== undefined && change.hash === moved?.serverHash) {
+						if (moved) ctx.store.update(path, { revision: change.revision });
+						return ren;
+					}
+				}
+			}
+		}
 	}
 
 	if (ctx.ignores(path)) return skip(note, "ignored-by-rules");
@@ -649,7 +893,7 @@ async function applyRemoteChange(
 	// 必须在写之前拦住：登记 blocked，两份内容都留在服务器上。
 	// 删除不拦：删除不会造成覆盖，而拦下来反而会让本地留着不该留的文件。
 	if (change.action !== "delete") {
-		const collides = ctx.store.collidingPath(path, serverPath ?? ctx.store.get(path)?.fileId);
+		const collides = ctx.store.collidingPath(path, serverPath ?? change.fileId ?? ctx.store.get(path)?.fileId);
 		if (collides !== undefined) {
 			ctx.store.setBlockedChange({
 				sequence: change.sequence,

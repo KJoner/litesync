@@ -93,8 +93,13 @@ export async function attemptAutoMerge(
 			const mergedData = encodeUtf8(result.mergedText);
 			const mergedHash = await sha256Hex(mergedData);
 			try {
-				// Race Protection：必须以下载到的 remote revision 作为 baseRevision
-				const out = await uploadFromPlain(ctx, path, mergedData, remote.revision, Date.now(), "merge");
+				// Race Protection：必须以下载到的 remote revision 作为 baseRevision；
+				// E2EE 下 contentGeneration 同理——tracked 里的世代可能落后于服务器
+				//（对端在本机离线期间推高了它），必须以刚下载的 HEAD 世代为下限，
+				// 否则上传会被服务器按回退拒绝，且重试永远撞同一堵墙
+				const out = await uploadFromPlain(ctx, path, mergedData, remote.revision, Date.now(), "merge", {
+					generationFloor: remote.generation,
+				});
 				// 本地 CAS（v9 TOCTOU 修复）：合并/上传期间用户又编辑了该文件 →
 				// 不覆盖本地、也不更新 tracked；下一轮扫描会以新内容再走一次合并
 				const wrote = await writeIfLocalUnchanged(ctx, path, mergedData, localHash);

@@ -63,6 +63,7 @@ export async function loadConflict(ctx: SyncContext, path: string): Promise<Load
 		path,
 		pending,
 		remoteRevision: remote.revision,
+		remoteGeneration: remote.generation,
 		localText,
 		localHash,
 		remoteText,
@@ -91,11 +92,17 @@ export async function saveResolution(
 	finalText: string,
 	remoteRevision: number,
 	expectedLocalHash: string,
+	remoteGeneration?: number,
 ): Promise<number> {
 	requireSyncSafe(ctx, "保存冲突合并结果");
 	const data = encodeUtf8(finalText);
 	const hash = await sha256Hex(data);
-	const out = await uploadFromPlain(ctx, path, data, remoteRevision, Date.now(), "merge");
+	// E2EE：tracked 里的 contentGeneration 可能落后于服务器（对端在本机离线期间
+	// 推高了它）。以打开 Resolver 时下载到的远端世代为下限，否则上传必然被
+	// 服务器按回退拒绝（409），而「重新加载再保存」并不会改变 tracked——死循环
+	const out = await uploadFromPlain(ctx, path, data, remoteRevision, Date.now(), "merge", {
+		generationFloor: remoteGeneration,
+	});
 
 	const wrote = await writeIfLocalUnchanged(ctx, path, data, expectedLocalHash === "" ? null : expectedLocalHash);
 	if (!wrote) throw new LocalChangedError(path);

@@ -357,9 +357,17 @@ async function restoreObject(
 		metaEnc: meta?.metaEnc,
 		canonicalHash: meta?.canonicalHash,
 	});
+	// generation 必须记账：restore 已把服务器上该对象的 contentGeneration 推到
+	// nextGen——紧接着的内容上传要在它**之上**（nextGen+1）。漏记的话上传会从
+	// tracked（空 → 0）推导出 generation 1 ≤ nextGen，被服务器按回退拒绝（409），
+	// 下一轮再把这个 409 当成真实冲突去合并，凭空造出一个冲突副本。
+	// metaGeneration 同理：恢复后服务器上是 tombstone 的值 + 1，
+	// 不记账的话恢复后的第一次改名会拿旧世代做 CAS 而 412
 	ctx.store.update(path, {
 		fileId: out.fileId,
 		revision: out.revision,
+		generation: nextGen,
+		...(metaEncrypted(ctx) ? { metaGeneration: 1 } : { metaGeneration: out.metaGeneration }),
 		serverPseudonym: metaEncrypted(ctx) ? out.path : undefined,
 	});
 	return { fileId: out.fileId, revision: out.revision };

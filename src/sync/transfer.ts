@@ -444,6 +444,19 @@ async function reserveFileId(ctx: SyncContext, path: string): Promise<string> {
 	return fileId;
 }
 
+export interface UploadOptions {
+	/**
+	 * contentGeneration 的下限（不含）：本次写入的世代必须**大于**它。
+	 *
+	 * 用于「基于刚下载的远端 HEAD 上传」的场景（合并保存、恢复后重传等）：
+	 * 那时 tracked.generation 往往落后于服务器——对端在本机离线期间推高了世代。
+	 * 只按 tracked 推导会得到 gen ≤ 服务器当前值，被服务器按回退拒绝（409），
+	 * 而重试并不会改变 tracked，于是每一次都撞同一堵墙。
+	 * 调用方把**经 AAD 认证的**远端世代传进来，这里取两者较大者 + 1。
+	 */
+	generationFloor?: number;
+}
+
 /** 上传明文内容（E2EE 启用时自动加密，默认 LSE3；meta 模式自动伪名 + 挂元数据）。 */
 export async function uploadFromPlain(
 	ctx: SyncContext,
@@ -452,6 +465,7 @@ export async function uploadFromPlain(
 	baseRevision: number,
 	mtime: number,
 	action: UploadAction = "upsert",
+	opts?: UploadOptions,
 ): Promise<UploadOutcome> {
 	let payload = plain;
 	let sendFileId: string | undefined;
@@ -477,7 +491,8 @@ export async function uploadFromPlain(
 				tracked?.fileId === undefined
 					? await reserveFileId(ctx, path)
 					: requireFileId(tracked.fileId, `upload(${path}).fileId`);
-			generation = (tracked?.fileId === fileId ? (tracked?.generation ?? 0) : 0) + 1;
+			const knownGen = tracked?.fileId === fileId ? (tracked?.generation ?? 0) : 0;
+			generation = Math.max(knownGen, opts?.generationFloor ?? 0) + 1;
 			const binding3 = { vaultId: bind.vaultId, keyEpoch: bind.keyEpoch, fileId, generation };
 			// 大小混淆（§11.1）：开启时用 LSE4 并把明文填充到桶边界。
 			// 只对新写入生效——已有文件在下次修改时自然转过去，

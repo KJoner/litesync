@@ -389,6 +389,108 @@ export function unframeShareContent(plain: ArrayBuffer): { name: string | null; 
 	return { name, content: plain.slice(6 + nameLen) };
 }
 
+/**
+ * 多条目分享帧（0.17.0-rc.3，验收 T2.4）：
+ *
+ *   "LSN2" | nameLen(2,BE) | name(UTF-8) | count(2,BE) |
+ *     count × ( pathLen(2,BE) | path(UTF-8) | dataLen(4,BE) | data ) | content
+ *
+ * 主文档仍在帧尾（与 LSN1 同构）；内嵌图片等附件作为 (vault 相对路径, 字节)
+ * 列表随行加密——查看端据此在本地渲染 `![[img]]` 与 `![](img.png)`，
+ * 服务器仍然只见一个密文 blob，看不到附件的数量、名字与内容。
+ * 没有附件时继续用 LSN1（旧查看端可读）。
+ */
+const SHARE_BUNDLE_MAGIC = new Uint8Array([0x4c, 0x53, 0x4e, 0x32]); // "LSN2"
+
+export interface ShareAttachment {
+	/** Vault 相对路径（查看端按整路径与 basename 两级解析） */
+	path: string;
+	data: ArrayBuffer;
+}
+
+/** 把显示名、附件与内容打成多条目帧。 */
+export function frameShareBundle(name: string, content: ArrayBuffer, attachments: ShareAttachment[]): ArrayBuffer {
+	if (attachments.length === 0) return frameShareContent(name, content);
+	if (attachments.length > 0xffff) throw new Error("分享附件过多");
+	const enc = new TextEncoder();
+	const nameBytes = enc.encode(name);
+	if (nameBytes.length > 0xffff) throw new Error("分享显示名过长");
+	const entries = attachments.map((a) => {
+		const pathBytes = enc.encode(a.path);
+		if (pathBytes.length > 0xffff) throw new Error(`附件路径过长：${a.path}`);
+		return { pathBytes, data: new Uint8Array(a.data) };
+	});
+	let size = 4 + 2 + nameBytes.length + 2 + content.byteLength;
+	for (const e of entries) size += 2 + e.pathBytes.length + 4 + e.data.length;
+	const out = new Uint8Array(size);
+	const dv = new DataView(out.buffer);
+	let off = 0;
+	out.set(SHARE_BUNDLE_MAGIC, off);
+	off += 4;
+	dv.setUint16(off, nameBytes.length, false);
+	off += 2;
+	out.set(nameBytes, off);
+	off += nameBytes.length;
+	dv.setUint16(off, entries.length, false);
+	off += 2;
+	for (const e of entries) {
+		dv.setUint16(off, e.pathBytes.length, false);
+		off += 2;
+		out.set(e.pathBytes, off);
+		off += e.pathBytes.length;
+		dv.setUint32(off, e.data.length, false);
+		off += 4;
+		out.set(e.data, off);
+		off += e.data.length;
+	}
+	out.set(new Uint8Array(content), off);
+	return out.buffer;
+}
+
+/**
+ * 拆解分享帧（LSN2 / LSN1 / 裸内容三代兼容）。
+ * 任何解析失败都退化为「整段是内容」，绝不因为帧头像就丢内容。
+ */
+export function unframeShareBundle(plain: ArrayBuffer): {
+	name: string | null;
+	content: ArrayBuffer;
+	attachments: ShareAttachment[];
+} {
+	const view = new Uint8Array(plain);
+	if (plain.byteLength < 8 || !SHARE_BUNDLE_MAGIC.every((b, i) => view[i] === b)) {
+		const framed = unframeShareContent(plain);
+		return { name: framed.name, content: framed.content, attachments: [] };
+	}
+	try {
+		const dv = new DataView(plain);
+		const dec = new TextDecoder();
+		let off = 4;
+		const nameLen = dv.getUint16(off, false);
+		off += 2;
+		if (off + nameLen > plain.byteLength) throw new Error("truncated");
+		const name = dec.decode(plain.slice(off, off + nameLen));
+		off += nameLen;
+		const count = dv.getUint16(off, false);
+		off += 2;
+		const attachments: ShareAttachment[] = [];
+		for (let i = 0; i < count; i++) {
+			const pathLen = dv.getUint16(off, false);
+			off += 2;
+			if (off + pathLen > plain.byteLength) throw new Error("truncated");
+			const path = dec.decode(plain.slice(off, off + pathLen));
+			off += pathLen;
+			const dataLen = dv.getUint32(off, false);
+			off += 4;
+			if (off + dataLen > plain.byteLength) throw new Error("truncated");
+			attachments.push({ path, data: plain.slice(off, off + dataLen) });
+			off += dataLen;
+		}
+		return { name, content: plain.slice(off), attachments };
+	} catch {
+		return { name: null, content: plain, attachments: [] };
+	}
+}
+
 export async function encryptShare(keyRaw: Uint8Array, plaintext: ArrayBuffer): Promise<ArrayBuffer> {
 	const key = await crypto.subtle.importKey("raw", keyRaw as BufferSource, { name: "AES-GCM" }, false, [
 		"encrypt",

@@ -66,6 +66,8 @@ export class EnableE2eeModal extends Modal {
 			trustDevice: boolean,
 			onProgress: (p: MigrationProgress) => void,
 		) => Promise<number>,
+		/** 场景化文案（如首次配置的空仓启用——那时没有迁移，默认文案会说谎） */
+		private copy?: { note?: string; success?: (migrated: number) => string },
 	) {
 		super(app);
 	}
@@ -82,7 +84,9 @@ export class EnableE2eeModal extends Modal {
 			text: "⚠️ 密码一旦丢失，服务器上的数据将永远无法恢复；本版本不支持关闭 E2EE 或修改密码。",
 		});
 		warn.createEl("p", {
-			text: "迁移过程会把当前所有文件重新加密上传，并在验证密文后清理服务器上的明文历史。请确保其他设备此刻不在同步。",
+			text:
+				this.copy?.note ??
+				"迁移过程会把当前所有文件重新加密上传，并在验证密文后清理服务器上的明文历史。请确保其他设备此刻不在同步。",
 		});
 
 		contentEl.createDiv({ text: "设置 E2EE 密码（至少 8 个字符）：" });
@@ -120,7 +124,7 @@ export class EnableE2eeModal extends Modal {
 				const migrated = await this.onEnable(pw1.value, trustBox.checked, (p) => {
 					progressEl.setText(`加密迁移中 ${p.done}/${p.total}：${p.current}`);
 				});
-				new Notice(`端到端加密已启用，共迁移 ${migrated} 个文件 ✓`, 10000);
+				new Notice(this.copy?.success?.(migrated) ?? `端到端加密已启用，共迁移 ${migrated} 个文件 ✓`, 10000);
 				this.close();
 			} catch (e) {
 				errorEl.setText(

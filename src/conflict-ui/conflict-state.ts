@@ -8,6 +8,8 @@ export interface LoadedConflict {
 	pending: PendingConflict;
 	/** 打开 Resolver 时刻的远端 revision（Save Merge 必须以它为 baseRevision） */
 	remoteRevision: number;
+	/** 打开 Resolver 时刻远端 HEAD 的 contentGeneration（E2EE；Save Merge 的世代下限） */
+	remoteGeneration?: number;
 	localText: string;
 	/** 打开 Resolver 时刻本地内容的 hash（Save 时本地 CAS 用，v9） */
 	localHash: string;

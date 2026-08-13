@@ -64,7 +64,7 @@ export const PLUGIN_PROTOCOL_VERSION = 6;
  * 协议版本号（6）粒度太粗：同一个协议版本下的两个插件版本，
  * 修没修某个已知 bug 是不一样的。
  */
-export const PLUGIN_VERSION = "0.17.0-rc.2";
+export const PLUGIN_VERSION = "0.17.0-rc.3";
 
 /** 协议不兼容时返回给用户的提示；兼容返回 null。 */
 export function protocolError(info: ServerInfo): string | null {
@@ -809,7 +809,7 @@ export class ApiClient {
 			canonicalHash?: string;
 		},
 		operationId?: string,
-	): Promise<{ fileId: string; path: string; revision: number; sequence: number }> {
+	): Promise<{ fileId: string; path: string; revision: number; metaGeneration?: number; sequence: number }> {
 		const res = await requestUrl({
 			url: `${this.base()}/api/v1/files/${encodeURIComponent(fileId)}/restore`,
 			method: "POST",
@@ -824,7 +824,7 @@ export class ApiClient {
 			throw: false,
 		});
 		if (res.status !== 200) throw apiError(res.status, `restore ${fileId} failed`, res.text);
-		return res.json as { fileId: string; path: string; revision: number; sequence: number };
+		return res.json as { fileId: string; path: string; revision: number; metaGeneration?: number; sequence: number };
 	}
 
 	/** 信封升级完成：服务器验证全部 HEAD 为 LSE3 后把仓库下限提升到 3（ADR-006）。 */

@@ -5,11 +5,54 @@
  * 服务器只保存密文；Share Key 放在链接 fragment（# 后内容不会发给服务器）。
  * 绝不使用 / 泄露 Vault Master Key。撤销只作用于分享对象，不影响原始 Vault。
  */
-import { Modal, Notice } from "obsidian";
+import { Modal, Notice, TFile } from "obsidian";
 import { ShareEntry } from "../api/client";
-import { b64urlEncode, encryptShare, frameShareContent, randomBytes } from "../crypto/crypto";
+import { b64urlEncode, encryptShare, frameShareBundle, randomBytes, ShareAttachment } from "../crypto/crypto";
 import { SyncContext } from "../sync/context";
 import { requireSyncSafe } from "../sync/gate";
+
+/** 随分享打包的内嵌附件类型（与 Web 端 IMAGE_EXT 一致：只有图片会被内联渲染）。 */
+const SHARE_IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
+/** 附件总量上限：分享是「一篇笔记」不是「备份通道」，也别撞服务器单对象上限。 */
+const SHARE_ATTACHMENT_BUDGET = 64 << 20;
+
+/**
+ * 收集笔记内嵌的图片附件（`![[img.png]]` 与 `![](img.png)` 都在 metadataCache
+ * 的 embeds 里）。拿不到缓存、目标不存在、超出预算的条目一律跳过——
+ * 分享绝不因为一张图挂掉，最多退回「只有文字」的旧行为。
+ */
+async function collectImageEmbeds(
+	ctx: SyncContext,
+	notePath: string,
+	warn: (msg: string) => void,
+): Promise<ShareAttachment[]> {
+	const file = ctx.app.vault.getAbstractFileByPath(notePath);
+	if (!(file instanceof TFile)) return [];
+	const embeds = ctx.app.metadataCache.getFileCache(file)?.embeds ?? [];
+	const out: ShareAttachment[] = [];
+	const seen = new Set<string>();
+	let budget = SHARE_ATTACHMENT_BUDGET;
+	for (const emb of embeds) {
+		const linkpath = emb.link.split("#")[0].split("|")[0].trim();
+		if (linkpath === "") continue;
+		const target = ctx.app.metadataCache.getFirstLinkpathDest(linkpath, notePath);
+		if (!target || seen.has(target.path) || !SHARE_IMAGE_EXT.test(target.path)) continue;
+		seen.add(target.path);
+		let data: ArrayBuffer;
+		try {
+			data = await ctx.app.vault.adapter.readBinary(target.path);
+		} catch {
+			continue;
+		}
+		if (data.byteLength > budget) {
+			warn(`图片超出分享附件预算，已跳过：${target.path}`);
+			continue;
+		}
+		budget -= data.byteLength;
+		out.push({ path: target.path, data });
+	}
+	return out;
+}
 
 function shareUrl(serverUrl: string, id: string, keyB64url: string): string {
 	return `${serverUrl.replace(/\/+$/, "")}/share.html#${id}.${keyB64url}`;
@@ -68,7 +111,10 @@ export class ShareModal extends Modal {
 				// §7.4：显示名与内容一起加密。只放文件名（不含目录）——
 				// 分享对象本来就不需要知道发送者的目录结构
 				const displayName = this.path.slice(this.path.lastIndexOf("/") + 1);
-				const payload = await encryptShare(keyRaw, frameShareContent(displayName, plain));
+				// T2.4：内嵌图片随分享一起加密打包（LSN2），查看端才有字节可渲染；
+				// 服务器仍只见一个密文 blob，附件的数量与名字都在密文里
+				const attachments = await collectImageEmbeds(this.ctx, this.path, (m) => new Notice(m));
+				const payload = await encryptShare(keyRaw, frameShareBundle(displayName, plain, attachments));
 				const days = parseInt(select.value, 10);
 				const expiresAt = days > 0 ? Math.floor(Date.now() / 1000) + days * 86400 : 0;
 				const { id } = await this.ctx.client.createShare(expiresAt, payload);

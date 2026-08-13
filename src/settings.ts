@@ -145,7 +145,8 @@ export class SyncSettingTab extends PluginSettingTab {
 						action: (el) => {
 							el.addClass("is-disabled");
 							void plugin.testConnection().then((msg) => {
-								new Notice(msg);
+								// null = 已弹出「首次配置三选项」对话框，无需再报消息
+								if (msg !== null) new Notice(msg);
 								el.removeClass("is-disabled");
 							});
 						},

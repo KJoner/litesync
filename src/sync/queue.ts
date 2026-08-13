@@ -182,6 +182,24 @@ export class PendingQueue {
 		this.fireChange();
 	}
 
+	/**
+	 * 远端改名落地后，把同一对象上 pending 的本地改名意图跟着换基（验收 T3.4）。
+	 *
+	 * 场景：本机离线把 race.md 改成 race-d2.md（move op 的 from=race.md），
+	 * 上线后 pull 先应用了对端的改名 race.md → race-d1.md（tracked 已重键）。
+	 * 不换基的话，pushMove 按旧 from 找不到 tracked，只能退化为「新建对象」——
+	 * 服务器上凭空多出一份内容。换基后它变成 race-d1.md → race-d2.md 的正常
+	 * 改名：同一身份、无 tombstone、两台设备收敛到同一个名字。
+	 */
+	rebaseMoveFrom(oldFrom: string, newFrom: string): void {
+		for (const entry of this.map.values()) {
+			if (entry.op.action === "move" && entry.op.from === oldFrom) {
+				entry.op.from = newFrom;
+				this.fireChange();
+			}
+		}
+	}
+
 	/** 查看某路径当前排队的操作（不存在返回 undefined）。 */
 	getOp(path: string): PendingOp | undefined {
 		return this.map.get(path)?.op;

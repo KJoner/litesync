@@ -87,6 +87,7 @@ export class ResolverModal extends Modal {
 					this.loaded.merge.mergedText,
 					this.loaded.remoteRevision,
 					this.loaded.localHash,
+					this.loaded.remoteGeneration,
 				);
 				new Notice(`冲突已自动消除: ${this.path}`);
 				this.ctx.onConflictsChanged();
@@ -247,7 +248,14 @@ export class ResolverModal extends Modal {
 			return;
 		}
 		try {
-			const rev = await saveResolution(this.ctx, this.path, text, this.loaded!.remoteRevision, this.loaded!.localHash);
+			const rev = await saveResolution(
+				this.ctx,
+				this.path,
+				text,
+				this.loaded!.remoteRevision,
+				this.loaded!.localHash,
+				this.loaded!.remoteGeneration,
+			);
 			new Notice(`合并完成: ${this.path} → Revision ${rev}`);
 			this.ctx.onConflictsChanged();
 			this.close();

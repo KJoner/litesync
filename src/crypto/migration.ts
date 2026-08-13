@@ -38,16 +38,8 @@ export interface MigrationProgress {
 	current: string;
 }
 
-export async function enableE2ee(
-	ctx: SyncContext,
-	password: string,
-	fullSync: () => Promise<void>,
-	onProgress: (p: MigrationProgress) => void,
-): Promise<number> {
-	requireSyncSafe(ctx, "启用端到端加密");
-	if (password.length < 8) throw new Error("密码至少 8 个字符");
-
-	// 1. 获取或创建 vault key（支持中断后重新执行）
+/** 步骤 1（enableE2ee 与空仓启用共用）：获取或创建 vault key 并采纳（支持中断后重新执行）。 */
+async function acquireVaultKey(ctx: SyncContext, password: string): Promise<CryptoKey> {
 	let doc = await ctx.client.getVaultKey();
 	let vmk: CryptoKey;
 	if (doc) {
@@ -64,6 +56,36 @@ export async function enableE2ee(
 	ctx.e2ee.adopt(doc, vmk);
 	ctx.store.state.e2ee = doc;
 	await ctx.store.save();
+	return vmk;
+}
+
+/** 最后一步（同上共用）：把 key 文档标记 enabled（CAS，绝不盲目覆盖并发写入）。 */
+async function finalizeVaultKeyEnabled(ctx: SyncContext, vmk: CryptoKey): Promise<void> {
+	const cur = await ctx.client.getVaultKeyWithFingerprint();
+	if (!cur) throw new Error("vault key 文档丢失，请重新启用");
+	if (!cur.doc.enabled) {
+		const finalDoc: VaultKeyDoc = { ...cur.doc, enabled: true };
+		await ctx.client.putVaultKey(finalDoc, true, cur.fingerprint);
+		ctx.e2ee.adopt(finalDoc, vmk);
+		ctx.store.state.e2ee = finalDoc;
+	} else {
+		ctx.e2ee.adopt(cur.doc, vmk);
+		ctx.store.state.e2ee = cur.doc;
+	}
+	await ctx.store.save();
+}
+
+export async function enableE2ee(
+	ctx: SyncContext,
+	password: string,
+	fullSync: () => Promise<void>,
+	onProgress: (p: MigrationProgress) => void,
+): Promise<number> {
+	requireSyncSafe(ctx, "启用端到端加密");
+	if (password.length < 8) throw new Error("密码至少 8 个字符");
+
+	// 1. 获取或创建 vault key（支持中断后重新执行）
+	const vmk = await acquireVaultKey(ctx, password);
 
 	// 2. 迁移前必须同步干净：fullSync 等待当前轮 + 所有续轮 + 队列排空（LS-121-C06），
 	//    绝不在「只是设置了 runAgain」的状态下开始不可逆迁移
@@ -122,20 +144,38 @@ async function runE2eeMigration(
 	}
 
 	// 7. 标记 key 文档 enabled（CAS：携带当前指纹，绝不盲目覆盖并发写入的文档）
-	const cur = await ctx.client.getVaultKeyWithFingerprint();
-	if (!cur) throw new Error("vault key 文档丢失，请重新启用");
-	if (!cur.doc.enabled) {
-		const finalDoc: VaultKeyDoc = { ...cur.doc, enabled: true };
-		await ctx.client.putVaultKey(finalDoc, true, cur.fingerprint);
-		ctx.e2ee.adopt(finalDoc, vmk);
-		ctx.store.state.e2ee = finalDoc;
-	} else {
-		ctx.e2ee.adopt(cur.doc, vmk);
-		ctx.store.state.e2ee = cur.doc;
-	}
-	await ctx.store.save();
+	await finalizeVaultKeyEnabled(ctx, vmk);
 	ctx.log(`e2ee: migration complete, ${done} files encrypted`);
 	return done;
+}
+
+/**
+ * 在**未初始化的空远端**上直接启用 E2EE（首次配置的三选项之一）。
+ *
+ * 与 {@link enableE2ee} 的区别：此刻 bootstrap 尚未完成（requireSyncSafe 必拦），
+ * 服务器上也没有任何文件——没有迁移可做，走「取 key → begin → complete →
+ * enabled」即可。之后由调用方完成 local-init 接入，首次上传就是 LSE3 密文，
+ * 明文从头到尾不落服务器（对比「先 local-init 再 enableE2ee」的双倍流量 +
+ * 明文短暂进服务器 WAL/备份）。
+ */
+export async function enableE2eeOnEmptyRemote(ctx: SyncContext, password: string): Promise<void> {
+	if (ctx.store.corrupted) throw new Error("本地同步状态损坏，无法启用");
+	if (password.length < 8) throw new Error("密码至少 8 个字符");
+	const info = await ctx.client.info();
+	if ((info.latestSequence ?? 0) > 0 || (info.encryptionState ?? "plaintext") !== "plaintext") {
+		throw new Error("远端仓库已不是未初始化状态，请改用接入向导");
+	}
+	const vmk = await acquireVaultKey(ctx, password);
+	const state = await ctx.client.e2eeTransition("begin");
+	ctx.store.state.bootstrap.keyEpoch = requireKeyEpoch(state.keyEpoch, "e2ee/begin.keyEpoch");
+	if (!ctx.store.state.bootstrap.remoteVaultId && info.vaultId) {
+		ctx.store.state.bootstrap.remoteVaultId = info.vaultId;
+	}
+	await ctx.store.save();
+	// 快照为空：服务器对 0 个 HEAD 的验证直接放行
+	await ctx.client.e2eeTransition("complete");
+	await finalizeVaultKeyEnabled(ctx, vmk);
+	ctx.log("e2ee: enabled on empty remote (no migration needed)");
 }
 
 async function migratePath(

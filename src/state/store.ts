@@ -169,6 +169,11 @@ export interface PendingSwap {
 	fileId: string;
 	/** 它最终应该落到哪个真实路径 */
 	targetPath: string;
+	/**
+	 * 它来自哪个真实路径（0.17.0-rc.3）：目标被真实占用、无法前进时，
+	 * 恢复流程把它放回原位而不是永远滞留在插件目录里等一个不会空出来的目标
+	 */
+	sourcePath?: string;
 }
 
 /**

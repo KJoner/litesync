@@ -1,6 +1,8 @@
 import { Notice, Platform, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
-import { ApiClient } from "./api/client";
+import { ApiClient, protocolError } from "./api/client";
+import { bootstrapLocalInit, preflight } from "./bootstrap/bootstrap-manager";
 import { BootstrapWizardModal } from "./bootstrap/bootstrap-modal";
+import { FirstSyncModal } from "./bootstrap/first-sync-modal";
 import { ConflictListModal } from "./conflict-ui/conflict-view";
 import {
 	API_TOKEN_SECRET_ID,
@@ -11,7 +13,13 @@ import {
 import { EnableE2eeModal, UnlockModal } from "./crypto/e2ee-modals";
 import { Keyring } from "./crypto/keyring";
 import { ConfirmMetaEncryptionModal } from "./crypto/meta-modals";
-import { abortMetadataMigration, enableE2ee, encryptMetadata, upgradeEnvelopes } from "./crypto/migration";
+import {
+	abortMetadataMigration,
+	enableE2ee,
+	enableE2eeOnEmptyRemote,
+	encryptMetadata,
+	upgradeEnvelopes,
+} from "./crypto/migration";
 import { HistoryModal } from "./history/history-view";
 import { DeviceListModal } from "./pairing/device-list-modal";
 import { PasteLinkModal, registerImportHandler } from "./pairing/import-handler";
@@ -586,15 +594,69 @@ export default class PrivateSyncPlugin extends Plugin {
 		await this.manager.sync("manual");
 	}
 
-	async testConnection(): Promise<string> {
+	/** 返回给设置页展示的消息；null 表示已改为弹出「首次配置三选项」对话框。 */
+	async testConnection(): Promise<string | null> {
 		if (!this.client) return "插件尚未初始化完成，请稍候";
 		if (!this.isConfigured()) return "请先填写 Server URL 和 API Token";
 		try {
 			const info = await this.client.info();
+			const perr = protocolError(info);
+			if (perr) return perr;
+			// 首次配置（0.17.0-rc.3）：远端仓库未初始化且本设备未接入 → 三选项对话框。
+			// 「已启用 E2EE 但 0 个文件」不算未初始化——那是第二台设备接入的形状，
+			// 必须走接入向导的解锁门，绝不能在这里提供「添加 E2EE」
+			if (
+				(info.latestSequence ?? 0) === 0 &&
+				(info.encryptionState ?? "plaintext") === "plaintext" &&
+				!this.bootstrapReady &&
+				this.ctx !== null &&
+				this.manager !== null
+			) {
+				new FirstSyncModal(this.app, {
+					syncNow: () => this.firstSyncNow(),
+					withE2ee: () => this.openFirstSyncE2eeModal(),
+				}).open();
+				return null;
+			}
 			return `连接成功：服务器版本 ${info.version}，latestSequence=${info.latestSequence}`;
 		} catch (e) {
 			return `连接失败：${e instanceof Error ? e.message : String(e)}`;
 		}
+	}
+
+	/** 三选项之「立即同步」：local-init 接入并触发首轮同步（远端已非空则转交向导）。 */
+	private async firstSyncNow(): Promise<void> {
+		const pre = await preflight(this.ctx!);
+		if (pre.remoteFiles.length > 0) {
+			// 竞态兜底：点按钮前另一台设备已初始化了远端 → 绝不盲目 local-init
+			new Notice("远端仓库已有内容，转入接入向导");
+			this.openBootstrapWizard();
+			return;
+		}
+		await bootstrapLocalInit(this.ctx!, pre);
+		this.updateStatus("idle");
+		new Notice("已初始化，开始首次同步");
+		void this.manager!.sync("bootstrap");
+	}
+
+	/** 三选项之「添加 E2EE 并立即同步」：空仓启用（无迁移）→ local-init → 首轮同步即密文。 */
+	private openFirstSyncE2eeModal(): void {
+		new EnableE2eeModal(
+			this.app,
+			this.settings.trustDevice,
+			async (password, trustDevice) => {
+				await enableE2eeOnEmptyRemote(this.ctx!, password);
+				await this.setTrustDevice(trustDevice);
+				// 必须在启用 E2EE 之后重跑 preflight：completeBootstrap 会把 pending binding
+				// 里的 keyEpoch 写进正式 binding，用启用前的旧值（0）会产出 AAD 错绑的密文
+				await this.firstSyncNow();
+				return 0;
+			},
+			{
+				note: "远端仓库还是空的：设好密码即刻生效，随后的首次上传就是密文——没有迁移过程，明文不会经过服务器。",
+				success: () => "端到端加密已启用，正在进行首次同步（全部内容以密文上传）✓",
+			},
+		).open();
 	}
 
 	private isConfigured(): boolean {
