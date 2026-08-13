@@ -64,7 +64,7 @@ export const PLUGIN_PROTOCOL_VERSION = 6;
  * 协议版本号（6）粒度太粗：同一个协议版本下的两个插件版本，
  * 修没修某个已知 bug 是不一样的。
  */
-export const PLUGIN_VERSION = "0.17.0-rc.4";
+export const PLUGIN_VERSION = "0.17.0";
 
 /**
  * 平台紧凑 token（随每个请求上报，运维页 Devices 列表用）。
@@ -787,7 +787,9 @@ export class ApiClient {
 	 * 服务器只改 pseudonym / canonical HMAC / metaGeneration——内容 blob、
 	 * revision、contentGeneration 全部不动，**不产生任何 tombstone**。
 	 * 412 = metaGeneration CAS 失败（并发改名，重取后重试）；
-	 * 409 = 目标被占用或目标名上有 tombstone（后者必须走 restore）。
+	 * 409 = 目标被 live 对象占用。目标名上只有 tombstone 时改名**放行**
+	 *（0.17 实测修正）：那不是复活，删除事实按 fileId 保留——以前的 409
+	 * 会把客户端逼进 delete+upsert 退化，历史嫁接到死对象身上。
 	 */
 	async rename(
 		fromPath: string,
