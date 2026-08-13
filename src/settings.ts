@@ -33,9 +33,14 @@ export interface PluginSettings {
 	/**
 	 * 开发开关：允许执行不可逆的明文路径抹除（meta complete）。
 	 *
-	 * v0.12.1 默认 **关闭**，且服务端也已拒绝这种 complete——当前实现无法在
-	 * 抹除明文的同时保住删除屏障（tombstone 的 path 本身就是明文路径）。
-	 * 正式抹除要等 v0.13.0 的隐私 tombstone ledger。
+	 * 默认 **关闭**：迁移停在「已伪名化但未抹除」的可回退状态。
+	 *
+	 * 开启后 complete 会真正覆写数据库、WAL 与 blob 中残留的明文路径，
+	 * 并用哨兵扫描验证覆写确实生效（ADR-008 §3.2）——这一步**不可逆**。
+	 *
+	 * 曾经这个开关是死的：v0.12.1 时服务端一律拒绝，因为当时抹除明文会连带
+	 * 毁掉删除屏障（tombstone 的 path 本身就是明文路径）。隐私 tombstone
+	 * ledger 在 v0.13.0 落地后这个矛盾消失了，删除屏障在抹除后完整保留。
 	 */
 	allowIrreversibleMetaErase: boolean;
 	/**
@@ -262,22 +267,26 @@ export class SyncSettingTab extends PluginSettingTab {
 						name: "加密路径与文件名（实验）",
 						desc: createFragment((frag) => {
 							frag.appendText(
-								"开启后才会出现「加密路径与文件名」命令。v0.12.x 仍是 RC：请只在测试 Vault 或已完整备份的副本上使用。",
+								"开启后才会出现「加密路径与文件名」命令。请只在测试 Vault 或已完整备份的副本上使用。",
 							);
 							frag.createEl("br");
-							frag.appendText("· 迁移前的服务器备份中仍可能含有明文路径；");
+							frag.appendText("· 迁移前的服务器备份中仍含有明文路径——那既是回滚窗口，也是明文的最后残留处；");
 							frag.createEl("br");
-							frag.appendText("· 迁移完成后无法依赖普通回滚恢复真实路径；");
+							frag.appendText("· 迁移到 verifying 之前随时可以无损放弃；complete 并抹除之后不可回滚；");
 							frag.createEl("br");
-							frag.appendText("· 所有设备都必须升级到 0.12+，旧版本无法读取此仓库。");
+							frag.appendText("· 所有设备都必须先升级，旧版本读不了伪名寻址的仓库。");
+							frag.createEl("br");
+							frag.appendText("· 动手前请先在服务器上执行 obsync migration preflight，它会检查有没有设备还没升级。");
 						}),
 						control: { type: "toggle", key: "experimentalMetaEncryption" },
 					},
 					{
 						name: "允许不可逆的明文路径抹除（开发者）",
 						desc:
-							"v0.12.1 默认关闭，且服务端同样拒绝执行：当前实现无法在抹除明文路径的同时保住删除屏障。" +
-							"迁移会停在「已伪名化但未抹除」的可回退状态，正式抹除请等待 v0.13.0 的隐私 tombstone ledger。",
+							"默认关闭。关闭时迁移会停在「已伪名化但未抹除」的**可回退**状态——" +
+							"这是绝大多数情况下你想要的。开启后 complete 会真正覆写数据库、WAL 与 blob 中残留的明文路径，" +
+							"并用哨兵扫描验证覆写生效；这一步**不可逆**，此后只能依靠迁移前的备份恢复。" +
+							"隐私 tombstone ledger 已在 v0.13.0 落地，删除屏障在抹除后仍然完整保留。",
 						visible: () => plugin.settings.experimentalMetaEncryption,
 						control: { type: "toggle", key: "allowIrreversibleMetaErase" },
 					},
