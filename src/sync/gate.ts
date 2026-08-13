@@ -21,6 +21,7 @@ export type GateReason =
 	| "repo-epoch-mismatch"
 	| "migration-active"
 	| "key-locked"
+	| "credential-rejected"
 	| "integrity-error";
 
 export interface GateBlock {
@@ -45,6 +46,13 @@ export class SyncGate {
 	private migration: string | null = null;
 	/** 不可自动恢复的完整性错误（如服务器换掉了 fileId）：需要人工处理 */
 	private integrity: string | null = null;
+	/**
+	 * 服务器拒绝了本设备凭据（HTTP 401，验收 T5.2）：设备被撤销或 Token 失效。
+	 * 与 unbound 不同——那是「本地配置变了需要重新校验」，这是「服务器不认识
+	 * 我们了」，不会自己好起来，也不该用退避重试去撞；手动同步会重新校验，
+	 * /info 成功后自动清除。
+	 */
+	private credential: string | null = null;
 
 	get isUnbound(): boolean {
 		return this.unbound !== null;
@@ -75,6 +83,10 @@ export class SyncGate {
 		this.integrity = message;
 	}
 
+	markCredentialRejected(message: string | null): void {
+		this.credential = message;
+	}
+
 	clearIntegrityError(): void {
 		this.integrity = null;
 	}
@@ -91,6 +103,7 @@ export class SyncGate {
 	sessionBlock(): GateBlock | null {
 		if (this.integrity !== null) return { reason: "integrity-error", message: this.integrity };
 		if (this.protocol !== null) return { reason: "protocol-mismatch", message: this.protocol };
+		if (this.credential !== null) return { reason: "credential-rejected", message: this.credential };
 		if (this.repoEpoch !== null) return { reason: "repo-epoch-mismatch", message: this.repoEpoch };
 		if (this.unbound !== null) {
 			return {

@@ -1,4 +1,4 @@
-import { requestUrl } from "obsidian";
+import { Platform, requestUrl } from "obsidian";
 import { canonicalCheckpoint, SignedCheckpoint } from "../crypto/checkpoint";
 import { VaultKeyDoc } from "../crypto/crypto";
 
@@ -64,7 +64,27 @@ export const PLUGIN_PROTOCOL_VERSION = 6;
  * 协议版本号（6）粒度太粗：同一个协议版本下的两个插件版本，
  * 修没修某个已知 bug 是不一样的。
  */
-export const PLUGIN_VERSION = "0.17.0-rc.3";
+export const PLUGIN_VERSION = "0.17.0-rc.4";
+
+/**
+ * 平台紧凑 token（随每个请求上报，运维页 Devices 列表用）。
+ * 与 diagnostics 里面向展示的 describePlatform 不同：这里是机器可读的固定值集合
+ * （windows|macos|linux|ios|android|unknown），服务器按白名单校验后落库。
+ * 判定顺序与 describePlatform 一致：先移动端后桌面端。
+ * 字段缺失（如测试替身的最小 Platform mock）时安全地归为 "unknown"。
+ */
+function detectClientPlatform(): string {
+	const p = Platform as Partial<Record<"isIosApp" | "isAndroidApp" | "isMacOS" | "isWin" | "isLinux", boolean>>;
+	if (p.isIosApp) return "ios";
+	if (p.isAndroidApp) return "android";
+	if (p.isMacOS) return "macos";
+	if (p.isWin) return "windows";
+	if (p.isLinux) return "linux";
+	return "unknown";
+}
+
+/** 模块加载时一次性判定：平台在进程生命周期内不会变，没必要逐请求重算。 */
+const CLIENT_PLATFORM = detectClientPlatform();
 
 /** 协议不兼容时返回给用户的提示；兼容返回 null。 */
 export function protocolError(info: ServerInfo): string | null {
@@ -353,6 +373,9 @@ export class ApiClient {
 			// 客户端版本（§15 第 3 步）：让「所有设备都升级了吗」成为一个可查的事实，
 			// 而不是一句只能靠人挨个问的口头确认
 			"X-Client-Version": PLUGIN_VERSION,
+			// 客户端平台（运维页 Devices 列表）：让「哪台是丢失的那台手机」
+			// 在事故当天一眼可辨，而不是对着一排设备名猜
+			"X-Client-Platform": CLIENT_PLATFORM,
 			...(formatEpoch > 0 ? { "X-Format-Epoch": String(formatEpoch) } : {}),
 			...(repoEpoch ? { "X-Repo-Epoch": repoEpoch } : {}),
 			...(keyEpoch > 0 ? { "X-Key-Epoch": String(keyEpoch) } : {}),

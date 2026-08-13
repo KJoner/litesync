@@ -307,7 +307,9 @@ async function applyPlainRename(
 		// 本地原文件不在（可能刚被用户移走）：只更新状态键，内容由扫描收敛；
 		// 用户自己的改名意图（pending move op）跟着换基，随后作为正常改名推送（T3.4）
 		ctx.store.applyMetaRenameState(fromPath, toPath, { metaGeneration: change.metaGeneration });
-		ctx.queue.rebaseMoveFrom(fromPath, toPath);
+		if (ctx.queue.rebaseMoveFrom(fromPath, toPath) > 0) {
+			ctx.notify(`另一台设备已将 ${fromPath} 改名为 ${toPath}；本机的改名将以此为基础继续，最终以本机的名字为准`);
+		}
 		return "applied";
 	}
 
@@ -465,7 +467,9 @@ async function applyMetaRename(
 			metaFingerprint: fingerprint,
 			serverPseudonym: pseudonym,
 		});
-		ctx.queue.rebaseMoveFrom(realPath, newPath);
+		if (ctx.queue.rebaseMoveFrom(realPath, newPath) > 0) {
+			ctx.notify(`另一台设备已将 ${realPath} 改名为 ${newPath}；本机的改名将以此为基础继续，最终以本机的名字为准`);
+		}
 		return "applied";
 	}
 	if ((await renameLocalFile(ctx, realPath, newPath, tracked.fileId)) === "occupied") {

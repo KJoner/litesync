@@ -270,6 +270,11 @@ export default class PrivateSyncPlugin extends Plugin {
 			syncObsidian: () => this.effectiveSyncObsidian(),
 			padsSize: (path) => this.padsSize(path),
 			reportedMtime: (ms) => this.reportedMtime(ms),
+			// 时间混淆（§11.2 / 验收 T4.5）：定时/前台/启动/重试的轮次只拉不推——
+			// 上传只在窗口发车点（sync("change")）或用户显式动作时发生
+			deferPush: (reason) =>
+				this.settings.obfuscateTiming && ["interval", "foreground", "startup", "retry"].includes(reason),
+			onPushDeferred: () => this.scheduleDebounced(),
 			ignores: (path) => this.ignoreMatcher?.ignores(path) ?? false,
 			deviceName: () =>
 				this.settings.deviceName || `device-${(this.store?.state.deviceId ?? "").slice(0, 8)}`,
@@ -281,7 +286,7 @@ export default class PrivateSyncPlugin extends Plugin {
 				// 仅在用户显式开启 Debug 时输出；用 debug 级别不污染默认控制台
 				if (this.settings.debug) console.debug(`[litesync] ${msg}`);
 			},
-			notify: (msg) => new Notice(msg, 8000),
+			notify: (msg, durationMs) => new Notice(msg, durationMs ?? 8000),
 			onConflictsChanged: () => this.updateStatus(this.lastStatus),
 			e2ee: this.keyring,
 			credentials: () => ({ serverUrl: this.settings.serverUrl, apiToken: this.getApiToken() }),

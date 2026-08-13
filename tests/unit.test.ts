@@ -178,21 +178,28 @@ test("PendingQueue: 入队先落盘、失败即回滚（v0.13.2 §6.3）", async
 	assert.equal(q.size, 2);
 });
 
-test("PendingQueue: move 条目被后续 upsert 覆盖（退化为 delete+upsert 的入口）", async () => {
+test("PendingQueue: move 条目不被后续 upsert 覆盖（验收 T3.2/T3.5：身份不重置）", async () => {
 	const q = new PendingQueue();
 	await q.addMove("new.md", "old.md");
 	assert.equal(q.getOp("new.md")?.action, "move");
 	const moveId = q.getOp("new.md")?.operationId;
 	q.rememberIdentity("new.md", { fileId: "f".repeat(32) });
-	// 改名后立即编辑：modify 事件的 upsert 覆盖 move（旧路径由扫描兜底补 delete）
+	const genBefore = [...q.entries()].find(([p]) => p === "new.md")![2];
+	// 改名后立即编辑：move 必须保留——覆盖成 upsert 会让新路径被当成 base-0
+	// 新对象上传（身份重置、历史从 1 开始）。内容由 pushMove 的 contentChanged
+	// 分支「先改名再传内容」处理，编辑不会丢
 	await q.add("new.md", "upsert");
 	const op = q.getOp("new.md");
-	assert.equal(op?.action, "upsert");
-	assert.equal(op?.from, undefined);
-	// 换了动作就是另一个逻辑操作：幂等键必须换新，否则服务器会返回 move 的缓存结果
-	assert.notEqual(op?.operationId, moveId);
-	// 但对象身份与动作无关，必须保留
+	assert.equal(op?.action, "move");
+	assert.equal(op?.from, "old.md");
+	assert.equal(op?.operationId, moveId, "同一逻辑操作，幂等键不换");
 	assert.equal(op?.fileId, "f".repeat(32));
+	// lost wake-up 语义：编辑要刷新变更代号，推送完成的回调不会误删这次编辑
+	const genAfter = [...q.entries()].find(([p]) => p === "new.md")![2];
+	assert.notEqual(genAfter, genBefore, "编辑必须刷新 generation");
+	// delete 仍然覆盖 move（文件被删了，改名意图自然作废）
+	await q.add("new.md", "delete");
+	assert.equal(q.getOp("new.md")?.action, "delete");
 });
 
 test("PendingQueue: 按路径去重，后到动作覆盖", async () => {

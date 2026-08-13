@@ -92,6 +92,30 @@ export class ShareModal extends Modal {
 			const opt = select.createEl("option", { text: label });
 			opt.value = String(days);
 		}
+		select.createEl("option", { text: "自定义…" }).value = "custom";
+
+		// 自定义时长行：数值 + 单位，只在选中「自定义…」时出现。
+		// 最小单位是分钟且数值必须 ≥ 1，即天然满足「下限 1 分钟」
+		const customRow = contentEl.createDiv({ cls: "litesync-share-custom" });
+		const amountInput = customRow.createEl("input", { type: "number", cls: "litesync-share-custom-amount" });
+		amountInput.min = "1";
+		amountInput.step = "1";
+		amountInput.value = "1";
+		const unitSelect = customRow.createEl("select", { cls: "litesync-share-select" });
+		for (const [label, seconds] of [
+			["分钟", 60],
+			["小时", 3600],
+			["天", 86400],
+		] as Array<[string, number]>) {
+			const opt = unitSelect.createEl("option", { text: label });
+			opt.value = String(seconds);
+		}
+		customRow.createDiv({
+			cls: "litesync-history-meta",
+			text: "提醒：到期后密文很快会被服务器回收，回收后无法恢复，只能重新分享。",
+		});
+		customRow.hide();
+		select.onchange = () => customRow.toggle(select.value === "custom");
 
 		const resultEl = contentEl.createDiv();
 		const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
@@ -115,8 +139,16 @@ export class ShareModal extends Modal {
 				// 服务器仍只见一个密文 blob，附件的数量与名字都在密文里
 				const attachments = await collectImageEmbeds(this.ctx, this.path, (m) => new Notice(m));
 				const payload = await encryptShare(keyRaw, frameShareBundle(displayName, plain, attachments));
-				const days = parseInt(select.value, 10);
-				const expiresAt = days > 0 ? Math.floor(Date.now() / 1000) + days * 86400 : 0;
+				let expiresAt: number;
+				if (select.value === "custom") {
+					// 自定义时长：n 必须是正整数（服务器只要求未来时间，校验在这里做）
+					const n = Number(amountInput.value);
+					if (!Number.isInteger(n) || n <= 0) throw new Error("自定义时长必须是正整数");
+					expiresAt = Math.floor(Date.now() / 1000) + n * Number(unitSelect.value);
+				} else {
+					const days = parseInt(select.value, 10);
+					expiresAt = days > 0 ? Math.floor(Date.now() / 1000) + days * 86400 : 0;
+				}
 				const { id } = await this.ctx.client.createShare(expiresAt, payload);
 				const keyB64url = b64urlEncode(keyRaw);
 				keyRaw.fill(0);

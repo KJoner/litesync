@@ -88,7 +88,8 @@ export function timingDisclosure(windowSec: number, mtimeGranularitySec: number)
 	const mins = Math.round((w / 60) * 10) / 10;
 	const hrs = Math.round((mtimeGranularitySec / 3600) * 10) / 10;
 	return (
-		`上传将被推迟最多约 ${mins} 分钟，服务器只能判断编辑发生在哪个 ${mins} 分钟窗口里；` +
+		`上传将被推迟平均约 ${mins} 分钟（最多约 ${mins * 2} 分钟），` +
+		`服务器只能判断编辑发生在哪个 ${mins} 分钟窗口里；` +
 		`文件修改时间按 ${hrs} 小时取整后再上报。` +
 		`代价：跨设备可见延迟与冲突窗口都会变长。` +
 		`本功能不隐藏「你在某个窗口里有没有编辑」——那需要持续的掩护流量，本插件不做。`

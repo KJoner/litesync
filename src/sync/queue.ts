@@ -124,6 +124,20 @@ export class PendingQueue {
 	 * 用于「本来就要在同一轮同步里立刻处理」的路径——它们不经过退出窗口。
 	 */
 	stage(path: string, op: PendingOp): void {
+		// 改名后的编辑绝不能把 move 覆盖成 upsert（验收 T3.2/T3.5 的实测缺陷）：
+		// 队列按路径键控、「后到覆盖先到」，覆盖之后新路径会被当成 base-0 的
+		// **新对象**上传——身份被重置、版本历史从 1 重新开始（违反 INV-05）。
+		// 编辑的内容不会丢：pushMove 在推送时读取当前字节，内容变了会
+		// 「先改名再传内容」，两件事都落在同一个对象上。
+		// 只刷新变更代号（lost wake-up 语义：推送完成的回调不会误删这次编辑）。
+		{
+			const entry = this.map.get(path);
+			if (op.action === "upsert" && entry?.op.action === "move") {
+				entry.gen = ++this.genCounter;
+				this.fireChange();
+				return;
+			}
+		}
 		const prev = this.map.get(path)?.op;
 		// 幂等键只在「同一个逻辑操作」上复用（§6.3）：动作或改名来源变了就是另一个
 		// 操作，必须换新 id，否则服务器会把新操作当成旧操作的重试而返回缓存结果。
@@ -191,13 +205,16 @@ export class PendingQueue {
 	 * 服务器上凭空多出一份内容。换基后它变成 race-d1.md → race-d2.md 的正常
 	 * 改名：同一身份、无 tombstone、两台设备收敛到同一个名字。
 	 */
-	rebaseMoveFrom(oldFrom: string, newFrom: string): void {
+	rebaseMoveFrom(oldFrom: string, newFrom: string): number {
+		let rebased = 0;
 		for (const entry of this.map.values()) {
 			if (entry.op.action === "move" && entry.op.from === oldFrom) {
 				entry.op.from = newFrom;
+				rebased++;
 				this.fireChange();
 			}
 		}
+		return rebased;
 	}
 
 	/** 查看某路径当前排队的操作（不存在返回 undefined）。 */

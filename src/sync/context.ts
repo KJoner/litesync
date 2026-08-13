@@ -36,6 +36,17 @@ export interface SyncContext {
 	 * 白白重算一遍哈希。
 	 */
 	reportedMtime(mtimeMs: number): number;
+	/**
+	 * 本轮同步是否应当**推迟上传**（v0.17 / 计划书 §11.2，验收 T4.5）。
+	 *
+	 * 时间混淆的窗口约束必须加在 push 阶段而不是触发源上：sync() 是拉推一体的，
+	 * 定时/前台/启动/重试每一轮都会顺手把队列推走，只拦「修改防抖」一个触发源
+	 * 等于没拦。返回 true 表示该 reason 的轮次只拉不推（pull 语义完全不受影响）；
+	 * 用户显式动作（manual/change 发车点/迁移）永不推迟。未提供 = 从不推迟。
+	 */
+	deferPush?(reason: string): boolean;
+	/** push 被推迟且队列非空时回调：确保窗口发车点已排上（孤儿变更的兜底） */
+	onPushDeferred?(): void;
 	deviceName(): string;
 	/** 插件自己的目录（staging / recovery / swap 都放这里，永不参与同步） */
 	pluginDir(): string;
@@ -52,7 +63,8 @@ export interface SyncContext {
 	/** 登记成功回调（main 侧据此不再重复登记） */
 	onSigningKeyRegistered?: () => void;
 	log(msg: string): void;
-	notify(msg: string): void;
+	/** durationMs=0 表示常驻通知（移动端没有状态栏，重要提示 8 秒会被错过）。 */
+	notify(msg: string, durationMs?: number): void;
 	/** pending conflicts 集合变化后调用（刷新状态栏等） */
 	onConflictsChanged(): void;
 	/**

@@ -402,6 +402,148 @@ test("T3.4: 并发改名成不同名字 → 本地改名意图换基后作为正
 	assert.equal(store.get("race-d1.md"), undefined);
 });
 
+test("T3.2/T3.5: 改名后立即编辑——move 不被 modify 事件覆盖，同一对象改名 + 传内容（身份不重置）", async () => {
+	const store = await plainStore();
+	const vault = memVault();
+	const newData = bytes("改名后又编辑的新内容");
+	vault.files.set("b.md", newData);
+	store.replaceWithNewObject("a.md", {
+		hash: "old-hash", serverHash: "s1", revision: 3, mtime: 1, size: 4, fileId: FA, metaGeneration: 0,
+	});
+	const queue = new PendingQueue();
+	queue.stage("b.md", { action: "move", from: "a.md" });
+	// modify 事件（改名后立刻编辑）：绝不能把 move 覆盖成 upsert
+	queue.stage("b.md", { action: "upsert" });
+	assert.equal(queue.getOp("b.md")?.action, "move", "move 必须保留");
+
+	const renames: Array<{ from: string; to: string }> = [];
+	const uploads: number[] = [];
+	const ctx = ctxOf({
+		store,
+		vault,
+		queue,
+		client: {
+			rename: async (from: string, to: string, base: number) => {
+				renames.push({ from, to });
+				return { fileId: FA, toPath: to, revision: 3, metaGeneration: base + 1, sequence: 5 };
+			},
+			upload: async (_p: string, baseRevision: number, hash: string, payload: ArrayBuffer) => {
+				uploads.push(baseRevision);
+				return { path: "b.md", revision: 4, hash, size: payload.byteLength, sequence: 6, fileId: FA };
+			},
+		},
+	});
+
+	const r = await pushPendingChanges(ctx);
+	assert.equal(r.pushed, 1);
+	assert.deepEqual(renames, [{ from: "a.md", to: "b.md" }], "先改名（同一对象）");
+	assert.deepEqual(uploads, [3], "内容以既有 revision 为基线上传——绝不是 base-0 的新对象（历史不重置）");
+	const tracked = store.get("b.md");
+	assert.equal(tracked?.fileId, FA, "身份不变（INV-05）");
+	assert.equal(tracked?.revision, 4);
+	assert.equal(store.get("a.md"), undefined);
+});
+
+test("T4.5: 时间混淆——interval 轮次只拉不推并排发车点；manual 照常推送", async () => {
+	const store = await plainStore();
+	const vault = memVault();
+	const data = bytes("待混淆上传的内容");
+	vault.files.set("t.md", data);
+
+	let uploads = 0;
+	let deferred = 0;
+	const info = {
+		version: "test", latestSequence: 0, serverTime: 0,
+		protocolVersion: 6, minProtocolVersion: 6,
+		vaultId: VAULT_ID, repoEpoch: "epoch-1", keyEpoch: 1,
+		formatEpoch: 1, minimumEnvelopeVersion: 3, schemaVersion: 6,
+	};
+	const base = ctxOf({
+		store,
+		vault,
+		client: {
+			info: async () => info,
+			whoami: async () => ({ tokenType: "device" as const }),
+			changes: async () => ({ latestSequence: 0, hasMore: false, changes: [] }),
+			upload: async (_p: string, _b: number, hash: string, payload: ArrayBuffer) => {
+				uploads++;
+				return { path: "t.md", revision: 1, hash, size: payload.byteLength, sequence: 1, fileId: FA };
+			},
+		},
+	}) as unknown as Record<string, unknown>;
+	base.credentials = () => ({ serverUrl: "https://a", apiToken: "t" });
+	base.refreshE2ee = async () => {};
+	base.onConflictsChanged = () => {};
+	base.deferPush = (reason: string) => ["interval", "foreground", "startup", "retry"].includes(reason);
+	base.onPushDeferred = () => deferred++;
+	(base.app as { vault: Record<string, unknown> }).vault.configDir = ".obsidian";
+	(base.app as { vault: Record<string, unknown> }).vault.getFiles = () =>
+		[...vault.files.keys()].map((p) => ({ path: p, stat: { mtime: 1, size: vault.files.get(p)!.byteLength } }));
+	const ctx = base as unknown as SyncContext;
+
+	const { SyncManager } = await import("../src/sync/sync-manager");
+	const mgr = new SyncManager(ctx);
+	await mgr.sync("interval");
+	assert.equal(uploads, 0, "定时轮次绝不推送（上传时刻不能跟着编辑时刻走）");
+	assert.ok(deferred >= 1, "被推迟时必须排上窗口发车点（孤儿变更兜底）");
+	assert.ok(ctx.queue.size >= 1, "变更仍在队列中等发车");
+
+	await mgr.sync("manual");
+	assert.equal(uploads, 1, "用户显式动作照常推送（豁免语义）");
+	mgr.dispose();
+});
+
+test("T5.2: 设备凭据被拒（401）→ 常驻通知 + gate 停机 + 不退避重试；恢复后自动清除", async () => {
+	const store = await plainStore();
+	const vault = memVault();
+
+	let rejected = true;
+	const notices: Array<{ msg: string; duration?: number }> = [];
+	const { ApiError: ApiErrorCls } = await import("../src/api/client");
+	const info = {
+		version: "test", latestSequence: 0, serverTime: 0,
+		protocolVersion: 6, minProtocolVersion: 6,
+		vaultId: VAULT_ID, repoEpoch: "epoch-1", keyEpoch: 1,
+		formatEpoch: 1, minimumEnvelopeVersion: 3, schemaVersion: 6,
+	};
+	const base = ctxOf({
+		store,
+		vault,
+		client: {
+			info: async () => {
+				if (rejected) throw new ApiErrorCls(401, "info failed: HTTP 401");
+				return info;
+			},
+			whoami: async () => ({ tokenType: "device" as const }),
+			changes: async () => ({ latestSequence: 0, hasMore: false, changes: [] }),
+		},
+	}) as unknown as Record<string, unknown>;
+	base.credentials = () => ({ serverUrl: "https://a", apiToken: "t" });
+	base.refreshE2ee = async () => {};
+	base.onConflictsChanged = () => {};
+	base.notify = (msg: string, duration?: number) => notices.push({ msg, duration });
+	(base.app as { vault: Record<string, unknown> }).vault.configDir = ".obsidian";
+	(base.app as { vault: Record<string, unknown> }).vault.getFiles = () => [];
+	const ctx = base as unknown as SyncContext;
+
+	const { SyncManager } = await import("../src/sync/sync-manager");
+	const mgr = new SyncManager(ctx);
+	await mgr.sync("interval");
+	assert.equal(ctx.gate.sessionBlock()?.reason, "credential-rejected", "必须置为凭据被拒停机");
+	assert.equal(notices.length, 1, "必须弹出提示（T5.2 的失败形态就是静默）");
+	assert.equal(notices[0].duration, 0, "移动端没有状态栏：提示必须常驻");
+	assert.ok(notices[0].msg.includes("撤销") || notices[0].msg.includes("失效"), notices[0].msg);
+
+	await mgr.sync("interval");
+	assert.equal(notices.length, 1, "同一停机只提示一次，不轰炸");
+
+	// 用户重新接入（换发凭据）后：/info 恢复成功 → 停机自动清除
+	rejected = false;
+	await mgr.sync("manual");
+	assert.notEqual(ctx.gate.sessionBlock()?.reason, "credential-rejected", "恢复后必须清除停机");
+	mgr.dispose();
+});
+
 // ---------------------------------------------------------------- resync 对账
 
 test("resync: 改名走本地 rename，不退化为 trash + 全量重下载", async () => {

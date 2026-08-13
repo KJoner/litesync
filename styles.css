@@ -208,6 +208,20 @@
 .litesync-share-select {
 	margin: 6px 0 12px;
 }
+/* 分享有效期「自定义…」行：数值 + 单位横排，提示文案独占一行 */
+.litesync-share-custom {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin: 0 0 12px;
+}
+.litesync-share-custom-amount {
+	width: 90px;
+}
+.litesync-share-custom .litesync-history-meta {
+	flex-basis: 100%;
+}
 .litesync-status-clickable {
 	cursor: pointer;
 }

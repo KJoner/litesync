@@ -1,4 +1,4 @@
-import { protocolError, ServerInfo } from "../api/client";
+import { ApiError, protocolError, ServerInfo } from "../api/client";
 import { E2eeLockedError } from "../crypto/keyring";
 import { BindingFingerprint, computeBinding } from "../state/store";
 import { isKeyEpoch } from "../utils/validate";
@@ -6,7 +6,7 @@ import { SyncContext, SyncCounters } from "./context";
 import { syncGateBlock } from "./gate";
 import { ensureSigningKeyRegistered, publishCheckpoint, verifyCheckpointChain } from "./checkpoint-sync";
 import { pullRemoteChanges, recoverInterruptedSwaps } from "./pull";
-import { pushPendingChanges, scanLocalChanges } from "./push";
+import { pushPendingChanges, PushResult, scanLocalChanges } from "./push";
 
 export type SyncStatus = "idle" | "syncing" | "synced" | "conflict" | "offline" | "locked";
 
@@ -31,6 +31,15 @@ export class SyncManager {
 
 	private syncing = false;
 	private runAgain = false;
+	/**
+	 * 本条同步链要不要执行 push（时间混淆，§11.2）。
+	 *
+	 * 在 sync() 入口按 reason 评估而不是在 runOnce 里：续轮的 reason 是
+	 * "follow-up"，无从判断最初是谁触发的；且手动同步撞上进行中的链时只是
+	 * 设 runAgain 搭车，豁免必须在入口处记下来，否则会被吞掉。
+	 * 任何一轮实际执行过 push 后清零。
+	 */
+	private pushWanted = false;
 	private retryTimer: number | null = null;
 	private retryIndex = 0;
 	/** 当前正在执行的同步链（含 runAgain 续轮）；fullSync 据此等待真正结束（LS-121-C06） */
@@ -40,6 +49,8 @@ export class SyncManager {
 	private protocolWarned = false;
 	private stateCorruptWarned = false;
 	private credentialChecked = false;
+	/** 「凭据被拒」只弹一次常驻通知（验收 T5.2）；恢复后复位 */
+	private credentialWarned = false;
 
 	constructor(private ctx: SyncContext) {}
 
@@ -79,6 +90,9 @@ export class SyncManager {
 	 * 请求」的完成语义（LS-121-C06）。
 	 */
 	async sync(reason: string): Promise<void> {
+		// 时间混淆（§11.2）：非推迟类 reason 一到就把「要 push」记下来——
+		// 即使这次只是搭上进行中的链（runAgain），豁免也不能丢
+		if (!(this.ctx.deferPush?.(reason) ?? false)) this.pushWanted = true;
 		if (this.syncing) {
 			// 同一客户端不允许并发同步；标记结束后补一轮
 			this.runAgain = true;
@@ -213,7 +227,16 @@ export class SyncManager {
 			this.applyingRemote = false;
 
 			await scanLocalChanges(this.ctx);
-			const push = await pushPendingChanges(this.ctx);
+			// 时间混淆（§11.2 / 验收 T4.5）：定时/前台/启动/重试的轮次只拉不推，
+			// 上传只发生在窗口发车点或用户显式动作。扫描照常执行（stage 只落盘
+			// 不出网）；被推迟的队列由窗口定时器兜底，绝不悬空
+			let push: PushResult = { pushed: 0, conflicts: 0 };
+			if (this.pushWanted) {
+				push = await pushPendingChanges(this.ctx);
+				this.pushWanted = false;
+			} else if (this.ctx.queue.size > 0) {
+				this.ctx.onPushDeferred?.();
+			}
 
 			this.applyingRemote = true;
 			const pull2 = await pullRemoteChanges(this.ctx);
@@ -249,6 +272,20 @@ export class SyncManager {
 			if (e instanceof E2eeLockedError) {
 				// 中途遇到密文但未解锁（如其他设备刚启用 E2EE）→ 等待解锁，不做退避重试
 				this.onStatus("locked");
+			} else if (e instanceof ApiError && e.status === 401) {
+				// 凭据被拒（验收 T5.2）：设备被撤销或 Token 失效。这不会自己好起来，
+				// 退避重试只是无意义地撞墙；置 gate 停掉手动命令、弹常驻通知
+				//（移动端没有状态栏，8 秒的提示等于没有提示），等用户重新接入。
+				// /info 重新成功（换发凭据/改 Token 后手动同步）时自动清除
+				const msg =
+					"设备凭据已失效或被撤销：服务器拒绝了本设备的访问。\n" +
+					"请重新接入本设备（配对，或在设置中重新填写 Token 后执行「立即同步」）";
+				this.ctx.gate.markCredentialRejected(msg);
+				if (!this.credentialWarned) {
+					this.credentialWarned = true;
+					this.ctx.notify(msg, 0);
+				}
+				this.onStatus("offline", msg);
 			} else {
 				this.onStatus("offline", failure.message);
 				this.scheduleRetry();
@@ -289,6 +326,9 @@ export class SyncManager {
 		//（服务器从备份恢复、别的设备完成了迁移、密钥轮换）。用会话首轮的判断
 		// 继续 pull/push，等于拿着过期的世界观改数据。
 		const info = await this.ctx.client.info();
+		// /info 成功 = 服务器重新认识我们了：清除「凭据被拒」停机（T5.2 的恢复路径）
+		this.ctx.gate.markCredentialRejected(null);
+		this.credentialWarned = false;
 		const err = protocolError(info);
 		if (err) {
 			this.ctx.gate.markProtocolMismatch(err);
