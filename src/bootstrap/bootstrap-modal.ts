@@ -127,6 +127,7 @@ export class BootstrapWizardModal extends Modal {
 		};
 		createLabel.appendText(" 新建仓库：");
 		const nameInput = createRow.createEl("input", { type: "text", placeholder: "仓库名（1–64 字符）" });
+		nameInput.setAttribute("autocomplete", "off");
 		nameInput.onfocus = () => {
 			createRadio.checked = true;
 			selected = "__new__";
@@ -134,18 +135,36 @@ export class BootstrapWizardModal extends Modal {
 
 		const hint = contentEl.createDiv({ cls: "litesync-history-meta" });
 		hint.setText("切换仓库会作废本设备的同步记录（本地笔记保留），随后按你选择的方式恢复/合并/初始化。");
-		// 账户 Token 补填行（默认隐藏）：配对导入的设备持设备凭据，而切换/新建
-		// 仓库是用户级操作（D4 最小权限，服务端硬拒）——在向导内直接补填并
-		// 存入 SecretStorage（与设置页填写等效），不逼用户绕去设置页再回来
-		const tokenRow = contentEl.createDiv({ cls: "litesync-history-meta" });
-		tokenRow.hidden = true;
-		tokenRow.createDiv({ text: "账户 API Token（lsk_ 开头；输入后将保存为本设备的凭据）：" });
-		const tokenInput = tokenRow.createEl("input", { type: "password", placeholder: "lsk_…" });
-		// iOS：软键盘（尤其密码键盘）会盖住底部按钮且没有收起键——回车键是
-		// 唯一出口，必须让它等价于「继续」并顺手收起键盘（0.19.0-rc.1 真机实测）
-		tokenInput.setAttribute("enterkeyhint", "go");
 		const errEl = contentEl.createDiv({ cls: "litesync-history-meta" });
 		const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
+		// iOS：软键盘（尤其密码键盘）会盖住底部按钮且没有收起键——回车键是
+		// 唯一出口，必须让它等价于「继续」并顺手收起键盘（0.19.0-rc.1 真机实测）
+		const submitOnEnter = (input: HTMLInputElement): void => {
+			input.addEventListener("keydown", (e) => {
+				if (e.key === "Enter") {
+					input.blur();
+					proceed();
+				}
+			});
+		};
+		// 账户 Token 补填行：**被拒时才创建**，绝不常驻 DOM（哪怕 hidden）——
+		//「文本框 + 密码框」的组合会触发 WebKit 的登录表单启发式，把新建仓库
+		// 名当成用户名字段，而 iOS 对凭据字段禁用第三方输入法（重命名弹窗
+		// 真机实测的同款连坐）。配对导入的设备持设备凭据，切换/新建是用户级
+		// 操作（D4 最小权限，服务端硬拒）——在向导内直接补填并存入
+		// SecretStorage（与设置页填写等效），不逼用户绕去设置页再回来
+		let tokenInput: HTMLInputElement | null = null;
+		const ensureTokenRow = (): HTMLInputElement => {
+			if (tokenInput) return tokenInput;
+			const tokenRow = createEl("div", { cls: "litesync-history-meta" });
+			tokenRow.createDiv({ text: "账户 API Token（lsk_ 开头；输入后将保存为本设备的凭据）：" });
+			tokenInput = tokenRow.createEl("input", { type: "password", placeholder: "lsk_…" });
+			tokenInput.setAttribute("enterkeyhint", "go");
+			tokenInput.setAttribute("autocomplete", "off");
+			submitOnEnter(tokenInput);
+			contentEl.insertBefore(tokenRow, errEl);
+			return tokenInput;
+		};
 		const proceed = (): void => {
 			void (async () => {
 				if (!selected) {
@@ -155,7 +174,7 @@ export class BootstrapWizardModal extends Modal {
 				const currentVault = vaults.find((v) => v.current);
 				const changing = selected === "__new__" || (currentVault && selected !== currentVault.id);
 				if (changing && tokenType === "device") {
-					const t = tokenInput.value.trim();
+					const t = tokenInput?.value.trim() ?? "";
 					if (t && this.hooks.setApiToken) {
 						await this.hooks.setApiToken(t);
 						try {
@@ -166,7 +185,7 @@ export class BootstrapWizardModal extends Modal {
 						}
 					}
 					if (tokenType === "device") {
-						tokenRow.hidden = false;
+						const ti = ensureTokenRow();
 						errEl.setText(
 							t
 								? "这个 Token 仍是设备凭据——请粘贴账户的 API Token（lsk_ 开头，可在网页端「账户」页查看指引）。"
@@ -175,7 +194,7 @@ export class BootstrapWizardModal extends Modal {
 						);
 						// 桌面端聚焦是便利；移动端自动聚焦会立刻弹出无法收起的
 						// 密码键盘盖住整个界面（iOS 实测）——让用户自己点
-						if (!Platform.isMobileApp) tokenInput.focus();
+						if (!Platform.isMobileApp) ti.focus();
 						return;
 					}
 					errEl.setText("");
@@ -200,16 +219,6 @@ export class BootstrapWizardModal extends Modal {
 			})();
 		};
 		footer.createEl("button", { text: "继续", cls: "mod-cta" }).onclick = proceed;
-		// 回车 = 继续，并先收起软键盘（否则 iOS 密码键盘既盖住按钮又没有关闭键）
-		const submitOnEnter = (input: HTMLInputElement): void => {
-			input.addEventListener("keydown", (e) => {
-				if (e.key === "Enter") {
-					input.blur();
-					proceed();
-				}
-			});
-		};
-		submitOnEnter(tokenInput);
 		submitOnEnter(nameInput);
 		footer.createEl("button", { text: "稍后再说" }).onclick = () => this.close();
 	}

@@ -481,17 +481,37 @@ class RenameVaultModal extends Modal {
 			info.setText(`当前仓库：「${cur.name || "默认仓库"}」。改名只影响各处的显示名，不影响同步、加密与其他设备。`);
 			contentEl.createDiv({ text: "新名字（1–64 字符）：" });
 			const input = contentEl.createEl("input", { type: "text", cls: "litesync-modal-input", value: cur.name });
-			// 账户 Token 补填行（默认隐藏）：重命名是用户级操作，配对导入的设备
-			// 持设备凭据会被服务端拒——在弹窗内直接补填（与设置页填写等效）
-			const tokenRow = contentEl.createDiv({ cls: "litesync-history-meta" });
-			tokenRow.hidden = true;
-			tokenRow.createDiv({ text: "账户 API Token（lsk_ 开头；输入后将保存为本设备的凭据）：" });
-			const tokenInput = tokenRow.createEl("input", { type: "password", cls: "litesync-modal-input", placeholder: "lsk_…" });
-			tokenInput.setAttribute("enterkeyhint", "go");
+			input.setAttribute("autocomplete", "off");
 			const errEl = contentEl.createDiv({ cls: "litesync-history-meta" });
 			const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
 			const btn = footer.createEl("button", { text: "重命名", cls: "mod-cta" });
 			const id = cur.id;
+			const submitOnEnter = (el: HTMLInputElement): void => {
+				el.addEventListener("keydown", (e) => {
+					if (e.key === "Enter") {
+						// 回车 = 提交，并先收起软键盘（iOS 密码键盘盖按钮且没有关闭键）
+						el.blur();
+						doRename();
+					}
+				});
+			};
+			// 账户 Token 补填行：**被拒时才创建**，绝不常驻 DOM——哪怕 hidden，
+			// 「文本框 + 密码框」的组合也会触发 WebKit 的登录表单启发式，把名字框
+			// 当成用户名字段，而 iOS 对凭据字段禁用第三方输入法——名字框跟着遭殃
+			//（iOS 实测：重命名时打不出中文）。密码框本身禁第三方键盘是系统安全
+			// 策略，解除不了；名字框的连坐靠按需创建根除
+			let tokenInput: HTMLInputElement | null = null;
+			const ensureTokenRow = (): HTMLInputElement => {
+				if (tokenInput) return tokenInput;
+				const tokenRow = createEl("div", { cls: "litesync-history-meta" });
+				tokenRow.createDiv({ text: "账户 API Token（lsk_ 开头；输入后将保存为本设备的凭据）：" });
+				tokenInput = tokenRow.createEl("input", { type: "password", cls: "litesync-modal-input", placeholder: "lsk_…" });
+				tokenInput.setAttribute("enterkeyhint", "go");
+				tokenInput.setAttribute("autocomplete", "off");
+				submitOnEnter(tokenInput);
+				contentEl.insertBefore(tokenRow, errEl);
+				return tokenInput;
+			};
 			const doRename = (): void => {
 				void (async () => {
 					const name = input.value.trim();
@@ -499,7 +519,7 @@ class RenameVaultModal extends Modal {
 						errEl.setText("名字需为 1–64 个字符。");
 						return;
 					}
-					const t = tokenInput.value.trim();
+					const t = tokenInput?.value.trim() ?? "";
 					if (t) await this.plugin.setApiToken(t);
 					try {
 						await this.plugin.renameRemoteVault(id, name);
@@ -508,14 +528,14 @@ class RenameVaultModal extends Modal {
 						this.plugin.refreshSettingsTab();
 					} catch (e) {
 						if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
-							tokenRow.hidden = false;
+							const ti = ensureTokenRow();
 							errEl.setText(
 								t
 									? "这个 Token 仍无权限——请粘贴账户的 API Token（lsk_ 开头）。"
 									: "重命名需要账户的 API Token（本设备持有的是配对导入的设备凭据）。在上方输入后按回车（或点「重命名」）即可。",
 							);
 							// 移动端不自动聚焦：iOS 密码键盘一弹出就盖住界面且无法收起
-							if (!Platform.isMobileApp) tokenInput.focus();
+							if (!Platform.isMobileApp) ti.focus();
 						} else {
 							errEl.setText(`失败：${e instanceof Error ? e.message : String(e)}`);
 						}
@@ -523,15 +543,7 @@ class RenameVaultModal extends Modal {
 				})();
 			};
 			btn.onclick = doRename;
-			// 回车 = 提交，并先收起软键盘（iOS 密码键盘盖按钮且没有关闭键）
-			for (const el of [input, tokenInput]) {
-				el.addEventListener("keydown", (e) => {
-					if (e.key === "Enter") {
-						el.blur();
-						doRename();
-					}
-				});
-			}
+			submitOnEnter(input);
 			footer.createEl("button", { text: "取消" }).onclick = () => this.close();
 		})();
 	}
