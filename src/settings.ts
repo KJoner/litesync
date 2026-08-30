@@ -489,35 +489,44 @@ class RenameVaultModal extends Modal {
 			const id = cur.id;
 			// Token 补填走**独立弹窗**（TokenPromptModal）：密码框绝不与名字框
 			// 同弹窗——「文本框 + 密码框」触发 WebKit 登录表单启发式，名字框被
-			// 当用户名字段连坐进 iOS 凭据键盘限制（禁第三方输入法），密码管理器
-			// 自动填充还会把条目的「用户名」塞进名字框（真机实测两次踩到）
+			// 当用户名字段连坐进 iOS 凭据键盘限制（禁第三方输入法）。但两个
+			// 弹窗仍叠在同一个网页文档里，iOS 密码管理器填充照样会把条目的
+			//「用户名」塞进下层名字框（真机实测：重命名成了密码条目名）——
+			// 所以重试**只用被拒那一刻捕获的名字**，Token 弹窗期间名字框
+			// readOnly（autofill 跳过只读控件），关闭时恢复捕获值
+			const attemptRename = async (name: string): Promise<void> => {
+				try {
+					await this.plugin.renameRemoteVault(id, name);
+					new Notice(`仓库已重命名为「${name}」✓`);
+					this.close();
+					this.plugin.refreshSettingsTab();
+				} catch (e) {
+					if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
+						errEl.setText("重命名需要账户的 API Token（本设备持有的是配对导入的设备凭据）。");
+						input.readOnly = true;
+						new TokenPromptModal(
+							this.app,
+							"重命名需要账户的 API Token（lsk_ 开头）。输入后将保存为本设备的凭据并自动重试。",
+							(t) => {
+								void this.plugin.setApiToken(t).then(() => attemptRename(name));
+							},
+							() => {
+								input.readOnly = false;
+								input.value = name;
+							},
+						).open();
+					} else {
+						errEl.setText(`失败：${e instanceof Error ? e.message : String(e)}`);
+					}
+				}
+			};
 			const doRename = (): void => {
-				void (async () => {
-					const name = input.value.trim();
-					if (!name || name.length > 64) {
-						errEl.setText("名字需为 1–64 个字符。");
-						return;
-					}
-					try {
-						await this.plugin.renameRemoteVault(id, name);
-						new Notice(`仓库已重命名为「${name}」✓`);
-						this.close();
-						this.plugin.refreshSettingsTab();
-					} catch (e) {
-						if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
-							errEl.setText("重命名需要账户的 API Token（本设备持有的是配对导入的设备凭据）。");
-							new TokenPromptModal(
-								this.app,
-								"重命名需要账户的 API Token（lsk_ 开头）。输入后将保存为本设备的凭据并自动重试。",
-								(t) => {
-									void this.plugin.setApiToken(t).then(() => doRename());
-								},
-							).open();
-						} else {
-							errEl.setText(`失败：${e instanceof Error ? e.message : String(e)}`);
-						}
-					}
-				})();
+				const name = input.value.trim();
+				if (!name || name.length > 64) {
+					errEl.setText("名字需为 1–64 个字符。");
+					return;
+				}
+				void attemptRename(name);
 			};
 			btn.onclick = doRename;
 			input.addEventListener("keydown", (e) => {

@@ -15,6 +15,14 @@ export class TokenPromptModal extends Modal {
 		app: App,
 		private message: string,
 		private onSubmit: (token: string) => void,
+		/**
+		 * 弹窗关闭时回调（在 onSubmit **之前**触发）。调用方用它恢复下层界面：
+		 * Obsidian 的弹窗叠在同一个网页文档里，iOS 密码管理器填充会把条目的
+		 * 「用户名」塞进文档里**任何**可见文本框（真机实测：下层重命名框被
+		 * 填成密码条目名）——打开本弹窗前锁住（readOnly）下层文本框、关闭时
+		 * 在这里恢复其原值。
+		 */
+		private onClosed?: () => void,
 	) {
 		super(app);
 	}
@@ -49,5 +57,6 @@ export class TokenPromptModal extends Modal {
 
 	onClose(): void {
 		this.contentEl.empty();
+		this.onClosed?.();
 	}
 }

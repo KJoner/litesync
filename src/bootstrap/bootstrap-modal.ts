@@ -168,6 +168,11 @@ export class BootstrapWizardModal extends Modal {
 						return;
 					}
 					errEl.setText("切换/新建仓库需要账户的 API Token（本设备持有的是仅绑定单一仓库的设备凭据）。");
+					// iOS 密码管理器填充会把条目「用户名」塞进文档里任何可见文本框
+					//（重命名弹窗真机实测）——Token 弹窗期间锁住新建仓库名并在
+					// 关闭时恢复；proceed 重入时读到的即是恢复后的原值
+					const pendingName = nameInput.value;
+					nameInput.readOnly = true;
 					new TokenPromptModal(
 						this.app,
 						"切换/新建仓库需要账户的 API Token（lsk_ 开头，可在网页端「账户」页查看指引）。" +
@@ -188,6 +193,10 @@ export class BootstrapWizardModal extends Modal {
 								errEl.setText("");
 								proceed();
 							})();
+						},
+						() => {
+							nameInput.readOnly = false;
+							nameInput.value = pendingName;
 						},
 					).open();
 					return;
