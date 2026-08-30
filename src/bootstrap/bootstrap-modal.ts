@@ -1,5 +1,6 @@
-import { App, Modal, Notice, Platform } from "obsidian";
+import { App, Modal, Notice } from "obsidian";
 import { EnableE2eeModal } from "../crypto/e2ee-modals";
+import { TokenPromptModal } from "../token-prompt-modal";
 import { enableE2eeOnEmptyRemote } from "../crypto/migration";
 import { SyncContext } from "../sync/context";
 import {
@@ -147,24 +148,12 @@ export class BootstrapWizardModal extends Modal {
 				}
 			});
 		};
-		// 账户 Token 补填行：**被拒时才创建**，绝不常驻 DOM（哪怕 hidden）——
-		//「文本框 + 密码框」的组合会触发 WebKit 的登录表单启发式，把新建仓库
-		// 名当成用户名字段，而 iOS 对凭据字段禁用第三方输入法（重命名弹窗
-		// 真机实测的同款连坐）。配对导入的设备持设备凭据，切换/新建是用户级
-		// 操作（D4 最小权限，服务端硬拒）——在向导内直接补填并存入
-		// SecretStorage（与设置页填写等效），不逼用户绕去设置页再回来
-		let tokenInput: HTMLInputElement | null = null;
-		const ensureTokenRow = (): HTMLInputElement => {
-			if (tokenInput) return tokenInput;
-			const tokenRow = createEl("div", { cls: "litesync-history-meta" });
-			tokenRow.createDiv({ text: "账户 API Token（lsk_ 开头；输入后将保存为本设备的凭据）：" });
-			tokenInput = tokenRow.createEl("input", { type: "password", placeholder: "lsk_…" });
-			tokenInput.setAttribute("enterkeyhint", "go");
-			tokenInput.setAttribute("autocomplete", "off");
-			submitOnEnter(tokenInput);
-			contentEl.insertBefore(tokenRow, errEl);
-			return tokenInput;
-		};
+		// 账户 Token 补填走**独立弹窗**（TokenPromptModal，叠加在向导上）：
+		// 密码框绝不与仓库名文本框同弹窗——「文本框 + 密码框」触发 WebKit
+		// 登录表单启发式，文本框被当用户名字段连坐进 iOS 凭据键盘限制，
+		// 密码管理器自动填充还会把条目「用户名」塞进文本框（真机实测）。
+		// 配对导入的设备持设备凭据，切换/新建是用户级操作（D4 最小权限，
+		// 服务端硬拒）——弹窗补填并存入 SecretStorage（与设置页填写等效）。
 		const proceed = (): void => {
 			void (async () => {
 				if (!selected) {
@@ -174,30 +163,34 @@ export class BootstrapWizardModal extends Modal {
 				const currentVault = vaults.find((v) => v.current);
 				const changing = selected === "__new__" || (currentVault && selected !== currentVault.id);
 				if (changing && tokenType === "device") {
-					const t = tokenInput?.value.trim() ?? "";
-					if (t && this.hooks.setApiToken) {
-						await this.hooks.setApiToken(t);
-						try {
-							tokenType = (await this.ctx.client.whoami()).tokenType ?? "root";
-						} catch (e) {
-							errEl.setText(`Token 验证失败：${e instanceof Error ? e.message : String(e)}`);
-							return;
-						}
-					}
-					if (tokenType === "device") {
-						const ti = ensureTokenRow();
-						errEl.setText(
-							t
-								? "这个 Token 仍是设备凭据——请粘贴账户的 API Token（lsk_ 开头，可在网页端「账户」页查看指引）。"
-								: "切换/新建仓库需要账户的 API Token（本设备持有的是仅绑定单一仓库的设备凭据）。" +
-										"在上方输入后按回车（或点「继续」）即可，无需去设置页。",
-						);
-						// 桌面端聚焦是便利；移动端自动聚焦会立刻弹出无法收起的
-						// 密码键盘盖住整个界面（iOS 实测）——让用户自己点
-						if (!Platform.isMobileApp) ti.focus();
+					if (!this.hooks.setApiToken) {
+						errEl.setText("切换/新建仓库需要账户的 API Token。请在设置中重新填入后再打开向导。");
 						return;
 					}
-					errEl.setText("");
+					errEl.setText("切换/新建仓库需要账户的 API Token（本设备持有的是仅绑定单一仓库的设备凭据）。");
+					new TokenPromptModal(
+						this.app,
+						"切换/新建仓库需要账户的 API Token（lsk_ 开头，可在网页端「账户」页查看指引）。" +
+							"输入后将保存为本设备的凭据并继续。",
+						(t) => {
+							void (async () => {
+								await this.hooks.setApiToken?.(t);
+								try {
+									tokenType = (await this.ctx.client.whoami()).tokenType ?? "root";
+								} catch (e) {
+									errEl.setText(`Token 验证失败：${e instanceof Error ? e.message : String(e)}`);
+									return;
+								}
+								if (tokenType === "device") {
+									errEl.setText("这个 Token 仍是设备凭据——请点「继续」重新粘贴账户的 API Token（lsk_ 开头）。");
+									return;
+								}
+								errEl.setText("");
+								proceed();
+							})();
+						},
+					).open();
+					return;
 				}
 				try {
 					let target = selected;
