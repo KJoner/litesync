@@ -66,7 +66,7 @@ export const PLUGIN_PROTOCOL_VERSION = 6;
  * 协议版本号（6）粒度太粗：同一个协议版本下的两个插件版本，
  * 修没修某个已知 bug 是不一样的。
  */
-export const PLUGIN_VERSION = "0.19.0-rc.5";
+export const PLUGIN_VERSION = "0.19.0";
 
 /**
  * 平台紧凑 token（随每个请求上报，运维页 Devices 列表用）。
