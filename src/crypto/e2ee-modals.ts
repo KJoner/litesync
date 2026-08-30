@@ -105,6 +105,17 @@ export class EnableE2eeModal extends Modal {
 		const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
 		const btn = footer.createEl("button", { text: "开始加密迁移", cls: "mod-cta" });
 		footer.createEl("button", { text: "取消" }).onclick = () => this.close();
+		// 回车流转：pw1 → pw2 → 提交（iOS 软键盘会盖住底部按钮且密码键盘无法收起，
+		// 回车是唯一出口；提交前先 blur 收起键盘）
+		pw1.addEventListener("keydown", (e) => {
+			if (e.key === "Enter") pw2.focus();
+		});
+		pw2.addEventListener("keydown", (e) => {
+			if (e.key === "Enter") {
+				pw2.blur();
+				btn.click();
+			}
+		});
 
 		btn.onclick = async () => {
 			if (this.busy) return;

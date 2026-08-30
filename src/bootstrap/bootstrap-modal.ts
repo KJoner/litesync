@@ -1,4 +1,4 @@
-import { App, Modal, Notice } from "obsidian";
+import { App, Modal, Notice, Platform } from "obsidian";
 import { EnableE2eeModal } from "../crypto/e2ee-modals";
 import { enableE2eeOnEmptyRemote } from "../crypto/migration";
 import { SyncContext } from "../sync/context";
@@ -141,9 +141,12 @@ export class BootstrapWizardModal extends Modal {
 		tokenRow.hidden = true;
 		tokenRow.createDiv({ text: "账户 API Token（lsk_ 开头；输入后将保存为本设备的凭据）：" });
 		const tokenInput = tokenRow.createEl("input", { type: "password", placeholder: "lsk_…" });
+		// iOS：软键盘（尤其密码键盘）会盖住底部按钮且没有收起键——回车键是
+		// 唯一出口，必须让它等价于「继续」并顺手收起键盘（0.19.0-rc.1 真机实测）
+		tokenInput.setAttribute("enterkeyhint", "go");
 		const errEl = contentEl.createDiv({ cls: "litesync-history-meta" });
 		const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
-		footer.createEl("button", { text: "继续", cls: "mod-cta" }).onclick = () => {
+		const proceed = (): void => {
 			void (async () => {
 				if (!selected) {
 					errEl.setText("请选择一个仓库，或新建。");
@@ -168,9 +171,11 @@ export class BootstrapWizardModal extends Modal {
 							t
 								? "这个 Token 仍是设备凭据——请粘贴账户的 API Token（lsk_ 开头，可在网页端「账户」页查看指引）。"
 								: "切换/新建仓库需要账户的 API Token（本设备持有的是仅绑定单一仓库的设备凭据）。" +
-										"在上方输入后再点「继续」即可，无需去设置页。",
+										"在上方输入后按回车（或点「继续」）即可，无需去设置页。",
 						);
-						tokenInput.focus();
+						// 桌面端聚焦是便利；移动端自动聚焦会立刻弹出无法收起的
+						// 密码键盘盖住整个界面（iOS 实测）——让用户自己点
+						if (!Platform.isMobileApp) tokenInput.focus();
 						return;
 					}
 					errEl.setText("");
@@ -194,6 +199,18 @@ export class BootstrapWizardModal extends Modal {
 				}
 			})();
 		};
+		footer.createEl("button", { text: "继续", cls: "mod-cta" }).onclick = proceed;
+		// 回车 = 继续，并先收起软键盘（否则 iOS 密码键盘既盖住按钮又没有关闭键）
+		const submitOnEnter = (input: HTMLInputElement): void => {
+			input.addEventListener("keydown", (e) => {
+				if (e.key === "Enter") {
+					input.blur();
+					proceed();
+				}
+			});
+		};
+		submitOnEnter(tokenInput);
+		submitOnEnter(nameInput);
 		footer.createEl("button", { text: "稍后再说" }).onclick = () => this.close();
 	}
 

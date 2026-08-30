@@ -487,11 +487,12 @@ class RenameVaultModal extends Modal {
 			tokenRow.hidden = true;
 			tokenRow.createDiv({ text: "账户 API Token（lsk_ 开头；输入后将保存为本设备的凭据）：" });
 			const tokenInput = tokenRow.createEl("input", { type: "password", cls: "litesync-modal-input", placeholder: "lsk_…" });
+			tokenInput.setAttribute("enterkeyhint", "go");
 			const errEl = contentEl.createDiv({ cls: "litesync-history-meta" });
 			const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
 			const btn = footer.createEl("button", { text: "重命名", cls: "mod-cta" });
 			const id = cur.id;
-			btn.onclick = () => {
+			const doRename = (): void => {
 				void (async () => {
 					const name = input.value.trim();
 					if (!name || name.length > 64) {
@@ -511,15 +512,26 @@ class RenameVaultModal extends Modal {
 							errEl.setText(
 								t
 									? "这个 Token 仍无权限——请粘贴账户的 API Token（lsk_ 开头）。"
-									: "重命名需要账户的 API Token（本设备持有的是配对导入的设备凭据）。在上方输入后再点「重命名」即可。",
+									: "重命名需要账户的 API Token（本设备持有的是配对导入的设备凭据）。在上方输入后按回车（或点「重命名」）即可。",
 							);
-							tokenInput.focus();
+							// 移动端不自动聚焦：iOS 密码键盘一弹出就盖住界面且无法收起
+							if (!Platform.isMobileApp) tokenInput.focus();
 						} else {
 							errEl.setText(`失败：${e instanceof Error ? e.message : String(e)}`);
 						}
 					}
 				})();
 			};
+			btn.onclick = doRename;
+			// 回车 = 提交，并先收起软键盘（iOS 密码键盘盖按钮且没有关闭键）
+			for (const el of [input, tokenInput]) {
+				el.addEventListener("keydown", (e) => {
+					if (e.key === "Enter") {
+						el.blur();
+						doRename();
+					}
+				});
+			}
 			footer.createEl("button", { text: "取消" }).onclick = () => this.close();
 		})();
 	}
