@@ -38,6 +38,31 @@ type OnProgress = (p: BootstrapProgress) => void;
 export async function preflight(ctx: SyncContext): Promise<PreflightResult> {
 	const info = await ctx.client.info();
 
+	// 换库对账（v0.18 实测缺陷的补口）：向导可能在「bootstrap pending + 已换
+	// Token」的状态下直接打开——同步轮里的 vaultId 对账（adoptRepoIdentity）
+	// 在 pending 时被 bootstrap gate 拦在更前面，永远没有机会执行。
+	// 旧账本属于别的仓库：带着它执行恢复/合并，下载校验会拿旧 fileId 当期望
+	// 而必然失败（「服务器返回了不同的文件身份」）；执行 local-init 则会静默
+	// 不传任何文件。必须赶在下面覆盖 pending binding **之前**对账并作废。
+	//
+	// 归属判定用 ledgerVaultId（账本自己的归属标记）而**不是**
+	// bootstrap.remoteVaultId——后者每次 preflight 都会被 pending binding
+	// 覆盖，一次失败的向导之后它就已经指向新仓库，再比较必然「一致」。
+	// 账本非空而归属未知（旧版本升级留下的中间态）同样作废：无法证明这本账
+	// 属于眼前这个仓库，就不能拿它当「已同步」的证据。
+	if (info.vaultId && ctx.store.paths().length > 0) {
+		const owner =
+			ctx.store.state.ledgerVaultId ??
+			(ctx.store.state.bootstrap.status === "ready" ? ctx.store.state.bootstrap.remoteVaultId : undefined);
+		if (owner !== info.vaultId) {
+			ctx.log(
+				`preflight: ledger belongs to ${owner ? owner.slice(0, 8) + "…" : "an unknown repository"}, ` +
+					`server is ${info.vaultId.slice(0, 8)}…; discarding stale ledger`,
+			);
+			ctx.store.resetForNewRepository();
+		}
+	}
+
 	// 权威 pending binding（v0.13.1 / 计划书 §5.1）。
 	//
 	// 一拿到服务器状态就写进 bootstrap（status 仍是 pending）：此后 bootstrap
@@ -102,6 +127,14 @@ function completeBootstrap(ctx: SyncContext, pre: PreflightResult, mode: "remote
 
 /** 本地初始化远端（远端为空）：标记就绪后由普通同步把本地文件全部推上去。 */
 export async function bootstrapLocalInit(ctx: SyncContext, pre: PreflightResult): Promise<void> {
+	// 自愈（v0.18 实测缺陷）：对**空**远端不可能存在「已同步」账本——有即为
+	// 换库/换账户的残留（升级前旧版本留下的，或换 Token 后未及重载的旧代码
+	// 写下的）。不作废的话，「由普通同步推上去」会因为账本声称「都同步过」
+	// 而一个文件都不推：local-init 静默变成空操作，状态栏却显示 synced。
+	if (pre.remoteFiles.length === 0 && ctx.store.paths().length > 0) {
+		ctx.log(`bootstrap: local-init found stale ledger (${ctx.store.paths().length} entries) against an empty remote — clearing`);
+		ctx.store.clearSyncLedger();
+	}
 	completeBootstrap(ctx, pre, "local-init");
 	await ctx.store.save();
 	ctx.log(`bootstrap: local-init (local=${pre.localPaths.length})`);

@@ -1,5 +1,5 @@
-import { App, Notice, Platform, PluginSettingTab, SettingDefinitionItem } from "obsidian";
-import { isLoopbackUrl } from "./api/client";
+import { App, debounce, Modal, Notice, Platform, PluginSettingTab, SettingDefinitionItem } from "obsidian";
+import { ApiError, isLoopbackUrl } from "./api/client";
 import type PrivateSyncPlugin from "./main";
 import {
 	DEFAULT_BATCH_SECONDS,
@@ -17,6 +17,12 @@ export interface PluginSettings {
 	syncObsidian: boolean;
 	/** 每行一个 Glob 模式 */
 	ignorePatterns: string;
+	/**
+	 * 目标仓库选择（v0.19 单用户多仓库）：一个 Token 名下可以有多个远端仓库，
+	 * 这里记录本 Obsidian 库绑定的那一个（vault_id；空 = 该用户的默认仓库）。
+	 * 只在接入向导里改变——切换仓库 = 重新接入（作废本地同步账本）。
+	 */
+	vaultChoice: string;
 	debug: boolean;
 	/**
 	 * 信任此设备：解锁后把 VMK 用随机设备密钥包装存入 SecretStorage，
@@ -80,6 +86,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	syncIntervalSeconds: 30,
 	syncObsidian: false,
 	ignorePatterns: ".trash/**\n.DS_Store\nThumbs.db",
+	vaultChoice: "",
 	debug: false,
 	trustDevice: true,
 	deviceKeyB64: "",
@@ -105,6 +112,11 @@ export class SyncSettingTab extends PluginSettingTab {
 		super(app, plugin);
 	}
 
+	/** 供 plugin 在弹窗操作成功后调用：重渲染设置页以反映新状态（基类 update 非公开）。 */
+	refresh(): void {
+		this.update();
+	}
+
 	getSettingDefinitions(): SettingDefinitionItem[] {
 		const plugin = this.plugin;
 		return [
@@ -126,16 +138,26 @@ export class SyncSettingTab extends PluginSettingTab {
 					},
 					{
 						name: "API Token",
-						desc: "与服务器 OBSYNC_TOKEN 一致（保存在 Obsidian SecretStorage，不进入 data.json）",
+						desc: "你的账户 API Token（lsk_ 开头；管理员也可用 OBSYNC_TOKEN）。保存在 Obsidian SecretStorage，不进入 data.json",
 						render: (setting) => {
 							setting.addText((text) => {
 								text.inputEl.type = "password";
+								// 防抖提交（v0.18 / v11 设计 §4.6）：逐字符提交会让定时同步
+								// 拿着半截 Token 撞出假 401（一条常驻错误通知），还伴随
+								// 每键一次的 SecretStorage 写入与绑定作废抖动。
+								// 停顿 800ms 或失焦才算「输完了」。
+								const commit = debounce(
+									(value: string) => void plugin.setApiToken(value.trim()),
+									800,
+									true,
+								);
 								text
 									.setPlaceholder("Token")
 									.setValue(plugin.getApiToken())
-									.onChange(async (value) => {
-										await plugin.setApiToken(value.trim());
-									});
+									.onChange((value) => commit(value));
+								text.inputEl.addEventListener("blur", () => {
+									void plugin.setApiToken(text.inputEl.value.trim());
+								});
 							});
 						},
 					},
@@ -145,7 +167,7 @@ export class SyncSettingTab extends PluginSettingTab {
 						action: (el) => {
 							el.addClass("is-disabled");
 							void plugin.testConnection().then((msg) => {
-								// null = 已弹出「首次配置三选项」对话框，无需再报消息
+								// null = 已弹出「首次配置」对话框，无需再报消息
 								if (msg !== null) new Notice(msg);
 								el.removeClass("is-disabled");
 							});
@@ -209,6 +231,32 @@ export class SyncSettingTab extends PluginSettingTab {
 				heading: "设备与迁移",
 				items: [
 					{
+						name: "当前仓库",
+						aliases: ["仓库", "vault", "多仓库", "重命名"],
+						render: (setting) => {
+							setting.setDesc("正在查询当前仓库…");
+							setting.addButton((btn) =>
+								btn.setButtonText("重命名…").onClick(() => new RenameVaultModal(plugin.app, plugin).open()),
+							);
+							void (async () => {
+								try {
+									const vaults = await plugin.listRemoteVaults();
+									const cur = vaults.find((v) => v.current);
+									if (!cur) {
+										setting.setDesc("尚未接入远端仓库（运行接入向导完成绑定）");
+										return;
+									}
+									const extra = vaults.length > 1 ? `；名下共 ${vaults.length} 个仓库` : "";
+									setting.setDesc(
+										`同步到「${cur.name || "默认仓库"}」（远端 ${cur.fileCount} 个文件${extra}）。切换或新建仓库：重新运行接入向导。`,
+									);
+								} catch {
+									setting.setDesc("无法查询（离线，或服务器版本低于 v0.19）");
+								}
+							})();
+						},
+					},
+					{
 						name: "添加新设备",
 						desc: "生成一次性加密配对二维码/链接：新设备扫码即可自动导入服务器配置（E2EE 密码仍需手动输入）",
 						action: () => plugin.openAddDeviceModal(),
@@ -220,7 +268,7 @@ export class SyncSettingTab extends PluginSettingTab {
 					},
 					{
 						name: "重新运行接入向导",
-						desc: "重新选择本设备与远端仓库的接入方式（从远端恢复 / 合并）",
+						desc: "重新选择目标仓库（切换 / 新建）与接入方式（从远端恢复 / 合并）",
 						action: () => plugin.rerunBootstrapWizard(),
 					},
 				],
@@ -398,5 +446,85 @@ export class SyncSettingTab extends PluginSettingTab {
 		}
 		await this.plugin.saveSettings();
 		this.plugin.applySettings();
+	}
+}
+
+/**
+ * 重命名当前仓库（v0.19.x）。只动服务端的展示名——vault_id / 密钥 / 账本 /
+ * 绑定指纹一概不变，因此无需重新接入。重命名是用户级 Token 专属操作：
+ * 配对导入的设备（持设备凭据）会被服务端拒绝，提示重新填入账户 Token。
+ */
+class RenameVaultModal extends Modal {
+	constructor(
+		app: App,
+		private plugin: PrivateSyncPlugin,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.titleEl.setText("重命名当前仓库");
+		const { contentEl } = this;
+		const info = contentEl.createDiv({ text: "正在查询当前仓库…" });
+		void (async () => {
+			let cur;
+			try {
+				cur = (await this.plugin.listRemoteVaults()).find((v) => v.current);
+			} catch (e) {
+				info.setText(`无法查询：${e instanceof Error ? e.message : String(e)}`);
+				return;
+			}
+			if (!cur) {
+				info.setText("尚未接入远端仓库。");
+				return;
+			}
+			info.setText(`当前仓库：「${cur.name || "默认仓库"}」。改名只影响各处的显示名，不影响同步、加密与其他设备。`);
+			contentEl.createDiv({ text: "新名字（1–64 字符）：" });
+			const input = contentEl.createEl("input", { type: "text", cls: "litesync-modal-input", value: cur.name });
+			// 账户 Token 补填行（默认隐藏）：重命名是用户级操作，配对导入的设备
+			// 持设备凭据会被服务端拒——在弹窗内直接补填（与设置页填写等效）
+			const tokenRow = contentEl.createDiv({ cls: "litesync-history-meta" });
+			tokenRow.hidden = true;
+			tokenRow.createDiv({ text: "账户 API Token（lsk_ 开头；输入后将保存为本设备的凭据）：" });
+			const tokenInput = tokenRow.createEl("input", { type: "password", cls: "litesync-modal-input", placeholder: "lsk_…" });
+			const errEl = contentEl.createDiv({ cls: "litesync-history-meta" });
+			const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
+			const btn = footer.createEl("button", { text: "重命名", cls: "mod-cta" });
+			const id = cur.id;
+			btn.onclick = () => {
+				void (async () => {
+					const name = input.value.trim();
+					if (!name || name.length > 64) {
+						errEl.setText("名字需为 1–64 个字符。");
+						return;
+					}
+					const t = tokenInput.value.trim();
+					if (t) await this.plugin.setApiToken(t);
+					try {
+						await this.plugin.renameRemoteVault(id, name);
+						new Notice(`仓库已重命名为「${name}」✓`);
+						this.close();
+						this.plugin.refreshSettingsTab();
+					} catch (e) {
+						if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
+							tokenRow.hidden = false;
+							errEl.setText(
+								t
+									? "这个 Token 仍无权限——请粘贴账户的 API Token（lsk_ 开头）。"
+									: "重命名需要账户的 API Token（本设备持有的是配对导入的设备凭据）。在上方输入后再点「重命名」即可。",
+							);
+							tokenInput.focus();
+						} else {
+							errEl.setText(`失败：${e instanceof Error ? e.message : String(e)}`);
+						}
+					}
+				})();
+			};
+			footer.createEl("button", { text: "取消" }).onclick = () => this.close();
+		})();
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
 	}
 }

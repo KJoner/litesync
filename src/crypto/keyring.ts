@@ -1,4 +1,4 @@
-import { deriveMetaKeys, exportVmkRaw, importVmk, MetaKeys, unlockVaultKey, VaultKeyDoc } from "./crypto";
+import { deriveMetaKeys, deriveResetAuth, exportVmkRaw, importVmk, MetaKeys, unlockVaultKey, VaultKeyDoc } from "./crypto";
 
 /** 同步遇到密文但密钥未解锁时抛出；同步暂停，本地编辑不受影响。 */
 export class E2eeLockedError extends Error {
@@ -83,6 +83,17 @@ export class Keyring {
 	 * 元数据密钥（v9.3 三期）：HKDF 从 VMK 派生，懒加载缓存。
 	 * VMK 原始字节仅在派生瞬间存在，用完立即清零。
 	 */
+	/** 重置凭证（v0.18）：未解锁返回 null（不该为了登记去打扰用户解锁）。 */
+	async resetAuth(): Promise<string | null> {
+		if (!this.vmk) return null;
+		const raw = await exportVmkRaw(this.vmk);
+		try {
+			return await deriveResetAuth(raw);
+		} finally {
+			raw.fill(0);
+		}
+	}
+
 	async metaKeys(): Promise<MetaKeys> {
 		if (!this.vmk) throw new E2eeLockedError();
 		if (this.cachedMetaKeys) return this.cachedMetaKeys;

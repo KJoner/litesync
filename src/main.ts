@@ -1,5 +1,5 @@
 import { Notice, Platform, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
-import { ApiClient, protocolError } from "./api/client";
+import { ApiClient, protocolError, RemoteVault } from "./api/client";
 import { bootstrapLocalInit, preflight } from "./bootstrap/bootstrap-manager";
 import { BootstrapWizardModal } from "./bootstrap/bootstrap-modal";
 import { FirstSyncModal } from "./bootstrap/first-sync-modal";
@@ -28,7 +28,7 @@ import { DEFAULT_SETTINGS, PluginSettings, SyncSettingTab } from "./settings";
 import { ShareManageModal, ShareModal } from "./share/share-modal";
 import { StateStore } from "./state/store";
 import { SyncContext } from "./sync/context";
-import { SyncBlockedError, SyncGate } from "./sync/gate";
+import { SyncBlockedError, SyncGate, syncGateBlock } from "./sync/gate";
 import { loadOrCreateSigningKey } from "./crypto/signing-key";
 import { LocalCommitter } from "./sync/local-commit";
 import { PendingQueue } from "./sync/queue";
@@ -78,6 +78,8 @@ export default class PrivateSyncPlugin extends Plugin {
 	private wizardOpen = false;
 	/** API Token 运行时值（真实存储在 Obsidian SecretStorage） */
 	private apiTokenValue = "";
+	/** 设置页实例：弹窗操作（解锁/启用 E2EE、重命名仓库）完成后就地刷新它 */
+	private settingTab: SyncSettingTab | null = null;
 	/** v3.1 迁移：旧版本明文保存的 E2EE 密码，仅在首次启动时用一次后即抹除 */
 	private legacyE2eePassword = "";
 
@@ -87,7 +89,8 @@ export default class PrivateSyncPlugin extends Plugin {
 		this.statusEl = this.addStatusBarItem();
 		this.updateStatus("idle");
 
-		this.addSettingTab(new SyncSettingTab(this.app, this));
+		this.settingTab = new SyncSettingTab(this.app, this);
+		this.addSettingTab(this.settingTab);
 		this.addCommand({
 			id: "sync-now",
 			name: "立即同步 (Sync now)",
@@ -228,6 +231,7 @@ export default class PrivateSyncPlugin extends Plugin {
 
 		this.rebuildIgnoreMatcher();
 		this.client = new ApiClient(() => ({
+			vaultChoice: this.settings.vaultChoice,
 			serverUrl: this.settings.serverUrl,
 			apiToken: this.getApiToken(),
 			deviceId: this.store?.state.deviceId ?? "",
@@ -289,7 +293,11 @@ export default class PrivateSyncPlugin extends Plugin {
 			notify: (msg, durationMs) => new Notice(msg, durationMs ?? 8000),
 			onConflictsChanged: () => this.updateStatus(this.lastStatus),
 			e2ee: this.keyring,
-			credentials: () => ({ serverUrl: this.settings.serverUrl, apiToken: this.getApiToken() }),
+			credentials: () => ({
+				serverUrl: this.settings.serverUrl,
+				apiToken: this.getApiToken(),
+				vaultChoice: this.settings.vaultChoice,
+			}),
 			refreshE2ee: async () => {
 				const before = this.keyring.doc;
 				const doc = await this.client!.getVaultKey();
@@ -338,7 +346,12 @@ export default class PrivateSyncPlugin extends Plugin {
 		}
 		this.wizardOpen = true;
 		new BootstrapWizardModal(this.app, this.ctx, {
-			openUnlock: () => this.openUnlockModal(),
+			setVaultChoice: (id) => this.setVaultChoice(id),
+			vaultChoice: () => this.settings.vaultChoice,
+			trustDevice: () => this.settings.trustDevice,
+			setTrustDevice: (v) => this.setTrustDevice(v),
+			setApiToken: (t) => this.setApiToken(t),
+			openUnlock: (onUnlocked) => this.openUnlockModal(onUnlocked),
 			onDone: () => {
 				this.updateStatus("idle");
 				void this.manager?.sync("bootstrap");
@@ -597,6 +610,29 @@ export default class PrivateSyncPlugin extends Plugin {
 		}
 		this.manager.resetRetry();
 		await this.manager.sync("manual");
+		// 手动同步必须有一条明确的结果消息（0.19.x 实测反馈：状态栏太隐蔽，
+		// 「没反应」分不清是同步成功还是失败）。仅手动触发弹——自动同步照旧安静
+		const err = this.manager.lastSyncError;
+		if (err) {
+			new Notice(`同步失败：${err.message}`, 8000);
+			return;
+		}
+		const block = this.ctx ? syncGateBlock(this.ctx) : null;
+		if (block) {
+			new Notice(`同步未执行：${block.message}`, 8000);
+			return;
+		}
+		const c = this.manager.lastSyncCounters;
+		if (!c) {
+			new Notice("同步未执行：请查看状态栏或稍后重试");
+			return;
+		}
+		const detail = c.pulled > 0 || c.pushed > 0 ? `下载 ${c.pulled}、上传 ${c.pushed}` : "已是最新";
+		new Notice(
+			c.conflicts > 0
+				? `同步完成：${detail}，${c.conflicts} 个冲突待处理（命令面板 → 解决同步冲突）`
+				: `同步完成 ✓ ${detail}`,
+		);
 	}
 
 	/** 返回给设置页展示的消息；null 表示已改为弹出「首次配置三选项」对话框。 */
@@ -607,7 +643,7 @@ export default class PrivateSyncPlugin extends Plugin {
 			const info = await this.client.info();
 			const perr = protocolError(info);
 			if (perr) return perr;
-			// 首次配置（0.17.0-rc.3）：远端仓库未初始化且本设备未接入 → 三选项对话框。
+			// 首次配置（0.17.0-rc.3；0.19.x 起强制 E2EE）：远端未初始化且本设备未接入 → 首次配置对话框。
 			// 「已启用 E2EE 但 0 个文件」不算未初始化——那是第二台设备接入的形状，
 			// 必须走接入向导的解锁门，绝不能在这里提供「添加 E2EE」
 			if (
@@ -617,11 +653,25 @@ export default class PrivateSyncPlugin extends Plugin {
 				this.ctx !== null &&
 				this.manager !== null
 			) {
+				// v0.19 多仓库：名下不止一个仓库时，先让用户在向导里选清楚目标，
+				// 再谈初始化——三选项默认作用于当前指向的仓库，多仓库下容易选错对象
+				if (await this.hasMultipleVaults()) {
+					this.openBootstrapWizard();
+					return null;
+				}
 				new FirstSyncModal(this.app, {
-					syncNow: () => this.firstSyncNow(),
 					withE2ee: () => this.openFirstSyncE2eeModal(),
 				}).open();
 				return null;
+			}
+			// 闭环（v0.18 / v11 设计 §4.6）：连接验证成功而 gate 还停在「凭据被拒」
+			//（Token 重置/设备撤销后刚填入新 Token 的场景）→ 立即触发一轮同步。
+			// 同步的 ensureBinding 会重新校验、换发设备凭据、撤下常驻通知——
+			// 用户看到「连接成功」的同时状态栏还挂着 Offline，会以为没生效
+			if (this.manager && this.gate.sessionBlock()?.reason === "credential-rejected") {
+				this.manager.resetRetry();
+				void this.manager.sync("manual");
+				return `连接成功：服务器版本 ${info.version}，正在恢复同步…`;
 			}
 			return `连接成功：服务器版本 ${info.version}，latestSequence=${info.latestSequence}`;
 		} catch (e) {
@@ -629,7 +679,7 @@ export default class PrivateSyncPlugin extends Plugin {
 		}
 	}
 
-	/** 三选项之「立即同步」：local-init 接入并触发首轮同步（远端已非空则转交向导）。 */
+	/** local-init 接入并触发首轮同步（远端已非空则转交向导）；由 E2EE 启用回调复用。 */
 	private async firstSyncNow(): Promise<void> {
 		const pre = await preflight(this.ctx!);
 		if (pre.remoteFiles.length > 0) {
@@ -644,7 +694,7 @@ export default class PrivateSyncPlugin extends Plugin {
 		void this.manager!.sync("bootstrap");
 	}
 
-	/** 三选项之「添加 E2EE 并立即同步」：空仓启用（无迁移）→ local-init → 首轮同步即密文。 */
+	/** 首次配置「设置 E2EE 并立即同步」：空仓启用（无迁移）→ local-init → 首轮同步即密文。 */
 	private openFirstSyncE2eeModal(): void {
 		new EnableE2eeModal(
 			this.app,
@@ -655,6 +705,7 @@ export default class PrivateSyncPlugin extends Plugin {
 				// 必须在启用 E2EE 之后重跑 preflight：completeBootstrap 会把 pending binding
 				// 里的 keyEpoch 写进正式 binding，用启用前的旧值（0）会产出 AAD 错绑的密文
 				await this.firstSyncNow();
+				this.refreshSettingsTab();
 				return 0;
 			},
 			{
@@ -662,6 +713,37 @@ export default class PrivateSyncPlugin extends Plugin {
 				success: () => "端到端加密已启用，正在进行首次同步（全部内容以密文上传）✓",
 			},
 		).open();
+	}
+
+	/**
+	 * 让打开着的设置页立刻反映刚完成的操作（解锁/启用 E2EE、重命名仓库）。
+	 * 弹窗是异步交互——设置页按钮点击时的 update() 发生在用户输入之前，
+	 * 真正的状态变化要在**成功回调**里主动刷新，否则页面停留在旧状态
+	 * 直到用户离开再进来（0.19.x 实测反馈）。
+	 */
+	refreshSettingsTab(): void {
+		this.settingTab?.refresh();
+	}
+
+	/** 名下仓库列表（设置页「当前仓库」展示用；client 为 private，经此公开）。 */
+	async listRemoteVaults(): Promise<RemoteVault[]> {
+		if (!this.client) throw new Error("插件尚未初始化完成");
+		return this.client.listVaults();
+	}
+
+	/** 重命名仓库（设置页入口；用户级 Token 专属，设备凭据会被服务端拒绝）。 */
+	async renameRemoteVault(id: string, name: string): Promise<void> {
+		if (!this.client) throw new Error("插件尚未初始化完成");
+		await this.client.renameVault(id, name);
+	}
+
+	/** 名下是否有多个仓库（v0.19）；旧服务器/查询失败按单仓库处理。 */
+	private async hasMultipleVaults(): Promise<boolean> {
+		try {
+			return ((await this.client?.listVaults()) ?? []).length > 1;
+		} catch {
+			return false;
+		}
 	}
 
 	private isConfigured(): boolean {
@@ -691,6 +773,17 @@ export default class PrivateSyncPlugin extends Plugin {
 	 * server URL、Token、设备身份、vault key 文档任一变化时调用：会话缓存清零、
 	 * 状态切 unbound，上传/删除/MOVE/历史恢复/分享在重新完成权威校验前全部被拒。
 	 */
+	/**
+	 * 设置目标仓库（v0.19 多仓库）。只由接入向导调用——切换仓库 = 重新接入，
+	 * 账本作废由 vaultId 变化的防线兜底，这里立即作废绑定触发重新校验。
+	 */
+	async setVaultChoice(vaultId: string): Promise<void> {
+		if (this.settings.vaultChoice === vaultId) return;
+		this.settings.vaultChoice = vaultId;
+		await this.saveSettings();
+		this.invalidateBinding("目标仓库已切换");
+	}
+
 	invalidateBinding(reason: string): void {
 		this.gate.markUnbound(reason);
 		this.manager?.invalidateBinding(reason);
@@ -896,7 +989,12 @@ export default class PrivateSyncPlugin extends Plugin {
 		new Notice("已锁定，本设备同步暂停");
 	}
 
-	openUnlockModal(): void {
+	/**
+	 * 打开 E2EE 解锁弹窗。onUnlocked：接入向导传入——解锁成功后原地继续
+	 * 向导流程（弹窗叠加、向导不关），代替默认的「重开向导」（那会让用户
+	 * 把选仓库和接入方式各走两遍）。
+	 */
+	openUnlockModal(onUnlocked?: () => void): void {
 		new UnlockModal(this.app, this.settings.trustDevice, async (password, trustDevice) => {
 			// 新设备可能还没有缓存 vault key 文档，先从服务器获取
 			if (!this.keyring.doc) {
@@ -917,9 +1015,16 @@ export default class PrivateSyncPlugin extends Plugin {
 			await this.setTrustDevice(trustDevice);
 			new Notice("E2EE 已解锁 ✓");
 			this.updateStatus("idle");
-			// 未接入的设备解锁后回到接入向导；已接入的正常同步
-			if (!this.bootstrapReady) this.openBootstrapWizard();
-			else void this.manager?.sync("unlock");
+			this.refreshSettingsTab();
+			if (onUnlocked) {
+				// 向导内解锁：原地继续向导（接入完成时 onDone 自会触发同步）
+				onUnlocked();
+			} else if (!this.bootstrapReady) {
+				// 向导外解锁且未接入：回到接入向导
+				this.openBootstrapWizard();
+			} else {
+				void this.manager?.sync("unlock");
+			}
 			return null;
 		}).open();
 	}
@@ -939,6 +1044,7 @@ export default class PrivateSyncPlugin extends Plugin {
 			);
 			await this.setTrustDevice(trustDevice);
 			this.updateStatus("synced");
+			this.refreshSettingsTab();
 			return migrated;
 		}).open();
 	}

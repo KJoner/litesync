@@ -82,3 +82,15 @@ export function classifyBootstrap(localCount: number, remoteCount: number): Boot
 	if (localCount === 0) return "remote-only";
 	return "both";
 }
+
+/**
+ * 选仓库步（v0.19）是否显示。只要服务器支持 vaults 端点且宿主接线了
+ * setVaultChoice 就**始终显示**——哪怕名下只有一个仓库：「新建仓库」的唯一
+ * 入口在这一步。最初按「≤1 个自动跳过」实现，结果名下只有一个仓库的用户
+ * 想把第二个本地库接为新远端仓库时无路可走，向导径直对着默认仓库对账
+ * （0.19.0 实测缺口）。跳过只剩两种情况：旧服务器（listVaults 404）、
+ * 宿主没接线（防御）。
+ */
+export function vaultPickerVisible(listSucceeded: boolean, hasSetter: boolean): boolean {
+	return listSucceeded && hasSetter;
+}

@@ -21,9 +21,12 @@ Works on desktop and mobile (Obsidian 1.13+).
 
 2. Install LiteSync in Obsidian and open its settings
 3. Fill in **Server URL** and **API Token**, hit **Test Connection**
-4. Follow the onboarding wizard — it will offer to initialize the remote
-   vault from this device
-5. (Optional) Enable **end-to-end encryption** in settings and set a password
+4. If the remote vault is still empty, the test offers the next step right
+   there: **Close** / **Sync now** / **Add E2EE and sync now**. On an empty
+   vault there is no migration — the very first upload is already ciphertext,
+   so your notes never reach the server in plaintext
+5. Otherwise the onboarding wizard opens and asks how this device should join
+   the existing remote vault
 
 That's it — edits now sync automatically in the background.
 
@@ -57,16 +60,27 @@ is ever silently overwritten, and nothing is ever permanently deleted.
   stores ciphertext
 - **Trusted device** — remember device authorization (split-key wrapping via
   Obsidian SecretStorage) instead of your password
+- **Metadata privacy (optional, off by default)** — *size obfuscation* pads
+  ciphertext to bucket boundaries so the server sees a size range instead of an
+  exact byte count (worst case +12.5%), and *timing obfuscation* aligns uploads
+  to a time window so request timestamps stop being a typing log. Both are
+  opt-in, and their cost is spelled out in settings; **Sync now** always
+  bypasses the delay
 - **Encrypted sharing** — share a single note via a link whose key lives only
-  in the URL fragment; revocable, with optional expiry
+  in the URL fragment; embedded images are encrypted into the same package and
+  decrypted in the viewer's browser. Revocable, with preset or custom expiry
 - **Onboarding wizard** — new devices explicitly choose *restore from remote*
   or *merge* before any sync happens; the server's stable vault identity is
   verified so a reinstalled server can never silently clobber your notes
 - **Deletion safety** — remote deletions go to the trash on every platform;
   if trashing fails the file is kept and flagged, never permanently deleted
-- **Web read-only client & off-site backup** — the server ships an embedded
-  browser reader (decrypts locally) and optional Restic → Cloudflare R2
-  disaster backup, managed from a web admin page
+- **Per-device credentials** — each device holds its own revocable token.
+  Revoke a lost device from the server's ops page; the revoked device shows a
+  persistent notice and stops retrying instead of failing silently
+- **Web read-only client, ops page & off-site backup** — the server ships an
+  embedded browser reader (decrypts locally), an ops page for devices /
+  migrations / integrity alerts / share recovery, and optional
+  Restic → Cloudflare R2 disaster backup
 
 ## Privacy & Network Access
 
@@ -84,6 +98,13 @@ is ever silently overwritten, and nothing is ever permanently deleted.
   deletion barriers intact (tombstones are converted, never dropped), but the
   erasure step is still irreversible and pre-migration backups still contain
   plaintext paths — do not enable it on your only real vault.
+- Two optional privacy settings reduce what the server can infer from
+  *metadata* rather than content, and both state their limits in the settings
+  page: **size obfuscation** (padded ciphertext envelope; worst case +12.5%,
+  anything under 4KB counts as 4KB) and **timing obfuscation** (uploads leave
+  on a window grid, reported file mtimes are rounded down). Timing obfuscation
+  lowers resolution — it does not hide *whether* you edited during a window,
+  and LiteSync deliberately sends no cover traffic and does not pretend to.
 - Each device holds its own least-privilege credential (v0.10): the root
   server token is exchanged for a per-device token on first sync and never
   stays on devices afterwards. A lost device can be revoked individually on
@@ -105,10 +126,50 @@ is ever silently overwritten, and nothing is ever permanently deleted.
 - The server component is a separate open-source project:
   <https://github.com/KJoner/litesync-server>
 
+## Multi-user & API token reset (v0.18)
+
+One server can now host a few **mutually invisible** vaults (invite-only —
+registration stays closed). The admin generates one-time invite links in the
+web UI; the invitee picks a username and receives their own API token plus a
+step-by-step onboarding guide. Isolation is complete — files, change feeds,
+history, shares, devices and E2EE key documents are all partitioned per
+vault, enforced by an auto-generated cross-tenant test matrix. The admin can
+see usernames and usage, but **cannot** obtain anyone's API token (only
+hashes are stored) or E2EE password (never uploaded). A lost token cannot be
+recovered — by design there is no recovery flow to socially engineer.
+
+If you suspect your API token leaked (but not your E2EE password), reset it
+from the web UI's Account page: the old token dies immediately, all device
+credentials of that account are revoked, and every device recovers by simply
+pasting the new token and clicking "Test connection" — no re-onboarding, no
+full re-sync, local data untouched. On E2EE-enabled vaults the reset endpoint
+requires a credential derived from your encryption key, so an attacker
+holding only the token cannot race you to the reset button. A reset cannot
+retroactively recall ciphertext downloaded during the leak window — that part
+is protected only by your E2EE passphrase strength. Emergency fallback:
+`obsync token reset` on the server shell.
+
+## Multiple vaults per user (v0.19)
+
+One API token can own several **mutually isolated** remote vaults. The
+onboarding wizard starts with a vault picker (pick an existing vault to
+restore/merge, or create a new one to initialize from this device); the
+picker shows even when you own a single vault, because it is the only
+entry point for creating another one. Initializing an empty vault
+**requires E2EE** — the first upload is already ciphertext, and there is
+no plaintext-first-migrate-later path (existing plaintext vaults are
+unaffected). The settings page shows which vault this device syncs to,
+with an in-place rename (display name only). Switching vaults is deliberately
+heavyweight — it re-runs the wizard, discards this device's sync ledger
+(local notes are kept) and reconciles from scratch. One E2EE passphrase may
+be reused across vaults, but every vault has its own key document and salt;
+device credentials stay bound to a single vault (a stolen device cannot move
+laterally into your other vaults). The web UI gets a vault switcher.
+
 ## Known limitations & remaining threats
 
 Being explicit about what LiteSync does **not** protect against is part of the
-design. The list below is accurate as of v0.17.0-rc.1.
+design. The list below is accurate as of v0.17.0.
 
 ### What a malicious or compromised server can still do
 
@@ -141,6 +202,26 @@ Signed checkpoints (v0.15) are signed by your **devices**, never by the server.
 A new device does not trust the first manifest the server offers — it receives a
 trusted anchor through device pairing, whose key travels only in the link's
 `#fragment`.
+
+### What the server still learns even with E2EE on
+
+End-to-end encryption hides *content*. It does not hide everything around it,
+and the optional privacy settings only reduce the resolution:
+
+| Metadata | Default | With the optional settings on |
+|---|---|---|
+| Exact object size | visible | bucketed (worst case +12.5% storage) |
+| Edit timestamps | per-save, near real time | which time window the edit fell into |
+| Stored mtime | exact | rounded down to the configured granularity |
+| Whether you edited at all in a window | visible | **still visible** — no cover traffic |
+| Number of objects, access pattern | visible | visible |
+| Paths and filenames | visible | pseudonyms only, if you enable the RC path encryption below |
+
+Size padding covers the *content* envelope only; the metadata envelope (LSM1)
+and share-name envelope (LSN1) are not padded yet. Both are small and their
+lengths cluster tightly, but it is a known gap rather than a solved problem.
+Enabling padding does not rewrite existing files — they move to the padded
+envelope the next time you edit them.
 
 ### Path and filename encryption is still RC
 
@@ -194,10 +275,22 @@ Until LiteSync is available in Community Plugins:
 npm install
 npm run build        # type-check + bundle to main.js
 npm run lint         # eslint-plugin-obsidianmd recommended rules
-npm test             # unit tests (merge engine / crypto / pairing / state)
+npm test             # 289 tests, discovered from tests/ (merge / crypto /
+                     # pairing / state / crash points / adversarial protocol /
+                     # real filesystem semantics)
 npm run test:mobile  # mobile CI: Node/Electron dependency audit + build + tests
+npm run check:adr    # every ADR is referenced from the code it governs
+npm run check:inv    # every invariant (INV-xx) has annotated tests
 npm run dev          # watch mode
 ```
+
+CI runs the suite on Linux, macOS **and** Windows, because the file-system
+semantics this plugin depends on (case sensitivity, Unicode normalization,
+atomic replace) genuinely differ per platform. Mobile is covered by the
+in-plugin **"Platform compatibility probe"** command, since Obsidian Mobile
+cannot run in a CI runner.
+
+Contributor-facing architecture notes live in [AGENTS.md](AGENTS.md).
 
 Releases are automated: pushing a tag that matches `manifest.json`'s version
 lints, builds, attests provenance, and drafts a GitHub Release with `main.js`,

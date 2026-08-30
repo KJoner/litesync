@@ -6,6 +6,8 @@ export interface ServerInfo {
 	version: string;
 	latestSequence: number;
 	serverTime: number;
+	/** 重置凭证是否已登记（v0.18 服务器）：false 且已解锁 E2EE 时自动补登记 */
+	resetAuthConfigured?: boolean;
 	/** 服务器当前协议版本（0.7.0 之前的旧服务器不返回，按 1 处理） */
 	protocolVersion?: number;
 	/** 服务器仍兼容的最低客户端协议版本 */
@@ -64,7 +66,7 @@ export const PLUGIN_PROTOCOL_VERSION = 6;
  * 协议版本号（6）粒度太粗：同一个协议版本下的两个插件版本，
  * 修没修某个已知 bug 是不一样的。
  */
-export const PLUGIN_VERSION = "0.17.0";
+export const PLUGIN_VERSION = "0.19.0-rc.1";
 
 /**
  * 平台紧凑 token（随每个请求上报，运维页 Devices 列表用）。
@@ -200,6 +202,19 @@ export interface VersionEntry {
 
 export type UploadAction = "upsert" | "merge" | "restore";
 
+/** 名下仓库（GET /api/v1/vaults，v0.19 多仓库）。 */
+export interface RemoteVault {
+	id: string;
+	name: string;
+	createdAt: number;
+	fileCount: number;
+	bytesUsed: number;
+	updatedAt: number;
+	encryptionState: string;
+	/** 本次请求的凭据当前指向的仓库 */
+	current: boolean;
+}
+
 /** 分享元数据（GET /api/v1/shares）。 */
 export interface ShareEntry {
 	id: string;
@@ -216,6 +231,10 @@ export interface ShareEntry {
  * 绝不允许再解析 message 文案（文案会随本地化和版本变化）。
  */
 export type ServerErrorCode =
+	// --- v0.18 认证类（重置 Token / 设备撤销的机器可读通路） ---
+	| "UNAUTHORIZED"
+	| "TOKEN_REVOKED"
+	| "RESET_AUTH_MISMATCH"
 	| "INVALID_PATH"
 	| "INVALID_HEADER"
 	| "INVALID_BODY"
@@ -329,6 +348,8 @@ interface ClientConfig {
 	serverUrl: string;
 	apiToken: string;
 	deviceId: string;
+	/** 目标仓库（v0.19 多仓库；空 = 默认仓库）。随每个请求以 X-Vault-ID 携带 */
+	vaultChoice?: string;
 	/**
 	 * 客户端当前认为的寻址格式世代（0.13.0+ / ADR-006）。
 	 * 逐请求携带；与服务器不符时服务器返回 409 FORMAT_EPOCH_MISMATCH，
@@ -363,9 +384,12 @@ export class ApiClient {
 	}
 
 	private headers(extra?: Record<string, string>): Record<string, string> {
-		const { apiToken, deviceId, formatEpoch, repoEpoch, keyEpoch } = this.getConfig();
+		const { apiToken, deviceId, formatEpoch, repoEpoch, keyEpoch, vaultChoice } = this.getConfig();
 		return {
 			Authorization: `Bearer ${apiToken}`,
+			// 目标仓库（v0.19）：用户级凭据据此选择仓库（服务端按成员关系硬校验，
+			// 非成员 404）；设备凭据已绑定仓库，服务端对它忽略此头
+			...(vaultChoice ? { "X-Vault-ID": vaultChoice } : {}),
 			"X-Device-ID": deviceId,
 			// 逐请求协议与世代校验（协议 v6 / ADR-006 §2.2、计划书 §5.3）：
 			// 服务器逐请求比对，不匹配即拒绝写入——绝不让本设备用过时的判断改数据
@@ -395,7 +419,9 @@ export class ApiClient {
 			headers: this.headers(),
 			throw: false,
 		});
-		if (res.status !== 200) throw new ApiError(res.status, `info failed: HTTP ${res.status}`);
+		// v0.18：解析响应体，让 401 携带机器可读 code（UNAUTHORIZED / TOKEN_REVOKED）——
+		// 「Token 被重置/设备被撤销」与「网络抽风」在 UI 上必须是两种说法
+		if (res.status !== 200) throw apiError(res.status, "info failed", res.text);
 		return res.json as ServerInfo;
 	}
 
@@ -599,6 +625,60 @@ export class ApiClient {
 			throw: false,
 		});
 		if (res.status !== 200) throw apiError(res.status, "publish checkpoint failed", res.text);
+	}
+
+	/** 名下仓库列表（v0.19 多仓库；设备凭据也可调——只列自己主人的）。 */
+	async listVaults(): Promise<RemoteVault[]> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/vaults`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200) throw apiError(res.status, "list vaults failed", res.text);
+		return ((res.json as { vaults?: RemoteVault[] }).vaults ?? []);
+	}
+
+	/** 新建仓库（v0.19；用户级 Token 专属，设备凭据会被拒）。 */
+	async createVault(name: string): Promise<string> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/vaults`,
+			method: "POST",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify({ name }),
+			throw: false,
+		});
+		if (res.status !== 200) throw apiError(res.status, "create vault failed", res.text);
+		return (res.json as { id: string }).id;
+	}
+
+	/** 重命名仓库（v0.19.x；用户级 Token 专属，只动展示名——身份/密钥/账本不受影响）。 */
+	async renameVault(id: string, name: string): Promise<void> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/vaults/${encodeURIComponent(id)}`,
+			method: "PATCH",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify({ name }),
+			throw: false,
+		});
+		if (res.status !== 200) throw apiError(res.status, "rename vault failed", res.text);
+	}
+
+	/**
+	 * 登记重置凭证（v0.18 / v11 设计 §3.1）：resetKey = HKDF(VMK, "litesync/v1/token-reset-auth")。
+	 * 服务端存 SHA-256——之后「重置 API Token」必须提交这个值，只拿到 Token 的
+	 * 攻击者派生不出它。幂等；服务端已登记不同值时返回 409（RESET_AUTH_MISMATCH），
+	 * 调用方按 code 分支决定是否提示。
+	 */
+	async registerResetAuth(resetAuth: string): Promise<void> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/vault/reset-auth`,
+			method: "PUT",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify({ resetAuth }),
+			throw: false,
+		});
+		if (res.status !== 200) throw apiError(res.status, "register reset auth failed", res.text);
 	}
 
 	/** 登记本设备的 checkpoint 签名公钥（首次接入时一次）。 */

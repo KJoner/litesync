@@ -93,6 +93,29 @@ export interface MetaKeys {
  * HKDF 从 VMK 原始字节派生元数据密钥（与内容密钥域分离）。
  * 派生是确定性的：任何解锁了 VMK 的设备得到同一组 metaKeys。
  */
+/**
+ * 从 VMK 派生重置凭证（v0.18 / v11 设计 §3.1，与 Web 端同源参数）。
+ *
+ * 服务端存 SHA-256(该值)；「重置 API Token」必须提交原值——只持有 Token 的
+ * 攻击者派生不出它，抢不走重置权。HKDF 单向：服务端拿到它也推不回 VMK。
+ */
+export async function deriveResetAuth(vmkRaw: Uint8Array): Promise<string> {
+	const master = await crypto.subtle.importKey("raw", vmkRaw as BufferSource, "HKDF", false, ["deriveBits"]);
+	const bits = await crypto.subtle.deriveBits(
+		{
+			name: "HKDF",
+			hash: "SHA-256",
+			salt: new Uint8Array(32) as BufferSource,
+			info: new TextEncoder().encode("litesync/v1/token-reset-auth") as BufferSource,
+		},
+		master,
+		256,
+	);
+	return Array.from(new Uint8Array(bits))
+		.map((b) => b.toString(16).padStart(2, "0"))
+		.join("");
+}
+
 export async function deriveMetaKeys(vmkRaw: Uint8Array): Promise<MetaKeys> {
 	const master = await crypto.subtle.importKey("raw", vmkRaw as BufferSource, "HKDF", false, ["deriveKey"]);
 	const hkdf = (info: string, algo: AesKeyGenParams | HmacKeyGenParams, usages: KeyUsage[]) =>

@@ -46,11 +46,21 @@ export class SyncManager {
 	private running: Promise<void> | null = null;
 	/** 最近一轮同步的失败原因（fullSync 用它向迁移流程报错，而不是静默成功） */
 	private lastError: unknown = null;
+	/** 最近一条同步链的累计统计（手动同步的完成提示用；链开始时清零、每成功轮累加） */
+	private lastCounters: { pulled: number; pushed: number; conflicts: number } | null = null;
 	private protocolWarned = false;
 	private stateCorruptWarned = false;
 	private credentialChecked = false;
 	/** 「凭据被拒」只弹一次常驻通知（验收 T5.2）；恢复后复位 */
 	private credentialWarned = false;
+	/** 「凭据被拒」的常驻通知句柄：恢复时主动撤下，而不是让用户自己点掉 */
+	private credentialNotice: { hide(): void } | null = null;
+	/** 本会话是否已确认过重置凭证登记（v0.18）：每会话最多补登记一次 */
+	private resetAuthChecked = false;
+	/** 服务器最近上报的 keyEpoch（E2EE 一致性防御用；-1 = 尚未获知） */
+	private serverKeyEpoch = -1;
+	/** 「服务器加密状态自相矛盾」的常驻通知句柄（恢复时撤下） */
+	private e2eeMismatchNotice: { hide(): void } | null = null;
 
 	constructor(private ctx: SyncContext) {}
 
@@ -99,6 +109,10 @@ export class SyncManager {
 			await this.running;
 			return;
 		}
+		// 新链：错误与统计都只反映本链（被 gate 拦下的链两者皆空——
+		// 调用方据此区分「失败」「被拦」「成功」三态）
+		this.lastError = null;
+		this.lastCounters = null;
 		const chain = this.runChain(reason);
 		this.running = chain;
 		try {
@@ -106,6 +120,16 @@ export class SyncManager {
 		} finally {
 			if (this.running === chain) this.running = null;
 		}
+	}
+
+	/** 最近一条同步链的失败原因（手动同步的结果提示用）；成功链为 null。 */
+	get lastSyncError(): Error | null {
+		return this.lastError instanceof Error ? this.lastError : null;
+	}
+
+	/** 最近一条同步链的累计统计；链没跑成任何一轮（如被 gate 拦下）时为 null。 */
+	get lastSyncCounters(): { pulled: number; pushed: number; conflicts: number } | null {
+		return this.lastCounters;
 	}
 
 	/**
@@ -188,6 +212,30 @@ export class SyncManager {
 
 			// E2EE：已启用但未解锁 → 暂停同步（本地编辑不受影响），解锁后再继续
 			await this.ctx.refreshE2ee();
+			// 服务器加密状态一致性防御（v0.18 实测发现的矛盾形态）：
+			// 密钥文档 enabled=true 而仓库 keyEpoch=0（plaintext）。可能是残留的
+			// 旧密钥文档，也可能是恶意服务器的降级/混淆尝试——两种都不能信。
+			// 照单全收会让本地进入「已加密但没有合法密钥世代」的死局：push 每轮
+			// 在加密处失败，用户只看到 Offline。必须显式停机并说清楚原因。
+			if (this.ctx.e2ee.enabled && this.serverKeyEpoch === 0) {
+				const msg =
+					"服务器的加密状态自相矛盾：端到端加密密钥文档已启用，但仓库声称未加密（keyEpoch=0）。\n" +
+					"已停止同步，以免写入无法解密的内容。请服务器管理员检查——" +
+					"通常是一份残留的旧密钥文档（服务器启动日志会有相应警告）。";
+				this.ctx.gate.markProtocolMismatch(msg);
+				if (!this.e2eeMismatchNotice) {
+					const handle = this.ctx.notify(msg, 0);
+					if (handle) this.e2eeMismatchNotice = handle;
+				}
+				this.ctx.log("sync blocked: e2ee state mismatch (doc enabled, keyEpoch=0)");
+				this.onStatus("offline", msg);
+				return;
+			}
+			// 矛盾解除（管理员清理了文档 / 正常启用推进了 keyEpoch）→ 撤下提示
+			if (this.e2eeMismatchNotice) {
+				this.e2eeMismatchNotice.hide();
+				this.e2eeMismatchNotice = null;
+			}
 			if (this.ctx.e2ee.needsUnlock) {
 				this.ctx.log("sync paused: E2EE locked");
 				this.onStatus("locked");
@@ -254,6 +302,12 @@ export class SyncManager {
 
 			this.retryIndex = 0;
 			this.lastError = null;
+			const prev = this.lastCounters ?? { pulled: 0, pushed: 0, conflicts: 0 };
+			this.lastCounters = {
+				pulled: prev.pulled + counters.pulled,
+				pushed: prev.pushed + counters.pushed,
+				conflicts: prev.conflicts + counters.conflicts,
+			};
 			this.ctx.log(
 				`sync ok (${reason}): pulled=${counters.pulled} pushed=${counters.pushed} ` +
 					`conflicts=${counters.conflicts} lastSequence=${this.ctx.store.state.lastSequence}`,
@@ -275,15 +329,22 @@ export class SyncManager {
 			} else if (e instanceof ApiError && e.status === 401) {
 				// 凭据被拒（验收 T5.2）：设备被撤销或 Token 失效。这不会自己好起来，
 				// 退避重试只是无意义地撞墙；置 gate 停掉手动命令、弹常驻通知
-				//（移动端没有状态栏，8 秒的提示等于没有提示），等用户重新接入。
-				// /info 重新成功（换发凭据/改 Token 后手动同步）时自动清除
-				const msg =
-					"设备凭据已失效或被撤销：服务器拒绝了本设备的访问。\n" +
-					"请重新接入本设备（配对，或在设置中重新填写 Token 后执行「立即同步」）";
+				//（移动端没有状态栏，8 秒的提示等于没有提示），等用户填新 Token。
+				// /info 重新成功（「测试连接」或填新 Token 后的下一轮）时自动清除。
+				// 文案刻意不提「配对」：配对导入会强制重跑接入向导做一次全量对账，
+				// 而这个场景（Token 重置/设备撤销）只需要填新 Token（v11 设计 §4.6）
+				const msg = e.is("TOKEN_REVOKED")
+					? "本设备的凭据已被撤销（服务器重置了 API Token 或撤销了本设备）。\n" +
+						"在设置中填入新的 API Token 后点「测试连接」即可恢复同步——" +
+						"本地笔记、历史与加密密钥都不受影响。"
+					: "设备凭据已失效：服务器拒绝了本设备的访问。\n" +
+						"请在设置中确认 API Token 是否正确（更换后点「测试连接」即可恢复），" +
+						"本地数据不受影响。";
 				this.ctx.gate.markCredentialRejected(msg);
 				if (!this.credentialWarned) {
 					this.credentialWarned = true;
-					this.ctx.notify(msg, 0);
+					const handle = this.ctx.notify(msg, 0);
+					if (handle) this.credentialNotice = handle;
 				}
 				this.onStatus("offline", msg);
 			} else {
@@ -311,6 +372,7 @@ export class SyncManager {
 			apiToken: cfg.apiToken,
 			deviceId: this.ctx.store.state.deviceId,
 			vaultKey: this.ctx.e2ee.doc,
+			vaultChoice: cfg.vaultChoice,
 		});
 		if (!this.ctx.store.isBoundTo(want)) {
 			const prev = this.ctx.store.binding;
@@ -326,9 +388,12 @@ export class SyncManager {
 		//（服务器从备份恢复、别的设备完成了迁移、密钥轮换）。用会话首轮的判断
 		// 继续 pull/push，等于拿着过期的世界观改数据。
 		const info = await this.ctx.client.info();
-		// /info 成功 = 服务器重新认识我们了：清除「凭据被拒」停机（T5.2 的恢复路径）
+		// /info 成功 = 服务器重新认识我们了：清除「凭据被拒」停机（T5.2 的恢复路径），
+		// 并把还挂在屏幕上的常驻通知一并撤下——恢复了却留着警告，等于没恢复
 		this.ctx.gate.markCredentialRejected(null);
 		this.credentialWarned = false;
+		this.credentialNotice?.hide();
+		this.credentialNotice = null;
 		const err = protocolError(info);
 		if (err) {
 			this.ctx.gate.markProtocolMismatch(err);
@@ -344,6 +409,21 @@ export class SyncManager {
 		this.protocolWarned = false;
 
 		if (!(await this.adoptRepoIdentity(info))) return false;
+		this.serverKeyEpoch = info.keyEpoch ?? 0;
+		// 账本归属补写（v0.18）：从旧版本升级上来的账本没有归属标记。
+		// 此刻 vaultId 已通过 adoptRepoIdentity 对账（一致），补上标记后
+		// 向导 preflight 的换库判定才有可信依据。
+		if (!this.ctx.store.state.ledgerVaultId && info.vaultId) {
+			this.ctx.store.state.ledgerVaultId = info.vaultId;
+		}
+
+		// 重置凭证自动补登记（v0.18 / v11 设计 §3.1）：E2EE 已解锁且服务器尚未
+		// 登记时，把 HKDF(VMK) 派生值送上去——「重置 Token 需要 E2EE 密码」这道
+		// 服务端关卡越早立起来，Token 泄露时攻击者可抢的窗口越小。异步不阻塞同步。
+		if (info.resetAuthConfigured === false && !this.resetAuthChecked) {
+			this.resetAuthChecked = true;
+			void this.registerResetAuthOnce();
+		}
 
 		// 设备级凭据（v9.2）：仍在用根 Token 时自动换发本设备专属凭据，
 		// 根 Token 从此不再存在于任何设备（丢失设备可单独撤销）
@@ -357,11 +437,24 @@ export class SyncManager {
 				apiToken: fresh.apiToken,
 				deviceId: this.ctx.store.state.deviceId,
 				vaultKey: this.ctx.e2ee.doc,
+				vaultChoice: fresh.vaultChoice,
 			}),
 		);
 		await this.ctx.store.save();
 		this.ctx.gate.markBound();
 		return true;
+	}
+
+	/** 补登记重置凭证：失败只记日志（下个会话再试），绝不打扰用户。 */
+	private async registerResetAuthOnce(): Promise<void> {
+		try {
+			const resetAuth = await this.ctx.e2ee.resetAuth();
+			if (!resetAuth) return; // 未启用或未解锁 E2EE：无凭证可登记
+			await this.ctx.client.registerResetAuth(resetAuth);
+			this.ctx.log("reset-auth registered");
+		} catch (e) {
+			this.ctx.log(`reset-auth register failed: ${e instanceof Error ? e.message : String(e)}`);
+		}
 	}
 
 	/**
@@ -373,10 +466,15 @@ export class SyncManager {
 		// → 立即停止自动同步，重置为待接入，等用户重新走向导确认
 		const saved = this.ctx.store.state.bootstrap.remoteVaultId;
 		if (saved && info.vaultId && info.vaultId !== saved) {
-			this.ctx.store.resetBootstrap();
+			// v0.18 实测缺陷修复：换仓库必须作废整本同步账本，不只是 bootstrap。
+			// 只重置 bootstrap 的话，files 里对旧仓库的「已同步」记录会让重新接入
+			// 后的扫描空转——本地文件永远不会被推到新仓库，而状态栏显示 synced
+			this.ctx.store.resetForNewRepository();
 			this.ctx.store.clearBinding();
 			await this.ctx.store.save();
-			const msg = "服务器上的同步仓库已更换（vaultId 变化），已暂停同步；请重新运行接入向导确认本设备的接入方式";
+			const msg =
+				"服务器上的同步仓库已更换（vaultId 变化），已暂停同步并作废旧仓库的同步记录；\n" +
+				"本地笔记不受影响。请重新运行接入向导（或点「测试连接」）确认本设备的接入方式";
 			this.ctx.notify(msg);
 			this.ctx.log(`sync blocked: vaultId changed ${saved} -> ${info.vaultId}`);
 			this.onStatus("offline", msg);

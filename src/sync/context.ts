@@ -64,7 +64,8 @@ export interface SyncContext {
 	onSigningKeyRegistered?: () => void;
 	log(msg: string): void;
 	/** durationMs=0 表示常驻通知（移动端没有状态栏，重要提示 8 秒会被错过）。 */
-	notify(msg: string, durationMs?: number): void;
+	/** 弹通知；返回句柄可用于在状态恢复时主动撤下常驻（duration 0）的那条。 */
+	notify(msg: string, durationMs?: number): { hide(): void } | void;
 	/** pending conflicts 集合变化后调用（刷新状态栏等） */
 	onConflictsChanged(): void;
 	/**
@@ -78,7 +79,7 @@ export interface SyncContext {
 	 * 当前生效的服务器地址与凭据（v0.12.1 / LS-121-C02）：
 	 * 用于计算绑定指纹——任一变化都必须重新走权威校验后才允许写入。
 	 */
-	credentials(): { serverUrl: string; apiToken: string };
+	credentials(): { serverUrl: string; apiToken: string; vaultChoice?: string };
 	/** 从服务器刷新 vault key 状态（每次同步开始时调用） */
 	refreshE2ee(): Promise<void>;
 	/** 更换 API 凭据（v9.2 根 Token → 设备凭据自动换发；写入 SecretStorage） */

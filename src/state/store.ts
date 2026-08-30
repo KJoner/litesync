@@ -189,11 +189,21 @@ export interface BindingFingerprint {
 	tokenDigest: string;
 	deviceId: string;
 	vaultKeyDigest: string;
+	/** 目标仓库选择（v0.19 多仓库；空 = 默认仓库）。切换仓库立即触发重新绑定 */
+	vaultChoice: string;
 }
 
 export interface PersistedState {
 	deviceId: string;
 	lastSequence: number;
+	/**
+	 * 账本归属（v0.18）：files/游标/信任锚这本账属于哪个仓库（vaultId）。
+	 * 只在接入完成（completeBootstrap）时写入、只随账本作废（clearSyncLedger）
+	 * 而清——与 bootstrap.remoteVaultId 不同，它**不会**被向导 preflight 的
+	 * pending binding 覆盖，因此是「这本账是谁的」的唯一可信来源。
+	 * 旧版本状态没有此字段（undefined = 归属未知）。
+	 */
+	ledgerVaultId?: string;
 	files: Record<string, FileState>;
 	conflicts: Record<string, PendingConflict>;
 	/** vault key 文档缓存（只含加密后的密钥材料，可安全落盘） */
@@ -241,6 +251,7 @@ function emptyState(): PersistedState {
 	return {
 		deviceId: "",
 		lastSequence: 0,
+		ledgerVaultId: undefined,
 		files: {},
 		conflicts: {},
 		e2ee: null,
@@ -694,6 +705,8 @@ export class StateStore {
 			snapshotSequence,
 			completedAt: Date.now(),
 		};
+		// 账本归属从此刻确立：接下来积累的 files/游标都属于这个仓库
+		if (remoteVaultId) this.state.ledgerVaultId = remoteVaultId;
 	}
 
 	// ---------- 灾备恢复（v0.13.1 / 计划书 §5.6） ----------
@@ -713,6 +726,42 @@ export class StateStore {
 	/** 重置为待接入（vaultId/repoEpoch 变化 / 用户重跑向导 / 导入新配置时）。 */
 	resetBootstrap(): void {
 		this.state.bootstrap = { ...PENDING_BOOTSTRAP };
+	}
+
+	/**
+	 * 换仓库（vaultId 变化）时作废整本同步账本（v0.18 实测缺陷，LS-121-C02）。
+	 *
+	 * repoEpoch 变化是「同一仓库的灾备恢复」——账本要保留去做恢复合并；
+	 * vaultId 变化是「对面根本是另一个仓库」（换库/换账户/服务器重装）——
+	 * files 里的 serverHash/revision、游标、队列、信任锚全都是**对旧仓库**的
+	 * 陈述，带进新仓库的后果不是错误而是静默：扫描会把「从未上传到这个仓库」
+	 * 的文件当成「已同步」，push 空转、状态栏假 synced、远端永远是空的。
+	 *
+	 * 只清账本，绝不动 Vault 里的用户文件；deviceId（本设备身份）保留。
+	 */
+	resetForNewRepository(): void {
+		this.clearSyncLedger();
+		this.state.shares = {};
+		this.state.pendingDeletes = {};
+		this.state.e2ee = null; // 旧仓库的密钥文档；下一轮 refreshE2ee 拉新仓库的
+		this.state.recovery = null;
+		this.resetBootstrap();
+	}
+
+	/**
+	 * 只作废同步账本（files/游标/队列/冲突/信任锚），不动 bootstrap 与密钥。
+	 * local-init 对空远端的自愈用（见 bootstrap-manager）：那里 bootstrap 流程
+	 * 正在进行，不能整个 reset。
+	 */
+	clearSyncLedger(): void {
+		this.state.ledgerVaultId = undefined;
+		this.state.files = {};
+		this.state.lastSequence = 0;
+		this.state.conflicts = {};
+		this.state.pendingOps = {};
+		this.state.blockedChanges = {};
+		this.state.trustAnchor = null;
+		this.state.checkpointChain = [];
 	}
 
 	// ---------- 待手动删除（移动端删除安全，v6） ----------
@@ -743,7 +792,8 @@ export class StateStore {
 			b.serverUrl === fp.serverUrl &&
 			b.tokenDigest === fp.tokenDigest &&
 			b.deviceId === fp.deviceId &&
-			b.vaultKeyDigest === fp.vaultKeyDigest
+			b.vaultKeyDigest === fp.vaultKeyDigest &&
+			b.vaultChoice === fp.vaultChoice
 		);
 	}
 
@@ -832,6 +882,7 @@ function normalizeState(raw: Partial<PersistedState>): PersistedState {
 	const state: PersistedState = {
 		deviceId: typeof raw.deviceId === "string" ? raw.deviceId : "",
 		lastSequence: typeof raw.lastSequence === "number" ? raw.lastSequence : 0,
+		ledgerVaultId: typeof raw.ledgerVaultId === "string" ? raw.ledgerVaultId : undefined,
 		files: raw.files && typeof raw.files === "object" ? raw.files : {},
 		conflicts: raw.conflicts && typeof raw.conflicts === "object" ? raw.conflicts : {},
 		e2ee: raw.e2ee && typeof raw.e2ee === "object" ? raw.e2ee : null,
@@ -879,6 +930,8 @@ export async function computeBinding(input: {
 	apiToken: string;
 	deviceId: string;
 	vaultKey: VaultKeyDoc | null;
+	/** 目标仓库选择（v0.19；空 = 默认仓库） */
+	vaultChoice?: string;
 }): Promise<BindingFingerprint> {
 	const digest = async (label: string, value: string): Promise<string> =>
 		value === "" ? "" : (await sha256Hex(encodeUtf8(`litesync/v1/binding/${label}:${value}`))).slice(0, 16);
@@ -888,6 +941,7 @@ export async function computeBinding(input: {
 		tokenDigest: await digest("token", input.apiToken),
 		deviceId: input.deviceId,
 		vaultKeyDigest: await digest("vault-key", keyMaterial),
+		vaultChoice: input.vaultChoice ?? "",
 	};
 }
 
@@ -921,7 +975,15 @@ function normalizeBinding(raw: unknown): BindingFingerprint | null {
 	) {
 		return null;
 	}
-	return { serverUrl: b.serverUrl, tokenDigest: b.tokenDigest, deviceId: b.deviceId, vaultKeyDigest: b.vaultKeyDigest };
+	// v0.19 新增字段缺失（旧状态）→ 视为未绑定，触发一次无损的重新校验
+	if (typeof b.vaultChoice !== "string") return null;
+	return {
+		serverUrl: b.serverUrl,
+		tokenDigest: b.tokenDigest,
+		deviceId: b.deviceId,
+		vaultKeyDigest: b.vaultKeyDigest,
+		vaultChoice: b.vaultChoice,
+	};
 }
 
 /**
