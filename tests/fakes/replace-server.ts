@@ -78,6 +78,8 @@ export class FakeServer {
 	vaultId = "a".repeat(32);
 	repoEpoch = "epoch-1";
 	metaState: "plain" | "encrypted" = "plain";
+	/** false = 模拟 0.20 之前的服务端：没有 GET /api/v1/trash（404） */
+	trashAvailable = true;
 	requests: Array<{ op: string; path: string }> = [];
 
 	private record(path: string, h: Head, action: RemoteChange["action"], operationId?: string): number {
@@ -109,7 +111,7 @@ export class FakeServer {
 
 	/** 写入次数（不含故障注入里「没到服务器」的那次）与写请求列表。 */
 	writeRequests(): Array<{ op: string; path: string }> {
-		return this.requests.filter((r) => r.op === "upload" || r.op === "remove" || r.op === "restore");
+		return this.requests.filter((r) => r.op === "upload" || r.op === "remove" || r.op === "restore" || r.op === "rename");
 	}
 
 	private findTombstone(path: string, canonical: string): Head | undefined {
@@ -399,7 +401,67 @@ export class FakeServer {
 				srv.maybeLose();
 				return { fileId, path: key, revision: h.revision, metaGeneration: h.metaGeneration, sequence };
 			},
+			/**
+			 * 改名 = 元数据更新（rename.go）：meta 态寻址名不变、必带元数据；CAS 以 metaGeneration 为前提，
+			 * **先 CAS 再查幂等键**（与真实服务端一致——提交后响应丢失的重放会 412）；revision 不变，元数据世代 +1。
+			 */
+			async rename(
+				fromPath: string,
+				toPath: string,
+				baseMetaGeneration: number,
+				meta?: { metaEnc: string; canonicalHash: string },
+				operationId?: string,
+			) {
+				srv.requests.push({ op: "rename", path: fromPath });
+				srv.beforeWrite();
+				const metaMode = srv.metaState === "encrypted";
+				if (metaMode) {
+					if (fromPath !== toPath) throw new ApiError(400, "rename: pseudonym must not change", "META_REQUIRED");
+					if (!meta?.metaEnc || !meta?.canonicalHash) throw new ApiError(400, "rename: metadata required", "META_REQUIRED");
+				} else if (meta?.metaEnc) {
+					throw new ApiError(409, "rename: metadata in plain state", "ENCRYPTION_STATE");
+				}
+				const cur = srv.heads.get(fromPath);
+				if (!cur || cur.deleted) throw new ApiError(404, "rename: not found", "NOT_FOUND");
+				if (cur.metaGeneration !== baseMetaGeneration) {
+					throw new ApiError(412, "rename: metadata generation mismatch", "STALE_META_GENERATION");
+				}
+				if (operationId) {
+					const prev = srv.changes.find((c) => c.fileId === cur.fileId && c.operationId === operationId);
+					if (prev) return { fileId: cur.fileId, toPath: prev.path, revision: prev.revision, metaGeneration: prev.metaGeneration ?? 0, sequence: prev.sequence };
+				}
+				const canonical = meta?.canonicalHash ? `h:${meta.canonicalHash}` : platformCollisionKey(toPath);
+				for (const [p, o] of srv.heads) {
+					if (o !== cur && !o.deleted && o.canonical === canonical) throw new ApiError(422, `rename: collision with ${p}`, "CANONICAL_COLLISION", false, p);
+				}
+				let key = fromPath;
+				if (!metaMode && toPath !== fromPath) {
+					const occupied = srv.heads.get(toPath);
+					if (occupied && !occupied.deleted) {
+						throw new ConflictError({ path: toPath, revision: occupied.revision, hash: occupied.hash, deleted: false, fileId: occupied.fileId });
+					}
+					srv.heads.delete(fromPath);
+					srv.heads.set(toPath, cur);
+					key = toPath;
+				}
+				cur.metaGeneration++;
+				if (meta?.metaEnc) cur.metaEnc = meta.metaEnc;
+				cur.canonical = canonical;
+				const sequence = srv.record(key, cur, "upsert", operationId);
+				srv.maybeLose();
+				return { fileId: cur.fileId, toPath: key, revision: cur.revision, metaGeneration: cur.metaGeneration, sequence };
+			},
+			async getFileMeta(path: string) {
+				srv.requests.push({ op: "meta", path });
+				const h = srv.heads.get(path);
+				if (!h || h.deleted) throw new NotFoundError(h?.deleted ?? false, h?.revision ?? 0);
+				return { path, fileId: h.fileId, revision: h.revision, metaEnc: h.metaEnc ?? "", metaGeneration: h.metaGeneration };
+			},
+			async version(): Promise<DownloadResult> {
+				throw new NotFoundError(); // 历史已裁剪：按同名新内容处理
+			},
 			async trash() {
+				if (!srv.trashAvailable) throw new ApiError(404, "trash: not found", "NOT_FOUND");
 				const out = [];
 				for (const [path, h] of srv.heads) {
 					if (!h.deleted) continue;

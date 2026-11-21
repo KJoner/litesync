@@ -348,6 +348,8 @@ export interface RestoreResponse {
 	revision: number;
 	sequence: number;
 	metaGeneration?: number;
+	/** meta 模式：这次请求里发出的 LSM1 信封（调用方据此记下元数据指纹） */
+	metaEnc?: string;
 }
 
 /**
@@ -391,7 +393,69 @@ export async function requestRestore(ctx: SyncContext, req: RestoreRequest): Pro
 		revision: out.revision,
 		sequence: out.sequence ?? 0,
 		metaGeneration: out.metaGeneration,
+		metaEnc: meta?.metaEnc,
 	};
+}
+
+/**
+ * 墓碑的世代事实（服务器回收站，0.20 服务端）：删除时的内容世代与元数据世代。
+ *
+ * 恢复请求的内容世代必须严格大于墓碑的值（服务器据此抗回退）；meta 模式下 LSM1 信封里的元数据世代
+ * 要写「墓碑的值 + 1」，与服务器恢复后的值一致，否则之后的改名 CAS 对不上（0.20.1）。这些值只用来
+ * **抬高**下限或对齐计数，不用来做任何放行判断。旧服务器没有回收站接口时返回 null。
+ */
+export async function tombstoneFacts(
+	ctx: SyncContext,
+	fileId: string,
+): Promise<{ contentGeneration: number; metaGeneration: number } | null> {
+	try {
+		const t = (await ctx.client.trash()).find((x) => x.fileId === fileId);
+		return t === undefined ? null : { contentGeneration: t.contentGeneration, metaGeneration: t.metaGeneration };
+	} catch (e) {
+		if (e instanceof E2eeLockedError) throw e;
+		ctx.log(`restore: trash lookup unavailable (${e instanceof Error ? e.message : String(e)})`);
+		return null;
+	}
+}
+
+/**
+ * 恢复之后对齐元数据世代（0.20.1，meta 模式）。
+ *
+ * 服务器恢复时把元数据世代设为「墓碑 + 1」，而 LSM1 信封里的世代来自客户端的估计（回收站 / 本地记录）。
+ * 旧服务器查不到墓碑世代时两者可能对不上：本设备之后改名拿信封世代做 CAS 会 412，其他设备按信封世代
+ * 记账也会一直对不上。对不上时补一次「改名到同一个伪名」的元数据更新：CAS 以服务器的值为前提、
+ * 用同一把钥匙重新加密真实路径，之后服务器与信封都是 serverMetaGeneration + 1。
+ *
+ * 这次更新提交后响应丢失，重放会 412（服务器先做 CAS 再查幂等键）：此时读回服务器上的元数据，
+ * 仍是这个路径、信封世代等于服务器世代 → 已经对齐，采纳。拿不到确定结果就抛出，由调用方当网络错误重试。
+ */
+export async function alignRestoredMeta(
+	ctx: SyncContext,
+	p: { path: string; fileId: string; pseudonym: string; serverMetaGeneration: number; operationId?: string },
+): Promise<{ metaGeneration: number; metaFingerprint: string; sequence: number }> {
+	const bind = e2eeBinding(ctx);
+	if (!bind) throw new EnvelopeBindingMissingError(p.path);
+	const keys = await ctx.e2ee.metaKeys();
+	const metaEnc = await encryptMeta(
+		keys,
+		{ vaultId: bind.vaultId, keyEpoch: bind.keyEpoch, fileId: p.fileId, metaGeneration: p.serverMetaGeneration + 1 },
+		{ path: p.path },
+	);
+	const canonicalHash = await canonicalPathHmac(keys, p.path);
+	try {
+		const out = await ctx.client.rename(p.pseudonym, p.pseudonym, p.serverMetaGeneration, { metaEnc, canonicalHash }, p.operationId);
+		ctx.log(`restore: aligned metaGeneration ${p.serverMetaGeneration} -> ${out.metaGeneration} (${p.pseudonym.slice(0, 8)}…)`);
+		return { metaGeneration: out.metaGeneration, metaFingerprint: await metaFingerprintOf(metaEnc), sequence: out.sequence };
+	} catch (e) {
+		if (e instanceof ApiError && e.status === 412) {
+			const meta = await ctx.client.getFileMeta(p.pseudonym);
+			const dec = await decryptMeta(keys, meta.metaEnc, bind.vaultId, p.fileId);
+			if (dec !== null && dec.meta.path === p.path && dec.metaGeneration === meta.metaGeneration) {
+				return { metaGeneration: dec.metaGeneration, metaFingerprint: await metaFingerprintOf(meta.metaEnc), sequence: 0 };
+			}
+		}
+		throw e;
+	}
 }
 
 export async function restoreObject(
@@ -403,28 +467,50 @@ export async function restoreObject(
 ): Promise<{ fileId: string; revision: number; sequence: number } | null> {
 	if (!server.fileId) return null;
 	const tracked = ctx.store.get(path);
-	const nextGen = Math.max(server.contentGeneration ?? 0, tracked?.generation ?? 0) + 1;
-	if (metaEncrypted(ctx) && !e2eeBinding(ctx)) return null;
+	const meta = metaEncrypted(ctx);
+	if (meta && !e2eeBinding(ctx)) return null;
+	// meta 模式（0.20.1）：信封里的元数据世代要写「墓碑 + 1」——先向回收站取墓碑的世代，
+	// 取不到再用本地记录（删除被拉到之前 tracked 还在时，它就是墓碑的值）
+	const facts = meta ? await tombstoneFacts(ctx, server.fileId) : null;
+	const nextGen = Math.max(server.contentGeneration ?? 0, tracked?.generation ?? 0, facts?.contentGeneration ?? 0) + 1;
+	const envelopeMetaGen = (facts?.metaGeneration ?? (tracked?.fileId === server.fileId ? tracked.metaGeneration : undefined) ?? 0) + 1;
 	const out = await requestRestore(ctx, {
 		path,
 		fileId: server.fileId,
 		expectedTombstoneRevision: server.revision,
 		contentGeneration: nextGen,
-		metaGeneration: 1,
+		metaGeneration: envelopeMetaGen,
 		operationId,
 	});
+	let metaGeneration = meta ? envelopeMetaGen : out.metaGeneration;
+	let metaFingerprint = meta && out.metaEnc ? await metaFingerprintOf(out.metaEnc) : undefined;
+	if (meta && out.metaGeneration !== undefined && out.metaGeneration !== envelopeMetaGen) {
+		// 估计落空（旧服务器没有回收站接口）：补一次元数据对齐，让信封、服务器与本地记账三者一致
+		const aligned = await alignRestoredMeta(ctx, {
+			path,
+			fileId: out.fileId,
+			pseudonym: out.path,
+			serverMetaGeneration: out.metaGeneration,
+			operationId: operationId ? `${operationId}-m` : undefined,
+		});
+		metaGeneration = aligned.metaGeneration;
+		metaFingerprint = aligned.metaFingerprint;
+	}
 	// generation 必须记账：restore 已把服务器上该对象的 contentGeneration 推到
 	// nextGen——紧接着的内容上传要在它**之上**（nextGen+1）。漏记的话上传会从
 	// tracked（空 → 0）推导出 generation 1 ≤ nextGen，被服务器按回退拒绝（409），
 	// 下一轮再把这个 409 当成真实冲突去合并，凭空造出一个冲突副本。
 	// metaGeneration 同理：恢复后服务器上是 tombstone 的值 + 1，
-	// 不记账的话恢复后的第一次改名会拿旧世代做 CAS 而 412
+	// 不记账的话恢复后的第一次改名会拿旧世代做 CAS 而 412。
+	// 0.20.1：meta 模式下记的是**与服务器、与信封都一致**的那个值（以前一律记 1，信封也写 1——
+	// 服务器却是「墓碑 + 1」，第一次改名必然 412、退化成先建后删，身份就此断掉）
 	ctx.store.update(path, {
 		fileId: out.fileId,
 		revision: out.revision,
 		generation: nextGen,
-		...(metaEncrypted(ctx) ? { metaGeneration: 1 } : { metaGeneration: out.metaGeneration }),
-		serverPseudonym: metaEncrypted(ctx) ? out.path : undefined,
+		metaGeneration,
+		...(metaFingerprint !== undefined ? { metaFingerprint } : {}),
+		serverPseudonym: meta ? out.path : undefined,
 	});
 	return { fileId: out.fileId, revision: out.revision, sequence: out.sequence };
 }

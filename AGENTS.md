@@ -157,6 +157,10 @@ src/
   执行许可只豁免自己的迁移锁与向导里的 bootstrap 阶段；delete / keep / update / create 各有本地前置条件；
   墓碑上重建是持久化的 restore→upload 子状态机（稳定幂等键）；计划按 vault 文件清单的**确切名字**对齐
   （大小写不敏感的文件系统上 stat 会命中大小写不同的文件）；执行顺序新建先于删除。
+- **显式恢复的元数据世代（0.20.1）**：服务器恢复后 `metaGeneration = 墓碑 + 1`。meta 模式下 `restoreObject`（普通 push、
+  接入合并）与完整替换作业都让 LSM1 信封写同一个值（先向 `GET /api/v1/trash` 取墓碑世代）；取不到时恢复后补一次
+  「改名到同一伪名」的 CAS 对齐（`alignRestoredMeta`；改名的幂等检查在 CAS 之后，重放 412 时读回核对）。
+  信封、服务器、本地记账三者不一致的后果是：之后改名 412 退化成先建后删（身份断掉），其他设备误判同世代分叉。
 - **多用户（v0.18 服务端）**：对插件透明——用户 Token 映射到自己的
   Vault，`/api/v1/info` 返回该 Vault 的 `vaultId`/epochs。插件不感知租户。
 
@@ -175,7 +179,7 @@ src/
 
 ## 7. 测试组织
 
-`tests/` 目录自动发现，当前 428 条（0.20.1 复审修复后；0.20.0 时 361）。分类：
+`tests/` 目录自动发现，当前 434 条（0.20.1 复审修复后；0.20.0 时 361）。分类：
 
 - `unit` / `merge` / `smart-merge` / `crypto` / `store` / `device-trust`：基础单元；
 - `crashpoint.test.ts`：**崩溃点注入**（`utils/failpoint.ts` 在关键步骤间强制中断）；
@@ -184,8 +188,9 @@ src/
 - `padding.test.ts` / `timing.test.ts`：隐私增强的成本与承诺；
 - `v6 / v121 / v131 / v132 / rc3-regressions`：按版本归档的回归；
 - `strict-unlock` / `pairing-v2` / `replace-remote` / `settings-layout`：0.20 公开化（严格解锁迁移、连接链接 v2、高级恢复作业、设置页结构）。
-- `key-session` / `inherited-trust` / `replace-remote-safety` / `review-reproductions`：0.20.1 复审修复（PL-01 密钥会话代次、
-  PL-06 继承锚核验、PL-02～05 完整替换的许可 / 前置条件 / 子状态机、审查 7 条反例改写为正确行为断言）。
+- `key-session` / `inherited-trust` / `replace-remote-safety` / `review-reproductions` / `restore-meta`：0.20.1 复审修复（PL-01 密钥会话代次、
+  PL-06 继承锚核验、PL-02～05 完整替换的许可 / 前置条件 / 子状态机、审查 7 条反例改写为正确行为断言、
+  路径加密下显式恢复后的元数据世代与之后的改名 CAS）。
   完整替换用的内存服务端在 `tests/fakes/replace-server.ts`（多个文件共用），按协议 v6 语义建模（墓碑挡住普通上传、
   operationId 幂等、LSE3 世代单调、**元数据加密态的建档 metadata 要求**、restore 幂等与按名移动）——
   改服务端语义时记得同步改它，否则测试会和真实服务器分叉。

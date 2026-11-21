@@ -34,7 +34,7 @@ import { E2eeLockedError } from "../crypto/keyring";
 import { SyncContext } from "../sync/context";
 import { GateReason } from "../sync/gate";
 import { resolveSnapshotPaths } from "../sync/pull";
-import { requestRestore } from "../sync/push";
+import { alignRestoredMeta, requestRestore, tombstoneFacts } from "../sync/push";
 import { newOperationId } from "../sync/queue";
 import { decodeSnapshot, downloadPlain, metaEncrypted, UploadOptions, UploadOutcome, uploadFromPlain } from "../sync/transfer";
 import { evalFailpoint, FP } from "../utils/failpoint";
@@ -793,26 +793,6 @@ function newRestoreStep(
 }
 
 /**
- * 墓碑的世代事实（服务器回收站，0.20 服务端）：删除时的内容世代与元数据世代。
- *
- * 恢复请求的内容世代必须严格大于墓碑的值（服务器据此抗回退）；meta 模式下 LSM1 信封里的元数据世代
- * 要写「墓碑的值 + 1」，与服务器恢复后的值一致，否则之后的改名 CAS 对不上。这些值只用来**抬高**下限，
- * 不用来做任何放行判断。旧服务器没有回收站接口时返回 null，调用方用自己记下的值。
- */
-async function tombstoneFacts(
-	ctx: SyncContext,
-	fileId: string,
-): Promise<{ contentGeneration: number; metaGeneration: number } | null> {
-	try {
-		const t = (await ctx.client.trash()).find((x) => x.fileId === fileId);
-		return t === undefined ? null : { contentGeneration: t.contentGeneration, metaGeneration: t.metaGeneration };
-	} catch (e) {
-		ctx.log(`replace: trash lookup unavailable (${e instanceof Error ? e.message : String(e)})`);
-		return null;
-	}
-}
-
-/**
  * restore→upload 子状态机的第一段（PL-05）：发出（或原样重发）显式恢复请求，并把服务器结果落盘。
  *
  * 意图在调用之前已经落盘（phase=requested）；请求用稳定的 operationId，服务器提交后响应丢失时，
@@ -850,6 +830,21 @@ async function performRestore(ctx: SyncContext, job: ReplaceJob, it: ReplaceItem
 		markStale(job, it, "服务器恢复的对象身份与请求不符，已停止");
 		return "stale";
 	}
+	// meta 模式：信封里的元数据世代与服务器恢复后的值对不上（旧服务器没有回收站接口时的估计落空）→
+	// 补一次元数据对齐（改名到同一伪名的 CAS，幂等键 = 恢复幂等键 + "-m"；重放 412 时读回核对）
+	let metaGeneration = step.metaGeneration;
+	if (metaEncrypted(ctx) && res.metaGeneration !== undefined && res.metaGeneration !== step.metaGeneration) {
+		requirePermit(ctx, job, permit);
+		const aligned = await alignRestoredMeta(ctx, {
+			path: it.path,
+			fileId: step.fileId,
+			pseudonym: res.path,
+			serverMetaGeneration: res.metaGeneration,
+			operationId: `${step.operationId}-m`,
+		});
+		metaGeneration = aligned.metaGeneration;
+		if (aligned.sequence > 0 && !job.ownSequences.includes(aligned.sequence)) job.ownSequences.push(aligned.sequence);
+	}
 	// 服务器没有给出这次恢复的 sequence（幂等记录已被裁剪）：先确认对象仍是恢复出来的那份内容，
 	// 否则它可能已被别人改过——不能在别人的写入之上盲目覆盖
 	if (!(res.sequence > 0) && step.priorHash) {
@@ -864,7 +859,8 @@ async function performRestore(ctx: SyncContext, job: ReplaceJob, it: ReplaceItem
 	step.phase = "restored";
 	step.revision = res.revision;
 	step.sequence = res.sequence;
-	step.serverMetaGeneration = res.metaGeneration;
+	step.metaGeneration = metaGeneration;
+	step.serverMetaGeneration = metaEncrypted(ctx) ? metaGeneration : res.metaGeneration;
 	if (res.sequence > 0 && !job.ownSequences.includes(res.sequence)) job.ownSequences.push(res.sequence);
 	await persistJob(ctx, job);
 	return "ok";

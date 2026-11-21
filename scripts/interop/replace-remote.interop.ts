@@ -58,6 +58,7 @@ import { enableE2eeOnEmptyRemote, encryptMetadata, upgradeEnvelopes } from "../.
 import { StateStore } from "../../src/state/store";
 import type { SyncContext } from "../../src/sync/context";
 import { SyncGate } from "../../src/sync/gate";
+import { pushPendingChanges } from "../../src/sync/push";
 import { PendingQueue } from "../../src/sync/queue";
 import { uploadFromPlain } from "../../src/sync/transfer";
 import type { InteropFault, InteropRequestLog } from "./obsidian-shim";
@@ -612,6 +613,9 @@ async function runTarget(t: Target): Promise<ModeReport> {
 		check(`[${t.mode}] B：被删的 keep.md 按原身份恢复`, afterV2.get("keep.md")?.fileId === S.get("keep.md")?.fileId);
 		check(`[${t.mode}] B：所有故障都确实触发过`, report.faults.every((f) => f.hits === 1), report.faults.filter((f) => f.hits !== 1).map((f) => f.label).join("、"));
 
+		// ---------- 普通同步路径：删除 → 本地重建同名触发恢复 → 改名（0.20.1 复审后续） ----------
+		await runPushRestoreRename(t, r2ref.dev, seeder, vmk, check, addFaults, settleFaults, report);
+
 		// ---------- 旧 trust 迁移的重包装：服务器已收下新 keyDoc 但响应丢失（复审 RB-1，只在内容加密目标上跑） ----------
 		if (t.mode === "content-e2ee") await runTrustRewrap(t, seeder, vmk, check, addFaults, settleFaults);
 
@@ -632,6 +636,104 @@ async function runTarget(t: Target): Promise<ModeReport> {
 		check(`[${t.mode}] 场景未抛出异常`, false, e instanceof Error ? e.message : String(e));
 	}
 	return report;
+}
+
+/**
+ * 普通同步路径（插件原样的 pushPendingChanges）：删除 → 本地重建同名触发显式恢复 → 改名（0.20.1 复审后续）。
+ *
+ * 以前路径加密仓库恢复后，LSM1 信封与本地记账的元数据世代都是 1，服务器却是「墓碑 + 1」——第一次改名
+ * CAS 412，退化成先建后删，身份就此断掉。这里在真实服务端上核对：恢复的是原对象；改名一次 CAS 成功
+ * （不 412、不退化、没有多余的上传或删除）；fileId 不变、revision 不因改名变化；路径加密下信封世代 =
+ * 服务器世代 = 本设备记账。路径加密再跑一遍「回收站接口不可用」（模拟旧服务端）：恢复后补一次元数据对齐。
+ */
+async function runPushRestoreRename(
+	t: Target,
+	dev: Device,
+	verifier: Device,
+	vmk: CryptoKey,
+	check: (n: string, ok: boolean, d?: string) => void,
+	addFaults: (phase: string, f: InteropFault[]) => void,
+	settleFaults: () => void,
+	report: ModeReport,
+): Promise<void> {
+	const g = interop();
+	const cases: Array<{ path: string; to: string; oldServer: boolean }> = [
+		{ path: "dir/remote-only.md", to: "dir/renamed-after-restore.md", oldServer: false },
+		...(t.mode === "path-e2ee" ? [{ path: "attach/blob.bin", to: "attach/blob-renamed.bin", oldServer: true }] : []),
+	];
+	for (const c of cases) {
+		const tag = `[${t.mode}] 普通同步${c.oldServer ? "（模拟旧服务端：回收站不可用）" : ""}`;
+		const orig = (await readRemote(t, verifier, vmk)).get(c.path);
+		if (!orig) throw new Error(`${tag}：远端没有 ${c.path}`);
+		// 1. 本地删除 → 推送删除
+		await dev.vault.remove(c.path);
+		await rescan(dev);
+		await dev.ctx.queue.add(c.path, "delete");
+		await pushPendingChanges(dev.ctx);
+		check(`${tag}：删除推送后远端留下墓碑`, (await trashIds(verifier)).has(orig.fileId));
+		// 2. 本地重建同名 → 推送触发显式恢复
+		const content = enc(`本地重建的 ${c.path}（${t.mode}）\n`);
+		await dev.vault.put(c.path, content);
+		await rescan(dev);
+		if (c.oldServer) {
+			addFaults("push-restore", [
+				{ label: "回收站接口不可用（模拟旧服务端）", kind: "fail-before", match: (r) => r.method === "GET" && r.url.includes("/api/v1/trash"), remaining: 1, hits: 0 },
+			]);
+		}
+		await dev.ctx.queue.add(c.path, "upsert");
+		const logBeforeRestore = g.log.length;
+		const pushed = await pushPendingChanges(dev.ctx);
+		settleFaults();
+		const restoreWindow = g.log.slice(logBeforeRestore);
+		const alignRenames = restoreWindow.filter((x) => x.method === "POST" && x.url.includes("/rename") && x.status === 200).length;
+		const mid = (await readRemote(t, verifier, vmk)).get(c.path);
+		check(`${tag}：重建触发显式恢复——恢复的是原对象，内容是本地重建的版本`, pushed.pushed === 1 && mid?.fileId === orig.fileId && mid.bytesHash === sha256(content), `fileId ${mid?.fileId === orig.fileId ? "不变" : "变了"}`);
+		const tracked = dev.store.get(c.path);
+		if (t.mode === "path-e2ee") {
+			check(
+				`${tag}：恢复后 LSM1 信封世代 = 服务器世代 = 本设备记账`,
+				mid?.metaGeneration !== undefined && mid.metaGeneration === mid.reportedMetaGeneration && tracked?.metaGeneration === mid.reportedMetaGeneration,
+				`信封 ${mid?.metaGeneration} / 服务器 ${mid?.reportedMetaGeneration} / 本地 ${tracked?.metaGeneration}`,
+			);
+		} else {
+			check(`${tag}：恢复后本设备记账的元数据世代 = 服务器世代`, tracked?.metaGeneration === mid?.reportedMetaGeneration, `服务器 ${mid?.reportedMetaGeneration} / 本地 ${tracked?.metaGeneration}`);
+		}
+		if (c.oldServer) {
+			check(
+				`${tag}：回收站故障确实触发，恢复后补了一次元数据对齐（改名到同一伪名）`,
+				report.faults.some((f) => f.phase === "push-restore" && f.hits === 1) && alignRenames === 1,
+				`对齐改名 ${alignRenames} 次`,
+			);
+		} else {
+			check(`${tag}：回收站给出墓碑世代时不需要额外的对齐改名`, alignRenames === 0, `对齐改名 ${alignRenames} 次`);
+		}
+		// 3. 本地改名 → 推送改名（元数据 CAS）
+		const logBefore = g.log.length;
+		await dev.vault.put(c.to, await dev.vault.adapter.readBinary(c.path));
+		await dev.vault.remove(c.path);
+		await rescan(dev);
+		await dev.ctx.queue.addMove(c.to, c.path);
+		const moved = await pushPendingChanges(dev.ctx);
+		const window = g.log.slice(logBefore);
+		const renamesOk = window.filter((x) => x.method === "POST" && x.url.includes("/rename") && x.status === 200).length;
+		const renames412 = window.filter((x) => x.method === "POST" && x.url.includes("/rename") && x.status === 412).length;
+		const writesOther = window.filter((x) => x.method === "PUT" || x.method === "DELETE").length;
+		check(`${tag}：改名一次 CAS 成功——没有 412、没有退化成先建后删`, moved.conflicts === 0 && renamesOk === 1 && renames412 === 0 && writesOther === 0, `rename 200×${renamesOk}、412×${renames412}、其他写入 ${writesOther}`);
+		const after = await readRemote(t, verifier, vmk);
+		const r2 = after.get(c.to);
+		check(`${tag}：改名后仍是同一个对象（fileId 不变）、revision 不因改名变化、旧名字不在了`, r2?.fileId === orig.fileId && r2.revision === mid?.revision && !after.has(c.path));
+		const trackedAfter = dev.store.get(c.to);
+		if (t.mode === "path-e2ee") {
+			check(
+				`${tag}：改名后元数据世代 +1，信封 = 服务器 = 本设备记账`,
+				r2?.metaGeneration === (mid?.reportedMetaGeneration ?? 0) + 1 && r2.metaGeneration === r2.reportedMetaGeneration && trackedAfter?.metaGeneration === r2.reportedMetaGeneration,
+				`信封 ${r2?.metaGeneration} / 服务器 ${r2?.reportedMetaGeneration} / 本地 ${trackedAfter?.metaGeneration}`,
+			);
+		} else {
+			check(`${tag}：改名后服务器元数据世代 +1、本设备记账一致`, r2?.reportedMetaGeneration === (mid?.reportedMetaGeneration ?? 0) + 1 && trackedAfter?.metaGeneration === r2.reportedMetaGeneration);
+		}
+		check(`${tag}：内容世代没有被改名改动`, r2?.generation === mid?.generation && r2.generation === r2.reportedGeneration);
+	}
 }
 
 /**
