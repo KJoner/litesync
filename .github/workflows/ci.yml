@@ -17,7 +17,8 @@ name: CI
 
 on:
   push:
-    branches: ["master"]
+    # 功能分支也跑（复审 R-E：CI 要覆盖当前交付的分支，不只 master）
+    branches: ["master", "feat/**"]
   pull_request:
   workflow_dispatch:
 
