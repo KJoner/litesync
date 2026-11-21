@@ -422,22 +422,36 @@ export class FakeServer {
 	}
 }
 
-/** 内存 Vault：用户文件 + 插件目录（恢复点写在这里）。 */
+/**
+ * 内存 Vault：用户文件 + 插件目录（恢复点写在这里）。
+ * caseInsensitive：模拟 Windows / macOS 的文件系统——stat / 读写不区分大小写，文件清单里是确切的名字。
+ */
 export class MemVault {
 	files = new Map<string, ArrayBuffer>();
 	dirs = new Set<string>();
+	constructor(private opts: { caseInsensitive?: boolean } = {}) {}
+	private key(p: string): string | undefined {
+		if (this.files.has(p)) return p;
+		if (!this.opts.caseInsensitive) return undefined;
+		const lower = p.toLowerCase();
+		return [...this.files.keys()].find((k) => k.toLowerCase() === lower);
+	}
 	adapter = {
-		stat: async (p: string) => (this.files.has(p) ? { type: "file", mtime: 1000, size: this.files.get(p)!.byteLength } : null),
+		stat: async (p: string) => {
+			const k = this.key(p);
+			return k !== undefined ? { type: "file", mtime: 1000, size: this.files.get(k)!.byteLength } : null;
+		},
 		readBinary: async (p: string) => {
-			const d = this.files.get(p);
+			const k = this.key(p);
+			const d = k !== undefined ? this.files.get(k) : undefined;
 			if (!d) throw new Error(`no such file ${p}`);
 			return d.slice(0);
 		},
-		writeBinary: async (p: string, d: ArrayBuffer) => void this.files.set(p, d.slice(0)),
-		write: async (p: string, d: string) => void this.files.set(p, enc(d)),
-		exists: async (p: string) => this.files.has(p) || this.dirs.has(p),
+		writeBinary: async (p: string, d: ArrayBuffer) => void this.files.set(this.key(p) ?? p, d.slice(0)),
+		write: async (p: string, d: string) => void this.files.set(this.key(p) ?? p, enc(d)),
+		exists: async (p: string) => this.key(p) !== undefined || this.dirs.has(p),
 		mkdir: async (p: string) => void this.dirs.add(p),
-		read: async (p: string) => dec(this.files.get(p)!),
+		read: async (p: string) => dec(this.files.get(this.key(p) ?? p)!),
 	};
 	put(path: string, content: string): void {
 		this.files.set(path, enc(content));

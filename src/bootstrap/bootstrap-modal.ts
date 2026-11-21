@@ -298,6 +298,12 @@ export class BootstrapWizardModal extends Modal {
 			holdSync: () => {},
 			releaseSync: () => {},
 			onCompleted: async (job) => {
+				// 只有正向替换完成才算「以本地完整替换的方式接入」；向导里做完回滚，远端回到了原样、
+				// 本地并没有跟上——此时不完成接入，关掉向导让用户重新选择接入方式
+				if (job.kind !== "local-replace-remote") {
+					this.close();
+					return;
+				}
 				const info = await this.ctx.client.info();
 				completeBootstrap(
 					this.ctx,

@@ -354,6 +354,46 @@ for (const mode of ["plain", "path-e2ee"] as const) {
 	});
 }
 
+test("大小写不敏感的文件系统（Windows / macOS）：本地 case.md 对远端 Case.md——计划按确切名字对齐，仍是「删 + 在新名字上恢复同一对象」", async () => {
+	const server = new FakeServer();
+	const orig = await server.seedAsync("Case.md", "original");
+	const vault = new MemVault({ caseInsensitive: true });
+	vault.put("case.md", "renamed locally");
+	assert.ok(await vault.adapter.stat("Case.md"), "前提：stat 找得到大小写不同的本地文件");
+	const ctx = await makeCtx(server, vault);
+	const job = await planReplaceRemote(ctx, { vaultName: "v", vaultChoice: "", bootstrapContext: false });
+	assert.deepEqual(job.items.map((i) => `${i.action}:${i.path}`), ["delete:Case.md", "create:case.md"], "不会误判成覆盖 Case.md 再多建一个 case.md");
+	confirmReplaceJob(job, "v", 1);
+	await saveRecoveryPoint(ctx, job);
+	const r = await runReplaceJob(ctx, job);
+	assert.equal(r.state, "completed", r.reason);
+	assert.equal(server.heads.get("case.md")?.fileId, orig.fileId);
+	assert.equal(dec(server.heads.get("case.md")!.data), "renamed locally");
+});
+
+test("接入向导里的正向作业完成接入之后，回滚是普通（已接入）作业——不会被「接入状态已变」挡死", async () => {
+	const server = new FakeServer();
+	await server.seedAsync("a.md", "remote");
+	const vault = new MemVault();
+	vault.put("a.md", "local");
+	const ctx = await makeCtx(server, vault, new Keyring(), { bootstrap: "pending" });
+	const job = await planReplaceRemote(ctx, { vaultName: "v", vaultChoice: "", bootstrapContext: true });
+	confirmReplaceJob(job, "v", 1);
+	await saveRecoveryPoint(ctx, job);
+	assert.equal((await runReplaceJob(ctx, job)).state, "completed");
+	ctx.store.state.bootstrap.status = "ready"; // 向导以 local-replace 完成了接入
+	ctx.gate.markBound();
+	const inherited = buildReverseJob(job, 2);
+	assert.equal(inherited.bootstrapContext, true, "不传参数时沿用原作业（向导里放弃后回滚的情形）");
+	const rev = buildReverseJob(job, 2, { bootstrapContext: !ctx.store.bootstrapReady });
+	assert.equal(rev.bootstrapContext, false);
+	await refreshReverseWatermark(ctx, rev);
+	confirmReplaceJob(rev, "v", 3);
+	await saveRecoveryPoint(ctx, rev);
+	assert.equal((await runReplaceJob(ctx, rev)).state, "completed");
+	assert.equal(dec(server.heads.get("a.md")!.data), "remote");
+});
+
 // ---------- 全组合（路径加密 / 内容加密） ----------
 
 for (const mode of ["path-e2ee", "content-e2ee"] as const) {

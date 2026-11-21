@@ -128,7 +128,7 @@ export class ReplaceRemoteModal extends Modal {
 
 	private async prepareReverse(job: ReplaceJob, status: HTMLElement): Promise<void> {
 		try {
-			const rev = buildReverseJob(job, Date.now());
+			const rev = buildReverseJob(job, Date.now(), { bootstrapContext: !this.ctx.store.bootstrapReady });
 			await refreshReverseWatermark(this.ctx, rev);
 			this.renderPreview(rev);
 		} catch (e) {

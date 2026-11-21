@@ -287,6 +287,9 @@ export async function planReplaceRemote(
 	for (const file of ctx.app.vault.getFiles()) {
 		if (!ctx.ignores(file.path)) localPaths.push(file.path);
 	}
+	// 按**确切的名字**对齐（vault 文件清单），不用 adapter.stat：Windows / macOS 的文件系统不区分大小写，
+	// stat("Case.md") 会找到本地的 case.md，把「仅大小写不同的改名」误判成覆盖，再把 case.md 当新建多算一次
+	const localSet = new Set(localPaths);
 	const total = inScope.length + localPaths.filter((p) => !remoteSet.has(p)).length;
 	let done = 0;
 	const items: ReplaceItem[] = [];
@@ -304,8 +307,7 @@ export async function planReplaceRemote(
 			source: "local" as const,
 			status: "pending" as const,
 		};
-		const stat = await adapter.stat(f.path);
-		if (!stat || stat.type !== "file") {
+		if (!localSet.has(f.path)) {
 			// 远端独有 → 删除。快照报告的世代只作反向重建时的下限参考（认证过的世代在保存恢复点时取得）
 			items.push({ ...base, action: "delete", remoteGeneration: f.contentGeneration, remoteMetaGeneration: f.metaGeneration });
 			continue;
@@ -553,10 +555,12 @@ async function backupLocal(ctx: SyncContext, job: ReplaceJob, it: ReplaceItem): 
 async function localPrecondition(ctx: SyncContext, it: ReplaceItem): Promise<string | null> {
 	if (it.source !== "local") return null;
 	const adapter = ctx.app.vault.adapter;
-	const stat = await adapter.stat(it.path);
 	if (it.action === "delete") {
-		return stat ? "预览时本地没有这个文件，现在本地出现了它（新建、恢复或改名而来）" : null;
+		// 确切名字（同计划）：大小写不敏感的文件系统上，仅大小写不同的本地文件属于对应的新建条目，不算「出现了」
+		const present = ctx.app.vault.getFiles().some((f) => f.path === it.path);
+		return present ? "预览时本地没有这个文件，现在本地出现了它（新建、恢复或改名而来）" : null;
 	}
+	const stat = await adapter.stat(it.path);
 	if (!stat || stat.type !== "file") return "本地文件在预览之后被删除了（或被改名）";
 	if (it.localHash === undefined) return null;
 	const hash = await sha256Hex(await adapter.readBinary(it.path));
@@ -1045,7 +1049,7 @@ async function runUpsert(ctx: SyncContext, job: ReplaceJob, it: ReplaceItem, per
  * 反向作业只改远端；本设备由随后的普通同步跟随恢复后的远端（经 pull 的标准保护），
  * 被替换掉的本地副本事先备份进恢复目录。
  */
-export function buildReverseJob(job: ReplaceJob, now: number): ReplaceJob {
+export function buildReverseJob(job: ReplaceJob, now: number, opts: { bootstrapContext?: boolean } = {}): ReplaceJob {
 	if (job.kind !== "local-replace-remote") throw new ReplaceJobError("只能为原作业生成反向作业", "invalid-state");
 	const items: ReplaceItem[] = [];
 	// 仅大小写不同的改名：原作业删掉 Note.md，又在 note.md 上恢复了**同一个对象**。回滚时这两条要串起来
@@ -1120,6 +1124,9 @@ export function buildReverseJob(job: ReplaceJob, now: number): ReplaceJob {
 		parentJobId: job.jobId,
 		createdAt: now,
 		state: "planned",
+		// 接入向导里的正向作业完成后本设备已经接入：回滚是普通（已接入）作业，不能继承向导上下文——
+		// 否则执行许可会因「接入状态已变」把它挡死。调用方按当前接入状态传入
+		bootstrapContext: opts.bootstrapContext ?? job.bootstrapContext,
 		items,
 		counts: countItems(items, job.counts.outOfScope),
 		snapshotBytes: 0,
