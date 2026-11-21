@@ -23,6 +23,41 @@ on:
   workflow_dispatch:
 
 jobs:
+  # 真机测试包（Local Linker）：iPhone 上 Obsidian 的「文件」App 看不到 .obsidian，
+  # 改用社区插件 Local Linker 直接安装本分支最近一次成功构建的 Actions 产物。
+  # 产物名固定为 plugin，内容就是插件的三个发布文件（Local Linker 文档要求的格式）。
+  # 与测试矩阵分开、并行跑，几十秒就能拿到包；整次 CI 成功后 Local Linker 才会把它当作可安装的构建。
+  plugin-build:
+    name: plugin build (Local Linker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build
+
+      # 包里必须是 manifest 声明的这个插件，且三件齐全；空文件或 id 不对时宁可失败，不发一个装不上的包
+      - name: Check plugin files
+        shell: bash
+        run: |
+          test -s main.js && test -s manifest.json && test -s styles.css
+          node -e "const m=require('./manifest.json'); if (m.id !== 'litesync') { console.error('unexpected id', m.id); process.exit(1) } console.log('litesync', m.version, process.env.GITHUB_SHA)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin
+          path: |
+            main.js
+            manifest.json
+            styles.css
+          if-no-files-found: error
+
   test:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
