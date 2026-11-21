@@ -33,6 +33,9 @@ npm run check:adr    # 每个 ADR 都被它约束的代码引用
 npm run check:inv    # 每条 INV 都有测试认领
 npm run dev          # watch 模式
 scripts\dev-deploy.ps1   # 构建并部署到本机测试 Vault（PowerShell）
+
+# 插件原样代码 × 真实 Go 服务端联调（不进默认 npm test；用法与环境变量写在 run.mjs 开头）
+LITESYNC_INTEROP_SERVER_BIN=<obsync 二进制> node scripts/interop/run.mjs   # 结果 JSON 见 LITESYNC_INTEROP_OUT
 ```
 
 > `npm test` 曾经是一串**手写的文件名**，新增测试文件不会报错，它只是不运行。
@@ -49,8 +52,10 @@ src/
 ├── api/client.ts        HTTP 客户端、协议常量、错误码 → 类型化异常
 ├── sync/                同步引擎（见下）
 ├── state/store.ts       StateStore：state.json、FileState 缓存、绑定指纹、信任锚
-├── bootstrap/           首次接入：向导、接入模式、空仓对话框；replace-remote*：本地完整替换远端（ADR-016）
-├── crypto/              E2EE：信封、密钥环、设备信任、元数据迁移、填充、签名；trust-migration*：严格解锁与旧信任迁移（ADR-013）
+├── bootstrap/           首次接入：向导、接入模式、空仓对话框；replace-remote*：本地完整替换远端（ADR-016；
+│                        执行许可、本地前置条件、restore→upload 子状态机，0.20.1）
+├── crypto/              E2EE：信封、密钥环（会话 / 连接上下文代次）、设备信任、元数据迁移、填充、签名；
+│                        trust-migration*：严格解锁与旧信任迁移（ADR-013）；unlock-flow：解锁流程（每段异步后核对会话）
 ├── merge/               三方合并引擎（diff3 + Markdown 分词 + 智能合并）
 ├── conflict-ui/         冲突解决器界面
 ├── history/             版本历史界面
@@ -65,14 +70,14 @@ src/
 | 文件 | 职责 | 红线 |
 |---|---|---|
 | `sync-manager.ts` | 调度：一轮 = 拉取 → 扫描 → 推送 → 对齐游标；退避 5/15/30/60/120/300s | 一次调用最多续 8 轮，防自激死循环 |
-| `gate.ts` | **唯一**的许可来源：任何读写远端或覆盖本地的入口都要先过 `syncGateBlock` | 手动命令与自动同步共用同一套判断，规则不许漂移 |
+| `gate.ts` | **唯一**的许可来源：任何读写远端或覆盖本地的入口都要先过 `syncGateBlock` | 手动命令与自动同步共用同一套判断，规则不许漂移；迁移锁有所有者，只有持有者（完整替换作业 `replace-remote-job`）的许可能豁免它 |
 | `pull.ts` | 拉取远端变更、按 fileId 对账（含改名识别）、快照全量对账 | 明文与 meta 模式都必须按 fileId 认改名 |
 | `push.ts` | 扫描本地变化、推送队列 | 改名操作**不得被后续编辑覆盖**（0.17.0-rc.4 的实测事故） |
 | `queue.ts` | 待推送操作队列 + 持久化操作日志 | **先落盘再视为已接受**；重试保持同一 operationId / fileId / base |
 | `local-commit.ts` | **唯一**允许覆盖 Vault 已有文件的地方（11 步流程） | 前置条件不符 → keep-both / conflict，**绝不覆盖**（INV-03） |
 | `transfer.ts` | 上传/下载 + 信封封装解封 | 「基于刚下载的远端内容上传」必须以**认证后的远端世代**为下限 |
 | `freshness.ts` | 签名 checkpoint 的信任锚与分叉检测 | 锚只前进、链必须相连、同一 sequence 只能有一份 |
-| `checkpoint-sync.ts` | 签名密钥注册、checkpoint 发布与验证 | 签名由**设备**做，服务器永不参与 |
+| `checkpoint-sync.ts` | 签名密钥注册、checkpoint 发布与验证；配对继承锚的首次接入核验（`verifyInheritedTrust`） | 签名由**设备**做，服务器永不参与；服务器 head 低于已确认锚即判回退（空 checkpoint 列表不算通过） |
 | `conflict.ts` / `auto-merge.ts` | 冲突落地与自动合并 | 任何异常都回退 keep-both，不丢内容 |
 | `context.ts` | 各模块共享的依赖包（client / store / crypto / 日志） | — |
 
@@ -133,12 +138,25 @@ src/
 - **严格会话解锁（0.20 / ADR-013）**：新安装 `trustDevice=false`；「本设备自动解锁」只在高级区显式开启。
   旧设备的信任材料由 `crypto/trust-migration.ts` 状态机处理——**先证明能用密码恢复同一把 VMK，再清理**；
   `persistTrust` 只在显式开启时执行，迁移未完成时开关与「忘记此设备」一律转交迁移向导。
+  重包装上传前先落盘 `pendingRewrapKeyId`：服务器已收新 keyDoc 但响应丢失 / SecretStorage 写失败后，重来能认出自己的文档。
+- **密钥会话代次（0.20.1 / 复审 PL-01）**：`Keyring.generation`（锁定、换文档、采纳、换连接、卸载递增）与
+  `contextGeneration`（换服务器 / 凭据 / 仓库 / 导入连接递增）。解锁、派生元数据密钥、重置凭证、取回密钥文档、
+  显式持久化在**安装前**核对代次，变了就作废（stale），绝不装上旧会话的钥匙；多次解锁按发起顺序安装。
+  切库、导入连接、改 Server URL、服务器 vaultId 变化 → `switchContext({lock:true})` 立即锁定；Token 变化只作废进行中
+  的任务、保留钥匙（v0.18 恢复路径）。解锁窗口关闭即取消这次解锁。
 - **连接链接 v2（0.20 / ADR-014）**：新设备无凭据，靠 `GET /api/v2/pairings/{id}/envelope` 的状态码探测服务端能力
   （401/403/405 = 旧服务端）；兑换前把 `{exchangeId, enrollmentSecret,…}` 存 SecretStorage（`litesync-pending-redeem`），
-  断网可续传。配对包信任锚先暂存在 `state.pendingPairingTrust`，**接入完成时**（vaultIdentity + repoEpoch 吻合）才采纳。
+  断网可续传。配对包信任锚先暂存在 `state.pendingPairingTrust`。0.20.1（复审 PL-06）：接入向导 preflight 在**任何本地
+  落地或远端写入之前**核验它（身份、repoEpoch、可信水位、锚检查点仍在且之后的链是合法延伸），不通过 → 停止，
+  给「重新配对 / 明确确认后改为首次信任」两条路，**绝不静默降级**；执行器与 completeBootstrap 都断言核验结果。
 - **本地完整替换远端（0.20 / ADR-016）**：`bootstrap/replace-remote.ts`，作业存 `state.replaceJob`；
   恢复点写插件目录 `replace-recovery/<jobId>/`（不与 LocalCommitter 按周清理的 `recovery/` 混用）（唯一允许的直接写盘处，带路径校验）；
-  未完成的作业在启动时冻结普通同步（gate.beginMigration）直到用户续跑或放弃。
+  未完成的作业在启动时冻结普通同步（gate.beginMigration，所有者 `replace-remote-job`）直到用户续跑或放弃。
+  0.20.1（复审 PL-02～05）：**执行入口默认关闭**（设置 `replaceRemoteEnabled`，验收阶段；只读预览、诊断 / 放弃 / 回滚不受限）；
+  「预留 fileId」≠「远端已建档」（`uploadFromPlain` 的 `identity`），路径加密建档总带 LSM1 + canonical HMAC；
+  执行许可只豁免自己的迁移锁与向导里的 bootstrap 阶段；delete / keep / update / create 各有本地前置条件；
+  墓碑上重建是持久化的 restore→upload 子状态机（稳定幂等键）；计划按 vault 文件清单的**确切名字**对齐
+  （大小写不敏感的文件系统上 stat 会命中大小写不同的文件）；执行顺序新建先于删除。
 - **多用户（v0.18 服务端）**：对插件透明——用户 Token 映射到自己的
   Vault，`/api/v1/info` 返回该 Vault 的 `vaultId`/epochs。插件不感知租户。
 
@@ -157,7 +175,7 @@ src/
 
 ## 7. 测试组织
 
-`tests/` 目录自动发现，当前 356 条（0.20.0）。分类：
+`tests/` 目录自动发现，当前 428 条（0.20.1 复审修复后；0.20.0 时 361）。分类：
 
 - `unit` / `merge` / `smart-merge` / `crypto` / `store` / `device-trust`：基础单元；
 - `crashpoint.test.ts`：**崩溃点注入**（`utils/failpoint.ts` 在关键步骤间强制中断）；
@@ -166,8 +184,13 @@ src/
 - `padding.test.ts` / `timing.test.ts`：隐私增强的成本与承诺；
 - `v6 / v121 / v131 / v132 / rc3-regressions`：按版本归档的回归；
 - `strict-unlock` / `pairing-v2` / `replace-remote` / `settings-layout`：0.20 公开化（严格解锁迁移、连接链接 v2、高级恢复作业、设置页结构）。
-  `replace-remote.test.ts` 里的内存服务端按协议 v6 语义建模（墓碑挡住普通上传、operationId 幂等、LSE3 世代单调）——
+- `key-session` / `inherited-trust` / `replace-remote-safety` / `review-reproductions`：0.20.1 复审修复（PL-01 密钥会话代次、
+  PL-06 继承锚核验、PL-02～05 完整替换的许可 / 前置条件 / 子状态机、审查 7 条反例改写为正确行为断言）。
+  完整替换用的内存服务端在 `tests/fakes/replace-server.ts`（多个文件共用），按协议 v6 语义建模（墓碑挡住普通上传、
+  operationId 幂等、LSE3 世代单调、**元数据加密态的建档 metadata 要求**、restore 幂等与按名移动）——
   改服务端语义时记得同步改它，否则测试会和真实服务器分叉。
+- 真实服务端联调在 `scripts/interop/`（不进默认 npm test）：插件原样代码对固定版本的 Go 服务端跑内容加密 /
+  路径加密两种仓库的完整替换、故障注入、重启续跑、反向恢复，逐对象解密核对，输出机器可读 JSON。
 
 **新修一个 bug 就补一条回归测试，并标注它覆盖的 INV 编号。**
 
