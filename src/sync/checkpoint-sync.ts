@@ -19,9 +19,10 @@ import {
 	importSigningPrivateKey,
 	objectsRoot,
 	signCheckpoint,
+	verifyCheckpoint,
 } from "../crypto/checkpoint";
 import { SyncContext } from "./context";
-import { advanceAnchor, verifyFreshness } from "./freshness";
+import { advanceAnchor, FreshnessFailure, TrustAnchor, verifyFreshness } from "./freshness";
 
 /**
  * 从本地状态算出对象摘要集合。
@@ -56,9 +57,21 @@ export function localCheckpointObjects(ctx: SyncContext): CheckpointObject[] {
  * 锚点可比，强行拿服务器给的第一个 manifest 当基准，等于让服务器自己定义
  * 「正确的历史」（§9.3）。信任必须由配对流程建立。
  */
-export async function verifyCheckpointChain(ctx: SyncContext): Promise<boolean> {
+export async function verifyCheckpointChain(ctx: SyncContext, serverHead?: number): Promise<boolean> {
 	const anchor = ctx.store.state.trustAnchor;
 	if (anchor === null) return true; // 未建立信任链：freshness 检查此时无从谈起
+
+	// 0.20.1（复审 PL-06）：服务器当前的水位比本设备确认过的检查点还低——这本身就是回退证据，
+	// 不需要服务器交出任何 checkpoint。以前空列表直接放行，回退到旧备份的服务器因此「验证通过」
+	if (serverHead !== undefined && serverHead < anchor.headSequence) {
+		const msg =
+			`服务器当前的仓库水位（${serverHead}）低于本设备已确认的检查点（${anchor.headSequence}）：` +
+			"服务器可能被回退到了旧状态，已停止自动同步";
+		ctx.gate.markIntegrityError(msg);
+		ctx.notify(msg);
+		ctx.log(`checkpoint: rejected (head ${serverHead} < anchor ${anchor.headSequence})`);
+		return false;
+	}
 
 	let bundle;
 	try {
@@ -222,6 +235,157 @@ export async function ensureSigningKeyRegistered(ctx: SyncContext, publicKeyB64:
 	ctx.log("checkpoint: 已建立创世信任锚（本设备是该仓库的第一台设备）");
 }
 
+// ---------- 配对继承的可信锚：首次接入之前核验（0.20.1 / 复审 PL-06） ----------
+
+export type InheritedTrustFailure =
+	| "vault-mismatch"
+	| "epoch-mismatch"
+	| "rollback"
+	| "anchor-missing"
+	| "unsupported-server"
+	| FreshnessFailure;
+
+export type InheritedTrustVerdict =
+	/** 没有继承锚（首次信任 / 新仓库）：界面如实说明，不宣称已验证 */
+	| { kind: "none" }
+	/** 通过：接入完成时采纳 anchor + chain（已沿服务器给出的合法延伸前进到 verifiedHead） */
+	| { kind: "verified"; anchor: TrustAnchor; chain: string[]; verifiedHead: number; extended: number; receivedAt: number }
+	/** 被拒：任何本地落地或远端写入都不得发生；界面给出重新配对 / 显式改为首次信任两个选项 */
+	| { kind: "rejected"; reason: InheritedTrustFailure; message: string };
+
+function rejected(reason: InheritedTrustFailure, message: string): InheritedTrustVerdict {
+	return { kind: "rejected", reason, message };
+}
+
+/**
+ * 核验配对包继承的可信锚（PL-06）：在任何本地落地或远端写入**之前**调用（接入向导 preflight）。
+ *
+ * 配对包宣称「继承发行设备已验证的检查点（headSequence = H）」，就必须真的拿它当判据：
+ *   1. 仓库身份：配对包核对过的 vaultIdentity 必须就是服务器现在这个仓库；
+ *   2. repoEpoch：锚属于哪个世代——服务器灾备恢复过（epoch 变了），这个锚就描述不了眼前的仓库；
+ *   3. 可信水位：服务器的快照与当前 head 都不得低于 H（低了 = 回退到了更旧的状态）；
+ *   4. 可验证的后续历史：服务器必须还持有那份锚检查点（签名、身份、位置都对得上），之后给出的每一份
+ *      checkpoint 都必须是它的合法延伸（签名有效、设备未撤销、链相连、没有同位置分叉、不回退）；
+ *      服务器自己声称的 head 也不得低于它交出的最新已签名检查点。
+ * 任何一条不成立都**停止**——不静默降为首次信任。能解密的旧密文不代表最新可信状态：
+ * GCM 只证明「这是用这把钥匙加密过的某个版本」，证明不了「这是最新的那个版本」。
+ */
+export async function verifyInheritedTrust(
+	ctx: SyncContext,
+	server: { vaultId?: string; repoEpoch?: string; headSequence: number },
+): Promise<InheritedTrustVerdict> {
+	const pending = ctx.store.state.pendingPairingTrust;
+	if (!pending) return { kind: "none" };
+	const a = pending.anchor;
+	if (!server.vaultId || pending.vaultIdentity !== server.vaultId) {
+		return rejected(
+			"vault-mismatch",
+			"连接链接核对的是另一个仓库，而服务器现在指向的仓库与它不同（仓库被删除重建，或服务器被替换）。继承的检查点无法用于这个仓库。",
+		);
+	}
+	if (!server.repoEpoch || a.repoEpoch !== server.repoEpoch) {
+		return rejected(
+			"epoch-mismatch",
+			"发出连接链接之后，服务器的仓库世代（repoEpoch）变了——通常是从备份做了灾备恢复。继承的检查点描述的是恢复之前的历史，无法证明眼前的状态。",
+		);
+	}
+	if (server.headSequence < a.headSequence) {
+		return rejected(
+			"rollback",
+			`服务器现在给出的仓库状态（位置 ${server.headSequence}）比发行设备已经确认过的检查点（位置 ${a.headSequence}）更旧：` +
+				"服务器可能被回退到了旧备份。已停止，本设备一个文件都没有写。",
+		);
+	}
+
+	let bundle;
+	try {
+		// since 是开区间：要拿回锚检查点本身，从它前一位开始取
+		bundle = await ctx.client.checkpoints(a.checkpointHash ? Math.max(0, a.headSequence - 1) : 0);
+	} catch (e) {
+		if (e instanceof ApiError && (e.status === 404 || e.status === 405)) {
+			return rejected(
+				"unsupported-server",
+				"连接链接宣称继承了已验证的检查点，但这台服务器不提供签名检查点（版本过旧或被替换），无法核验。",
+			);
+		}
+		throw e; // 网络错误：可以重试，不是判决
+	}
+	if (bundle.repoEpoch && bundle.repoEpoch !== server.repoEpoch) {
+		return rejected("epoch-mismatch", "服务器交出的检查点属于另一个仓库世代，无法核验。");
+	}
+	if (bundle.conflicting.length > 1) {
+		return rejected(
+			"fork",
+			`服务器上同一个位置存在 ${bundle.conflicting.length} 份互不相同的已签名状态：它可能对不同设备展示了不同的历史。`,
+		);
+	}
+
+	let anchor: TrustAnchor = {
+		repoEpoch: a.repoEpoch,
+		checkpointHash: a.checkpointHash,
+		headSequence: a.headSequence,
+		devicePublicKeys: { ...a.devicePublicKeys },
+		revokedDevices: [...new Set(bundle.revokedDevices)],
+		updatedAt: Date.now(),
+	};
+	// 创世锚（发行时还没有任何已签名检查点）：第一份 checkpoint 的 previous 是空串
+	let chain = [a.checkpointHash];
+	let sawAnchor = a.checkpointHash === "";
+	let extended = 0;
+	for (const cp of bundle.checkpoints) {
+		if (cp.hash === a.checkpointHash) {
+			// 锚检查点本身：签名、仓库、世代、位置都必须与配对包一致（服务器不能拿别的东西冒名）
+			const pub = anchor.devicePublicKeys[cp.body.signingDeviceId];
+			const genuine =
+				pub !== undefined &&
+				!anchor.revokedDevices.includes(cp.body.signingDeviceId) &&
+				(await verifyCheckpoint(pub, cp)) &&
+				cp.body.vaultId === server.vaultId &&
+				cp.body.repoEpoch === a.repoEpoch &&
+				cp.body.headSequence === a.headSequence;
+			if (!genuine) return rejected("bad-signature", "服务器给出的「发行设备已确认的检查点」与连接链接里的不一致。");
+			sawAnchor = true;
+			continue;
+		}
+		const verdict = await verifyFreshness(anchor, chain, cp, server.vaultId);
+		if (!verdict.ok) return rejected(verdict.kind, verdict.message);
+		if (verdict.kind === "same") continue;
+		const next = advanceAnchor(anchor, chain, cp);
+		anchor = next.anchor;
+		chain = next.chain;
+		extended++;
+	}
+	if (!sawAnchor) {
+		return rejected(
+			"anchor-missing",
+			`服务器上找不到发行设备已经确认过的检查点（位置 ${a.headSequence}）：服务器的历史可能被回退或替换过。`,
+		);
+	}
+	if (anchor.headSequence > server.headSequence) {
+		return rejected(
+			"rollback",
+			`服务器声称的仓库位置（${server.headSequence}）低于它自己保存的已签名检查点（${anchor.headSequence}）：状态被回退了。`,
+		);
+	}
+	return { kind: "verified", anchor, chain, verifiedHead: anchor.headSequence, extended, receivedAt: pending.receivedAt };
+}
+
+/** 采纳核验通过的继承锚（接入完成时调用；把本设备自己的签名公钥加进信任集合）。 */
+export function adoptVerifiedInheritedTrust(
+	ctx: SyncContext,
+	verdict: Extract<InheritedTrustVerdict, { kind: "verified" }>,
+	ownDeviceId: string,
+	ownPublicKey: string,
+): void {
+	ctx.store.state.trustAnchor = {
+		...verdict.anchor,
+		devicePublicKeys: { ...verdict.anchor.devicePublicKeys, ...(ownPublicKey ? { [ownDeviceId]: ownPublicKey } : {}) },
+		updatedAt: Date.now(),
+	};
+	ctx.store.state.checkpointChain = [...verdict.chain].slice(-64);
+	ctx.log(`checkpoint: 已采纳核验通过的配对继承锚（head ${verdict.verifiedHead}，沿服务器历史前进 ${verdict.extended} 步）`);
+}
+
 /**
  * 从配对包携带的可信锚建立本地信任链（§9.3）。
  *
@@ -243,6 +407,7 @@ export function adoptTrustAnchorFromPairing(
 		revokedDevices: [],
 		updatedAt: Date.now(),
 	};
-	ctx.store.state.checkpointChain = anchor.checkpointHash ? [anchor.checkpointHash] : [];
+	// 创世锚（还没有任何已签名检查点）记作 [""]：第一份 checkpoint 的 previous 是空串，要能接上
+	ctx.store.state.checkpointChain = [anchor.checkpointHash];
 	ctx.log(`checkpoint: 已从配对包建立信任锚（head ${anchor.headSequence}）`);
 }

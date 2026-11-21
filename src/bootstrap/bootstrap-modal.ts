@@ -8,6 +8,7 @@ import {
 	bootstrapMerge,
 	bootstrapRemoteWins,
 	completeBootstrap,
+	discardInheritedTrust,
 	preflight,
 	PreflightResult,
 } from "./bootstrap-manager";
@@ -34,6 +35,8 @@ export interface BootstrapWizardHooks {
 	keyNote?: () => string;
 	/** 「用本地完整替换远端」的正向执行入口是否开启（0.20.1 阶段保护，默认关闭） */
 	replaceRemoteEnabled?: () => boolean;
+	/** 继承的可信检查点核验不通过时「重新配对」：打开粘贴连接链接（0.20.1 / PL-06） */
+	repairPairing?: () => void;
 	/** 拿到密钥之后的回调（用户显式开启了可恢复密钥持久化时写入本设备材料） */
 	afterKeyAvailable?: () => Promise<void>;
 	/**
@@ -279,7 +282,7 @@ export class BootstrapWizardModal extends Modal {
 	 * 当成「别的仓库的旧账」整本作废。直接用 /info 与作业记录的计划水位完成接入——
 	 * 水位之后的变更已核对全是本作业写入的，普通同步拉到它们时按 serverHash 直接对齐。
 	 */
-	private async openReplace(): Promise<void> {
+	private async openReplace(pre: PreflightResult): Promise<void> {
 		let name = "";
 		try {
 			name = (await this.ctx.client.listVaults()).find((v) => v.current)?.name ?? "";
@@ -306,6 +309,8 @@ export class BootstrapWizardModal extends Modal {
 						localPaths: [],
 						commonCount: 0,
 						e2eeEnabled: this.ctx.e2ee.enabled,
+						// 继承锚在本向导的 preflight 里已核验过（PL-06）；接入完成时据此采纳
+						inheritedTrust: pre.inheritedTrust,
 					},
 					"local-replace",
 				);
@@ -334,9 +339,78 @@ export class BootstrapWizardModal extends Modal {
 		}
 	}
 
+	/**
+	 * 配对继承的可信检查点核验不通过（0.20.1 / 复审 PL-06）：停在这里，一个文件都不写。
+	 * 两条出路都要用户明确选择——重新配对（推荐），或读过风险说明后改为首次信任；绝不静默降级。
+	 */
+	private renderTrustRejected(message: string): void {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.createEl("p").createEl("strong", { text: "无法确认服务器上的仓库状态是可信的，接入已停止" });
+		contentEl.createEl("p", { text: message });
+		contentEl.createEl("p", {
+			cls: "litesync-history-meta",
+			text:
+				"这个连接链接宣称本设备继承发行设备已经验证过的检查点，但服务器现在给出的状态通不过核验。" +
+				"为了不把可能被回退或调包的内容当成最新状态写进本设备，接入已停止：本地文件一个都没有动，服务器上也没有写入任何东西。",
+		});
+		contentEl.createEl("p", { text: "你可以：" });
+		const opt1 = contentEl.createDiv({ cls: "litesync-hunk" });
+		opt1.createDiv({ cls: "litesync-hunk-label", text: "重新配对（推荐）" });
+		opt1.createDiv({
+			cls: "litesync-history-meta",
+			text: "先在发出链接的那台设备上同步一次、确认它一切正常，再生成新的连接链接导入。网页生成的链接不继承检查点，会如实标为首次信任。",
+		});
+		const opt2 = contentEl.createDiv({ cls: "litesync-hunk" });
+		opt2.createDiv({ cls: "litesync-hunk-label", text: "改为首次信任（明确确认）" });
+		opt2.createDiv({
+			cls: "litesync-history-meta",
+			text:
+				"放弃继承的检查点：本设备将信任服务器当前给出的状态，之后的回退检测只从这里开始。" +
+				"只在你确定服务器刚做过一次合法的恢复或迁移、而发出链接的设备还没跟上时才这样做。",
+		});
+		const confirmBox = contentEl.createDiv({ cls: "litesync-history-meta" });
+		const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
+		if (this.hooks.repairPairing) {
+			footer.createEl("button", { text: "粘贴新的连接链接…", cls: "mod-cta" }).onclick = () => {
+				this.close();
+				this.hooks.repairPairing?.();
+			};
+		}
+		footer.createEl("button", { text: "改为首次信任…" }).onclick = () => {
+			confirmBox.empty();
+			confirmBox.createDiv({ text: "确认放弃继承的检查点、按首次信任接入吗？这一步不可撤销（之后可以重新配对）。" });
+			const yes = confirmBox.createEl("button", { text: "我了解风险，改为首次信任", cls: "mod-warning" });
+			yes.onclick = () => {
+				void (async () => {
+					await discardInheritedTrust(this.ctx);
+					contentEl.empty();
+					contentEl.createDiv({ text: "正在检测远端仓库…", cls: "litesync-history-meta" });
+					await this.runPreflight();
+				})();
+			};
+		};
+		footer.createEl("button", { text: "稍后再说" }).onclick = () => this.close();
+	}
+
 	private renderChoices(pre: PreflightResult): void {
 		const { contentEl } = this;
 		contentEl.empty();
+		// 配对继承的可信检查点（PL-06）：核验不通过就停在这里，什么都不渲染、什么都不执行
+		if (pre.inheritedTrust?.kind === "rejected") {
+			this.renderTrustRejected(pre.inheritedTrust.message);
+			return;
+		}
+		if (pre.inheritedTrust?.kind === "verified") {
+			contentEl.createDiv({
+				cls: "litesync-history-meta",
+				text:
+					"已核对继承的检查点：服务器状态不早于发行设备确认过的那一个，检查点链能接上" +
+					(pre.inheritedTrust.extended > 0
+						? `（之后的 ${pre.inheritedTrust.extended} 份签名检查点也已逐一验证，已确认到位置 ${pre.inheritedTrust.verifiedHead}）。`
+						: "。"),
+			});
+		}
 
 		contentEl.createDiv({
 			cls: "litesync-history-meta",
@@ -483,7 +557,7 @@ export class BootstrapWizardModal extends Modal {
 				const btnC = optC.createEl("button", {
 					text: pendingJob ? "查看未完成的替换作业…" : enabled ? "预览本地替换远端…" : "只读预览差异…",
 				});
-				btnC.onclick = () => void this.openReplace();
+				btnC.onclick = () => void this.openReplace(pre);
 				break;
 			}
 		}

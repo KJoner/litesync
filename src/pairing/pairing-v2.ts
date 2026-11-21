@@ -114,11 +114,22 @@ export function completeAnchor(t: PairingTrust | undefined): t is Required<Pick<
 	);
 }
 
-/** 给用户看的信任方式说明（不把「首次信任」包装成「已验证」）。 */
+/**
+ * 给用户看的信任方式说明（不把「首次信任」包装成「已验证」）。
+ *
+ * 0.20.1（复审 PL-06）：只承诺实现做得到的事——接入**之前**核对服务器状态不早于继承的检查点、
+ * 检查点链能接上；核对不通过就停止。发行时还没有任何已签名检查点（创世锚）的，不宣称能察觉回退。
+ */
 export function describeTrust(config: PairingConfig): string {
 	const t = config.trust;
 	if (completeAnchor(t)) {
-		return "继承发行设备已验证的检查点：服务器若回退或篡改仓库历史，本设备会察觉";
+		if (!t.checkpointHash) {
+			return "继承发行设备的签名设备名单（发行时还没有已签名的检查点）：之后发布的检查点会逐一核对，但无法证明服务器没有回退到发行之前的状态";
+		}
+		return (
+			`继承发行设备已验证的检查点（位置 ${t.headSequence}）：接入之前会核对服务器给出的仓库状态不早于它、检查点链能接上；` +
+			"核对不通过会停止接入并提示重新配对"
+		);
 	}
 	if (t?.mode === "new_vault_genesis") return "新仓库：本设备将从这个仓库的第一个状态开始建立信任";
 	return "首次信任：本设备没有继承任何已验证的检查点，将信任服务器当前提供的仓库状态";

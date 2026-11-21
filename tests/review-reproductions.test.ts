@@ -7,12 +7,13 @@
 //   PL-03  integrity-error 下完整替换仍执行写入               → 执行许可挡下，零写入，作业与恢复点可诊断
 //   PL-04  预览后本地出现了文件，delete 照删远端               → 暂停（paused_stale），远端不删，零写入
 //   PL-05  restore 提交后丢响应，同一作业续跑被误判 stale      → 同一作业续跑拿回首次结果，在其上完成上传
-//   PL-06  配对继承的可信锚（head 120）在首次应用之后才采纳     → 见 PL-06 批次（tests/inherited-trust.test.ts 与本文件末尾）
+//   PL-06  配对继承的可信锚（head 120）在首次应用之后才采纳     → 接入之前核验被拒，一个文件都不写；空 checkpoint 列表不再放行回退
+//          （判据矩阵见 tests/inherited-trust.test.ts）
 //
 // 内存服务端按真实协议建模（tests/fakes/replace-server.ts；元数据建档要求对照 service.go:508–519）。
 // 这不是真实 Go 服务端联调——那部分见 scripts/interop/。
 //
-// INV: INV-03（不满足前置条件绝不覆盖 / 不删除）/ INV-05（身份由 fileId 决定，恢复不重置）/ INV-10（换连接后旧结果不安装）/ INV-11（作业可恢复、可重复、幂等）
+// INV: INV-03（不满足前置条件绝不覆盖 / 不删除）/ INV-04（核验未过不推进游标）/ INV-05（身份由 fileId 决定，恢复不重置）/ INV-10（换连接后旧结果不安装）/ INV-11（作业可恢复、可重复、幂等）
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
@@ -28,16 +29,20 @@ import {
 	runReplaceJob,
 	saveRecoveryPoint,
 } from "../src/bootstrap/replace-remote";
+import { bootstrapRemoteWins, InheritedTrustRejectedError, preflight } from "../src/bootstrap/bootstrap-manager";
 import {
 	canonicalPathHmac,
 	createVaultKeyDoc,
 	decryptFileV3,
 	decryptMeta,
+	encryptFileV3,
 	exportVmkRaw,
+	newFileId,
 } from "../src/crypto/crypto";
 import { Keyring } from "../src/crypto/keyring";
+import { verifyCheckpointChain } from "../src/sync/checkpoint-sync";
 import { sha256Hex } from "../src/utils/hash";
-import { dec, FakeServer, makeCtx, MemVault } from "./fakes/replace-server";
+import { dec, enc, FakeServer, makeCtx, MemVault } from "./fakes/replace-server";
 
 async function e2eeCtx(metaState: "plain" | "encrypted") {
 	const server = new FakeServer();
@@ -218,4 +223,55 @@ test("反例转正 PL-05：restore 已提交但响应丢失 → 同一作业续�
 	assert.equal(server.changes.filter((c) => c.action === "restore" && c.fileId === gone.fileId).length, 1, "只恢复了一次");
 	assert.equal(item.restore?.phase, "restored");
 	assert.ok(job.ownSequences.includes(item.restore!.sequence!), "自己的 restore 被认作自己的写入，不是外来变更");
+});
+
+test("反例转正 PL-06：继承 head 120、服务器只给 head 1 的可解密旧内容 → 接入之前核验被拒，本地一个文件都不写；空 checkpoint 列表也不再放行", async () => {
+	const server = new FakeServer();
+	const vault = new MemVault();
+	const { doc, vmk } = await createVaultKeyDoc("password");
+	doc.enabled = true;
+	const kr = new Keyring();
+	kr.adopt(doc, vmk);
+	const ctx = await makeCtx(server, vault, kr, { bootstrap: "pending" });
+	const id = newFileId();
+	const raw = await encryptFileV3(vmk, { vaultId: server.vaultId, keyEpoch: 1, fileId: id, generation: 1 }, enc("stale content"));
+	server.seq = 1;
+	server.heads.set("note.md", { fileId: id, revision: 1, data: raw, hash: await sha256Hex(raw), deleted: false, generation: 1, metaGeneration: 0, canonical: "note.md" });
+	ctx.store.state.pendingPairingTrust = {
+		vaultIdentity: server.vaultId,
+		anchor: { repoEpoch: server.repoEpoch, checkpointHash: "c".repeat(64), headSequence: 120, devicePublicKeys: { old: "PUB" } },
+		receivedAt: 1,
+	};
+	(ctx.client as unknown as { checkpoints: () => Promise<unknown> }).checkpoints = async () => ({
+		repoEpoch: server.repoEpoch,
+		checkpoints: [],
+		conflicting: [],
+		signingKeys: {},
+		revokedDevices: [],
+	});
+	(ctx as unknown as { committer: unknown }).committer = {
+		commitRemoteChange: async (r: { realPath: string; incoming: ArrayBuffer }) => {
+			vault.files.set(r.realPath, r.incoming);
+			return { status: "committed" };
+		},
+	};
+	const p = await preflight(ctx);
+	assert.equal(p.snapshotSequence, 1);
+	assert.equal(p.inheritedTrust?.kind === "rejected" && p.inheritedTrust.reason, "rollback", "能解密 ≠ 最新可信状态");
+	await assert.rejects(bootstrapRemoteWins(ctx, p, () => {}), InheritedTrustRejectedError);
+	assert.equal(vault.files.has("note.md"), false, "旧内容没有写进本地");
+	assert.equal(ctx.store.state.lastSequence, 0);
+	assert.equal(ctx.store.state.trustAnchor, null);
+	assert.ok(ctx.store.state.pendingPairingTrust, "不静默降为首次信任：暂存保留给用户选择");
+
+	// 第二半：已采纳 head 120 的锚、服务器返回空 checkpoint 列表且 head 只有 1 → 判回退
+	ctx.store.state.trustAnchor = {
+		repoEpoch: server.repoEpoch,
+		checkpointHash: "c".repeat(64),
+		headSequence: 120,
+		devicePublicKeys: { old: "PUB" },
+		revokedDevices: [],
+		updatedAt: 0,
+	};
+	assert.equal(await verifyCheckpointChain(ctx, 1), false, "空列表不再等于验证通过");
 });

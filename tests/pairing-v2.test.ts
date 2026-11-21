@@ -7,14 +7,17 @@
 //     服务端返回的仓库与核对过的不一致 → 不用这份凭据；明确拒绝码清除暂存
 //   发行：verified_transfer 只在本机持有与当前 repoEpoch 一致的已验证锚时出现，否则 first_trust；
 //     包里没有长期 Token
-//   信任锚：只在接入完成、且仓库身份与 repoEpoch 都吻合时采纳，否则按首次信任
+//   信任锚：接入之前核验（0.20.1 / 复审 PL-06），通过才在接入完成时采纳；仓库身份或 repoEpoch 不吻合 → 停止，
+//     暂存保留给用户选择重新配对或显式改为首次信任（不再静默降级）
 //
 // INV: INV-10（凭据/仓库变化必须重新绑定——导入新连接后本设备回到待接入）/ INV-05（仓库身份以服务端为准）
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { PairingEnvelopeResult, RedeemRequest, RedeemResult } from "../src/api/client";
-import { completeBootstrap, PreflightResult } from "../src/bootstrap/bootstrap-manager";
+import { completeBootstrap, InheritedTrustRejectedError, PreflightResult } from "../src/bootstrap/bootstrap-manager";
+import { CheckpointBody, generateSigningKey, importSigningPrivateKey, SignedCheckpoint, signCheckpoint } from "../src/crypto/checkpoint";
+import { verifyInheritedTrust } from "../src/sync/checkpoint-sync";
 import type { SecretStore } from "../src/crypto/device-trust";
 import { b64urlEncode } from "../src/crypto/crypto";
 import { encryptPairingConfig, newPairSecret, PairingConfig } from "../src/pairing/pairing";
@@ -300,7 +303,7 @@ test("导入端：残缺的 verified_transfer 锚一律当首次信任", () => {
 	assert.match(describeTrust(cfg), /首次信任/);
 });
 
-// ---------- 信任锚的采纳时机 ----------
+// ---------- 信任锚的采纳时机（0.20.1 起：接入之前核验，核验通过才采纳；对不上就停止，不再静默降级） ----------
 
 function memAdapter() {
 	const files = new Map<string, string>();
@@ -311,17 +314,41 @@ function memAdapter() {
 	} as unknown as ConstructorParameters<typeof StateStore>[0];
 }
 
-async function ctxWithPending(vaultIdentity: string, epoch: string): Promise<SyncContext> {
+/** 发行设备在 head 120 上签过一份 checkpoint；配对包继承的正是它。 */
+async function signedAnchor(repoEpoch = "epoch-1") {
+	const key = await generateSigningKey();
+	const priv = await importSigningPrivateKey(key.privateKeyPkcs8B64);
+	const body: CheckpointBody = {
+		version: 1,
+		vaultId: VAULT.vaultIdentity,
+		repoEpoch,
+		formatEpoch: 1,
+		keyEpoch: 1,
+		headSequence: 120,
+		objectsRoot: "0".repeat(64),
+		objectCount: 0,
+		previousCheckpointHash: "",
+		signingDeviceId: "device-old",
+		timestamp: 1,
+	};
+	const cp = await signCheckpoint(priv, body);
+	return { cp, pub: key.publicKeyB64 };
+}
+
+async function ctxWithPending(vaultIdentity: string, epoch: string, served: SignedCheckpoint[], pub: string, hash: string): Promise<SyncContext> {
 	const store = new StateStore(memAdapter(), "state.json");
 	await store.load();
 	store.state.deviceId = "device-new";
 	store.state.pendingPairingTrust = {
 		vaultIdentity,
-		anchor: { repoEpoch: epoch, checkpointHash: "c".repeat(64), headSequence: 120, devicePublicKeys: { "device-old": "PUB" } },
+		anchor: { repoEpoch: epoch, checkpointHash: hash, headSequence: 120, devicePublicKeys: { "device-old": pub } },
 		receivedAt: 1,
 	};
 	return {
 		store,
+		client: {
+			checkpoints: async () => ({ repoEpoch: epoch, checkpoints: served, conflicting: [], signingKeys: {}, revokedDevices: [] }),
+		},
 		log: () => {},
 		deviceSigningPublicKey: () => "MY-PUB",
 	} as unknown as SyncContext;
@@ -339,9 +366,12 @@ function pre(vaultId: string, repoEpoch: string): PreflightResult {
 	};
 }
 
-test("信任锚：接入完成且仓库身份与 repoEpoch 都吻合 → 采纳，并把本设备加入信任集合", async () => {
-	const ctx = await ctxWithPending(VAULT.vaultIdentity, "epoch-1");
-	completeBootstrap(ctx, pre(VAULT.vaultIdentity, "epoch-1"), "merge");
+test("信任锚：接入之前核验通过（仓库身份、repoEpoch、水位、锚检查点签名都对得上）→ 接入完成时采纳，并把本设备加入信任集合", async () => {
+	const { cp, pub } = await signedAnchor();
+	const ctx = await ctxWithPending(VAULT.vaultIdentity, "epoch-1", [cp], pub, cp.hash);
+	const verdict = await verifyInheritedTrust(ctx, { vaultId: VAULT.vaultIdentity, repoEpoch: "epoch-1", headSequence: 130 });
+	assert.equal(verdict.kind, "verified");
+	completeBootstrap(ctx, { ...pre(VAULT.vaultIdentity, "epoch-1"), inheritedTrust: verdict }, "merge");
 	const a = ctx.store.state.trustAnchor;
 	assert.ok(a);
 	assert.equal(a.headSequence, 120);
@@ -349,13 +379,22 @@ test("信任锚：接入完成且仓库身份与 repoEpoch 都吻合 → 采纳�
 	assert.equal(ctx.store.state.pendingPairingTrust, null, "用完即清");
 });
 
-test("信任锚：仓库身份或 repoEpoch 不吻合 → 不采纳（首次信任），暂存同样清除", async () => {
-	const ctx = await ctxWithPending(VAULT.vaultIdentity, "epoch-1");
-	completeBootstrap(ctx, pre("0".repeat(32), "epoch-1"), "merge");
+test("信任锚：仓库身份或 repoEpoch 不吻合 → 停止（不再静默按首次信任完成接入），暂存保留给用户选择", async () => {
+	const { cp, pub } = await signedAnchor();
+	const ctx = await ctxWithPending(VAULT.vaultIdentity, "epoch-1", [cp], pub, cp.hash);
+	const wrongVault = await verifyInheritedTrust(ctx, { vaultId: "0".repeat(32), repoEpoch: "epoch-1", headSequence: 130 });
+	assert.equal(wrongVault.kind === "rejected" && wrongVault.reason, "vault-mismatch");
+	assert.throws(
+		() => completeBootstrap(ctx, { ...pre("0".repeat(32), "epoch-1"), inheritedTrust: wrongVault }, "merge"),
+		(e: unknown) => e instanceof InheritedTrustRejectedError && e.reason === "vault-mismatch",
+	);
 	assert.equal(ctx.store.state.trustAnchor, null);
-	assert.equal(ctx.store.state.pendingPairingTrust, null);
+	assert.ok(ctx.store.state.pendingPairingTrust, "暂存保留：重新配对或用户明确改为首次信任");
+	assert.equal(ctx.store.bootstrapReady, false, "接入没有完成");
 
-	const ctx2 = await ctxWithPending(VAULT.vaultIdentity, "epoch-1");
-	completeBootstrap(ctx2, pre(VAULT.vaultIdentity, "epoch-2"), "remote-wins");
-	assert.equal(ctx2.store.state.trustAnchor, null, "灾备恢复之后的世代不能沿用旧锚");
+	const epochChanged = await verifyInheritedTrust(ctx, { vaultId: VAULT.vaultIdentity, repoEpoch: "epoch-2", headSequence: 130 });
+	assert.equal(epochChanged.kind === "rejected" && epochChanged.reason, "epoch-mismatch", "灾备恢复之后的世代不能沿用旧锚");
+
+	// 未核验就想完成接入：同样拒绝
+	assert.throws(() => completeBootstrap(ctx, pre(VAULT.vaultIdentity, "epoch-1"), "merge"), InheritedTrustRejectedError);
 });

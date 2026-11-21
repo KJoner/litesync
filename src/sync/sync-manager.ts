@@ -61,6 +61,8 @@ export class SyncManager {
 	private serverKeyEpoch = -1;
 	/** 「服务器加密状态自相矛盾」的常驻通知句柄（恢复时撤下） */
 	private e2eeMismatchNotice: { hide(): void } | null = null;
+	/** 本轮 /info 报告的服务器水位（PL-06：低于已确认检查点即回退证据，不依赖服务器交出 checkpoint） */
+	private serverHead: number | undefined = undefined;
 
 	constructor(private ctx: SyncContext) {}
 
@@ -261,7 +263,7 @@ export class SyncManager {
 			// §9：先确认「服务器现在给我看的这套状态，确实是我已知历史的合法延伸」，
 			// 再决定要不要按它去改本地文件。反过来等于先动手再检查——
 			// 发现问题时已经写下去了
-			if (!(await verifyCheckpointChain(this.ctx))) {
+			if (!(await verifyCheckpointChain(this.ctx, this.serverHead))) {
 				await this.ctx.store.save();
 				this.onStatus("offline", "检测到仓库状态异常，已停止自动同步");
 				return;
@@ -388,6 +390,7 @@ export class SyncManager {
 		//（服务器从备份恢复、别的设备完成了迁移、密钥轮换）。用会话首轮的判断
 		// 继续 pull/push，等于拿着过期的世界观改数据。
 		const info = await this.ctx.client.info();
+		this.serverHead = info.headSequence ?? info.latestSequence;
 		// /info 成功 = 服务器重新认识我们了：清除「凭据被拒」停机（T5.2 的恢复路径），
 		// 并把还挂在屏幕上的常驻通知一并撤下——恢复了却留着警告，等于没恢复
 		this.ctx.gate.markCredentialRejected(null);

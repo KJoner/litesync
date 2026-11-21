@@ -515,6 +515,7 @@ export default class PrivateSyncPlugin extends Plugin {
 			vaultChoice: () => this.settings.vaultChoice,
 			keyNote: () => this.unlockNote(),
 			replaceRemoteEnabled: () => this.settings.replaceRemoteEnabled,
+			repairPairing: () => this.openPasteLinkModal(),
 			afterKeyAvailable: () => this.maybePersistTrust(),
 			setApiToken: (t) => this.setApiToken(t),
 			openUnlock: (onUnlocked) => this.openUnlockModal(onUnlocked),
@@ -967,6 +968,12 @@ export default class PrivateSyncPlugin extends Plugin {
 			// 首次配置（0.17.0-rc.3；0.19.x 起强制 E2EE）：远端未初始化且本设备未接入 → 首次配置对话框。
 			// 「已启用 E2EE 但 0 个文件」不算未初始化——那是第二台设备接入的形状，
 			// 必须走接入向导的解锁门，绝不能在这里提供「添加 E2EE」
+			// 配对包带着继承的可信检查点（PL-06）：先进接入向导核验，绝不在核验之前就往服务器写东西
+			//（首次配置对话框会立刻启用 E2EE、写入密钥文档）
+			if (!this.bootstrapReady && this.store?.state.pendingPairingTrust) {
+				this.openBootstrapWizard();
+				return null;
+			}
 			if (
 				(info.latestSequence ?? 0) === 0 &&
 				(info.encryptionState ?? "plaintext") === "plaintext" &&

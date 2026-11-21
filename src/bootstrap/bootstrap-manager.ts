@@ -13,7 +13,12 @@ import { SyncContext } from "../sync/context";
 import { resolveSnapshotPaths, trashLocal } from "../sync/pull";
 import { isStaleResurrection, restoreObject } from "../sync/push";
 import { downloadPlain, uploadFromPlain, writeIfLocalUnchanged } from "../sync/transfer";
-import { adoptTrustAnchorFromPairing } from "../sync/checkpoint-sync";
+import {
+	adoptVerifiedInheritedTrust,
+	InheritedTrustFailure,
+	InheritedTrustVerdict,
+	verifyInheritedTrust,
+} from "../sync/checkpoint-sync";
 
 export interface PreflightResult {
 	info: ServerInfo;
@@ -25,6 +30,34 @@ export interface PreflightResult {
 	commonCount: number;
 	/** 远端已启用 E2EE（执行前必须先解锁） */
 	e2eeEnabled: boolean;
+	/**
+	 * 配对包继承的可信锚的核验结果（0.20.1 / 复审 PL-06）。在 preflight 里、任何本地落地或远端写入之前算出；
+	 * rejected 时所有执行器都拒绝动手，接入也不能完成。未提供（手工构造的 pre）时按「尚未核验」处理。
+	 */
+	inheritedTrust?: InheritedTrustVerdict;
+}
+
+/**
+ * 配对继承的可信锚核验未通过（或尚未核验）：首次接入停止（PL-06）。
+ * 界面给出两条路：重新配对（推荐），或用户明确确认后改为首次信任——绝不静默降级。
+ */
+export class InheritedTrustRejectedError extends Error {
+	constructor(
+		public reason: InheritedTrustFailure | "unverified",
+		message: string,
+	) {
+		super(message);
+		this.name = "InheritedTrustRejectedError";
+	}
+}
+
+/** 首次接入执行器的总闸：继承锚被拒或未核验时，什么都不写。 */
+function assertInheritedTrust(ctx: SyncContext, pre: PreflightResult): void {
+	const v = pre.inheritedTrust;
+	if (v?.kind === "rejected") throw new InheritedTrustRejectedError(v.reason, v.message);
+	if (v === undefined && ctx.store.state.pendingPairingTrust) {
+		throw new InheritedTrustRejectedError("unverified", "配对包继承的可信检查点尚未核验：请重新打开接入向导。");
+	}
 }
 
 export interface BootstrapProgress {
@@ -82,10 +115,19 @@ export async function preflight(ctx: SyncContext): Promise<PreflightResult> {
 
 	await ctx.refreshE2ee();
 	const snap = await ctx.client.snapshot();
+	// 配对继承的可信锚（PL-06）：拿到服务器状态之后、解密或落地任何东西之前先核验。
+	// 快照与 /info 的水位取较低者——任何一个比可信锚旧都是回退
+	const snapRepoEpoch = snap.repoEpoch ?? info.repoEpoch;
+	const inheritedTrust = await verifyInheritedTrust(ctx, {
+		vaultId: info.vaultId,
+		repoEpoch: snapRepoEpoch,
+		headSequence: Math.min(snap.sequence, info.headSequence ?? info.latestSequence),
+	});
+	if (inheritedTrust.kind === "rejected") ctx.log(`pairing: inherited trust rejected (${inheritedTrust.reason})`);
 	// meta 模式（v9.3 三期）：快照条目是伪名 + 加密元数据。已解锁则立即解出
-	// 真实路径；未解锁保留伪名（向导会先走解锁门，执行器再兜底解一次）
+	// 真实路径；未解锁保留伪名（向导会先走解锁门，执行器再兜底解一次）。核验被拒时不解（反正不会落地）
 	let files = snap.files;
-	if (files.some((f) => f.metaEnc) && ctx.e2ee.unlocked) {
+	if (files.some((f) => f.metaEnc) && ctx.e2ee.unlocked && inheritedTrust.kind !== "rejected") {
 		files = await resolveSnapshotPaths(ctx, files);
 	}
 	const remoteFiles = files.filter((f) => !ctx.ignores(f.path));
@@ -100,11 +142,12 @@ export async function preflight(ctx: SyncContext): Promise<PreflightResult> {
 	return {
 		info,
 		snapshotSequence: snap.sequence,
-		repoEpoch: snap.repoEpoch ?? info.repoEpoch,
+		repoEpoch: snapRepoEpoch,
 		remoteFiles,
 		localPaths,
 		commonCount,
 		e2eeEnabled: ctx.e2ee.enabled,
+		inheritedTrust,
 	};
 }
 
@@ -126,33 +169,39 @@ export function completeBootstrap(
 	pre: PreflightResult,
 	mode: "remote-wins" | "merge" | "local-init" | "local-replace",
 ): void {
+	// 配对包宣称了可信转移（PL-06）：只有核验通过、且核验的正是现在这份暂存，才能完成接入。
+	// 以前对不上就「按首次信任处理」——那是静默降级；现在一律停止，由用户选择重新配对或显式改为首次信任
+	const pending = ctx.store.state.pendingPairingTrust;
+	const v = pre.inheritedTrust;
+	if (pending) {
+		if (v?.kind === "rejected") throw new InheritedTrustRejectedError(v.reason, v.message);
+		if (v?.kind !== "verified" || v.receivedAt !== pending.receivedAt) {
+			throw new InheritedTrustRejectedError("unverified", "配对包继承的可信检查点尚未核验：请重新打开接入向导。");
+		}
+	}
 	ctx.store.state.lastSequence = pre.snapshotSequence;
 	ctx.store.completeBootstrap(mode, pre.info.vaultId, pre.snapshotSequence, pre.repoEpoch, pre.info.keyEpoch);
-	adoptPendingPairingTrust(ctx, pre);
+	if (pending && v?.kind === "verified" && ctx.store.state.trustAnchor === null) {
+		// 已有本地锚时不覆盖（那是本设备自己确认过的）；没有就采纳核验通过、已沿服务器历史前进过的那一个
+		adoptVerifiedInheritedTrust(ctx, v, ctx.store.state.deviceId, ctx.deviceSigningPublicKey?.() ?? "");
+	}
+	ctx.store.state.pendingPairingTrust = null;
 }
 
 /**
- * 采纳配对包带来的已验证信任锚（0.20 / ADR-014）。
- *
- * 只有在账本归属刚刚确立、且仓库身份与 repoEpoch 都与配对包一致时才采纳：
- * 向导期间换过仓库、或服务器在此期间做过灾备恢复，这个锚描述的就不是眼前的仓库，
- * 宁可退回「首次信任」也不能拿一个对不上的锚去判别真伪。用完即清。
+ * 用户在接入向导里**明确选择**放弃继承的检查点、改为首次信任（PL-06 的显式降级出口）。
+ * 只在核验被拒、用户读过说明并确认之后调用；不会被任何自动流程调用。
  */
-function adoptPendingPairingTrust(ctx: SyncContext, pre: PreflightResult): void {
-	const pending = ctx.store.state.pendingPairingTrust;
-	if (!pending) return;
+export async function discardInheritedTrust(ctx: SyncContext): Promise<void> {
+	if (!ctx.store.state.pendingPairingTrust) return;
 	ctx.store.state.pendingPairingTrust = null;
-	const epoch = pre.repoEpoch ?? pre.info.repoEpoch ?? "";
-	if (ctx.store.state.trustAnchor !== null) return; // 已有本地锚（不覆盖更可信的东西）
-	if (pending.vaultIdentity !== pre.info.vaultId || pending.anchor.repoEpoch !== epoch) {
-		ctx.log("pairing: 配对包的信任锚与当前仓库不符（仓库或 repoEpoch 不同），按首次信任处理");
-		return;
-	}
-	adoptTrustAnchorFromPairing(ctx, pending.anchor, ctx.store.state.deviceId, ctx.deviceSigningPublicKey?.() ?? "");
+	await ctx.store.save();
+	ctx.log("pairing: 用户确认放弃配对包继承的检查点，本设备按首次信任接入");
 }
 
 /** 本地初始化远端（远端为空）：标记就绪后由普通同步把本地文件全部推上去。 */
 export async function bootstrapLocalInit(ctx: SyncContext, pre: PreflightResult): Promise<void> {
+	assertInheritedTrust(ctx, pre);
 	// 自愈（v0.18 实测缺陷）：对**空**远端不可能存在「已同步」账本——有即为
 	// 换库/换账户的残留（升级前旧版本留下的，或换 Token 后未及重载的旧代码
 	// 写下的）。不作废的话，「由普通同步推上去」会因为账本声称「都同步过」
@@ -175,6 +224,8 @@ export async function bootstrapRemoteWins(
 	pre: PreflightResult,
 	onProgress: OnProgress,
 ): Promise<void> {
+	// 继承锚核验没过：本设备一个文件都不写（PL-06）
+	assertInheritedTrust(ctx, pre);
 	pre = await ensureResolvedPre(ctx, pre);
 	const adapter = ctx.app.vault.adapter;
 	const remoteSet = new Set(pre.remoteFiles.map((f) => f.path));
@@ -292,6 +343,7 @@ export async function bootstrapMerge(
 	pre: PreflightResult,
 	onProgress: OnProgress,
 ): Promise<MergeResult> {
+	assertInheritedTrust(ctx, pre);
 	pre = await ensureResolvedPre(ctx, pre);
 	const adapter = ctx.app.vault.adapter;
 	const remoteSet = new Set(pre.remoteFiles.map((f) => f.path));
