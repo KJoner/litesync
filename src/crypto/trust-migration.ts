@@ -61,6 +61,7 @@ export type TrustMigrationError =
 	| "pending-writes"
 	| "state-unhealthy"
 	| "secret-store-failed"
+	| "settings-write-failed"
 	| "invalid-state";
 
 export interface TrustMigrationRecord {
@@ -184,9 +185,71 @@ async function fail(deps: TrustMigrationDeps, error: TrustMigrationError): Promi
 	const r = record(deps);
 	if (r) {
 		r.lastError = error;
-		await deps.saveSettings();
+		try {
+			await deps.saveSettings();
+		} catch (e) {
+			// 记一笔失败原因本身也可能写不进去（data.json 只读）：原错误照常返回，不变成未处理的异常
+			if (!(e instanceof SettingsWriteError)) throw e;
+		}
 	}
 	return { ok: false, error };
+}
+
+/**
+ * 设置文件（data.json）没有真的写进去。
+ *
+ * Obsidian 的 Plugin.saveData 会**静默吞掉**写入错误（vault.writeJson 里 try{…}catch{}）：data.json 只读、磁盘已满、
+ * 没有权限时 await 照样成功返回。迁移是「先落盘意图、再动服务器或清材料」的流程，必须读回核对——WIN-12 真机实测：
+ * data.json 只读时，重包装的意图标记没落盘就上传了新密钥文档、清掉了 SecretStorage 里的旧材料，界面还报了成功，
+ * 磁盘上却仍是「旧设备信任待迁移」。
+ */
+export class SettingsWriteError extends Error {
+	constructor(message = "设置文件没有写进去") {
+		super(message);
+		this.name = "SettingsWriteError";
+	}
+}
+
+/** 读回的 data.json 里，迁移相关的字段是否与内存一致（只比这三项：设置页同时改别的字段不算失败）。 */
+export function trustSettingsPersisted(expected: TrustSettings, raw: string | null): boolean {
+	if (raw === null) return false;
+	let back: Partial<TrustSettings>;
+	try {
+		back = JSON.parse(raw) as Partial<TrustSettings>;
+	} catch {
+		return false;
+	}
+	const pick = (x: Partial<TrustSettings>): string =>
+		JSON.stringify([x.trustDevice ?? null, x.deviceKeyB64 ?? null, x.trustMigration ?? null]);
+	return pick(back) === pick(JSON.parse(JSON.stringify(expected)) as Partial<TrustSettings>);
+}
+
+/** 写设置并读回核对；没写进去就抛 SettingsWriteError（宿主的 saveData 自己不会抛）。 */
+export async function saveTrustSettingsVerified(
+	save: () => Promise<void>,
+	readBack: () => Promise<string | null>,
+	expected: TrustSettings,
+): Promise<void> {
+	await save();
+	let raw: string | null;
+	try {
+		raw = await readBack();
+	} catch {
+		raw = null;
+	}
+	if (!trustSettingsPersisted(expected, raw)) {
+		throw new SettingsWriteError("本设备的设置文件（data.json）没有写进去：可能是只读、磁盘已满或没有权限");
+	}
+}
+
+/** 每个对外的迁移步骤都在这里兜住「设置没写进去」：停在当前一步、返回明确的错误，而不是未处理的异常。 */
+async function guardSettingsWrites(step: () => Promise<StepResult>): Promise<StepResult> {
+	try {
+		return await step();
+	} catch (e) {
+		if (e instanceof SettingsWriteError) return { ok: false, error: "settings-write-failed" };
+		throw e;
+	}
 }
 
 /**
@@ -229,6 +292,10 @@ async function markNoUsableMaterial(deps: TrustMigrationDeps): Promise<StepResul
  * 离线时退而使用本地缓存的 keyDoc（它与服务端一致的前提在下一轮同步的绑定校验里复核）。
  */
 export async function proveByPassword(deps: TrustMigrationDeps, password: string): Promise<StepResult> {
+	return guardSettingsWrites(() => proveByPasswordImpl(deps, password));
+}
+
+async function proveByPasswordImpl(deps: TrustMigrationDeps, password: string): Promise<StepResult> {
 	const r = record(deps);
 	if (!r || (r.state !== "legacy_trust_found" && r.state !== "recovery_proven")) return fail(deps, "invalid-state");
 	const legacy = await unwrapLegacy(deps);
@@ -274,6 +341,10 @@ export async function proveByPassword(deps: TrustMigrationDeps, password: string
  * 中途换了文档而被打破。
  */
 export async function proveByRewrap(deps: TrustMigrationDeps, newPassword: string): Promise<StepResult> {
+	return guardSettingsWrites(() => proveByRewrapImpl(deps, newPassword));
+}
+
+async function proveByRewrapImpl(deps: TrustMigrationDeps, newPassword: string): Promise<StepResult> {
 	const r = record(deps);
 	if (!r || r.state !== "legacy_trust_found") return fail(deps, "invalid-state");
 	const legacy = await unwrapLegacy(deps);
@@ -294,9 +365,16 @@ export async function proveByRewrap(deps: TrustMigrationDeps, newPassword: strin
 		if (currentKeyId !== blobKeyId && !ownLanded) return fail(deps, "doc-changed");
 
 		const next = await wrapVmkIntoKeyDoc(newPassword, legacy, current.doc);
-		// 意图先落盘：上传之后无论响应丢失还是进程被杀，重启都能认出服务器上那份是自己写的
+		// 意图先落盘：上传之后无论响应丢失还是进程被杀，重启都能认出服务器上那份是自己写的。
+		// 落盘失败（data.json 只读等）就停在这里——服务器一个字节都不改
+		const prevPending = r.pendingRewrapKeyId;
 		r.pendingRewrapKeyId = keyIdOf(next);
-		await deps.saveSettings();
+		try {
+			await deps.saveSettings();
+		} catch (e) {
+			r.pendingRewrapKeyId = prevPending;
+			throw e;
+		}
 		try {
 			await deps.replaceKeyDoc(next, current.fingerprint);
 		} catch (e) {
@@ -351,6 +429,10 @@ export async function proveByRewrap(deps: TrustMigrationDeps, newPassword: strin
 
 /** recovery_proven → pending_writes_handled：未同步的修改要么已推完，要么已在 durable journal 里。 */
 export async function handlePendingWrites(deps: TrustMigrationDeps): Promise<StepResult> {
+	return guardSettingsWrites(() => handlePendingWritesImpl(deps));
+}
+
+async function handlePendingWritesImpl(deps: TrustMigrationDeps): Promise<StepResult> {
 	const r = record(deps);
 	if (!r || r.state !== "recovery_proven") return fail(deps, "invalid-state");
 	try {
@@ -374,11 +456,22 @@ export async function handlePendingWrites(deps: TrustMigrationDeps): Promise<Ste
  * 不会出现「材料删了一半、状态却说还没开始」的分叉。
  */
 export async function clearLegacyMaterial(deps: TrustMigrationDeps): Promise<StepResult> {
+	return guardSettingsWrites(() => clearLegacyMaterialImpl(deps));
+}
+
+async function clearLegacyMaterialImpl(deps: TrustMigrationDeps): Promise<StepResult> {
 	const r = record(deps);
 	if (!r || (r.state !== "pending_writes_handled" && r.state !== "clearing")) return fail(deps, "invalid-state");
 	if (r.state !== "clearing") {
+		const prev = r.state;
 		r.state = "clearing";
-		await deps.saveSettings();
+		try {
+			await deps.saveSettings();
+		} catch (e) {
+			// 「clearing」没落盘就绝不动材料；内存里也退回去，免得同一次运行里重试时跳过这一步直接清理
+			r.state = prev;
+			throw e;
+		}
 	}
 	deps.secrets.setSecret(VAULT_KEY_SECRET_ID, "");
 	deps.settings.deviceKeyB64 = "";
@@ -405,6 +498,10 @@ export async function advanceAfterProof(deps: TrustMigrationDeps): Promise<StepR
 
 /** 用户显式选择保留本设备自动解锁（可恢复密钥持久化模式）。 */
 export async function keepLegacyTrust(deps: TrustMigrationDeps): Promise<StepResult> {
+	return guardSettingsWrites(() => keepLegacyTrustImpl(deps));
+}
+
+async function keepLegacyTrustImpl(deps: TrustMigrationDeps): Promise<StepResult> {
 	const r = record(deps);
 	if (!r || r.state !== "legacy_trust_found") return fail(deps, "invalid-state");
 	r.state = "user_kept";
@@ -445,6 +542,8 @@ export function trustMigrationErrorText(e: TrustMigrationError): string {
 			return "清理旧材料后校验失败（SecretStorage 中仍有数据），请重启 Obsidian 后重试。";
 		case "secret-store-failed":
 			return "新密钥文档已上传，但本设备的安全存储（SecretStorage）写入失败。旧材料保持原样、仍可用，什么都没有清理；请重启 Obsidian 后重试——会认出服务器上的新文档并沿用同一把密钥。";
+		case "settings-write-failed":
+			return "本设备的设置文件（LiteSync 插件目录下的 data.json）写不进去：可能是只读、磁盘已满或没有权限。迁移停在了这一步，没有继续改动服务器或清理旧材料；处理好之后重新打开迁移即可继续。";
 		case "invalid-state":
 			return "迁移状态不允许这一步，请重新打开迁移窗口。";
 	}

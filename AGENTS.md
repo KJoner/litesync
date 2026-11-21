@@ -166,6 +166,10 @@ src/
 
 ## 6. 平台约束（踩过坑的地方）
 
+- **`Plugin.saveData` 写失败不报错**：Obsidian 的 `vault.writeJson` 里是 `try{…}catch{}`，data.json 只读、磁盘满、
+  没权限时 `await saveData()` 照样成功返回。凡是「先落盘意图、再动服务器或清材料」的设置（旧信任迁移的标记与
+  `clearing`）一律读回核对——`trust-migration.ts` 的 `saveTrustSettingsVerified`（WIN-12 真机实测：以前 data.json
+  只读时照样上传新密钥文档、清掉 SecretStorage 并报成功，磁盘上却仍是待迁移）。
 - **路径归一取最严解释**：`Note.md` 与 `note.md` 视为同一文件，NFC/NFD 同名。
   实测证据：**iOS 大小写敏感且做 Unicode 归一，Android 恰好相反**。按本地平台
   判断会让两台设备对「是否撞名」给出相反答案，然后互相覆盖。
@@ -179,7 +183,7 @@ src/
 
 ## 7. 测试组织
 
-`tests/` 目录自动发现，当前 440 条（0.20.1 复审修复 + Windows 真机验收回归后；0.20.0 时 361）。分类：
+`tests/` 目录自动发现，当前 443 条（0.20.1 复审修复 + Windows 真机验收回归后；0.20.0 时 361）。分类：
 
 - `unit` / `merge` / `smart-merge` / `crypto` / `store` / `device-trust`：基础单元；
 - `crashpoint.test.ts`：**崩溃点注入**（`utils/failpoint.ts` 在关键步骤间强制中断）；

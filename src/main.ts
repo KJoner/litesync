@@ -58,6 +58,7 @@ import {
 	keyPolicyLabel,
 	migrationPending,
 	persistenceExplicit,
+	saveTrustSettingsVerified,
 	TrustMigrationDeps,
 } from "./crypto/trust-migration";
 import { TrustMigrationModal } from "./crypto/trust-migration-modal";
@@ -432,7 +433,20 @@ export default class PrivateSyncPlugin extends Plugin {
 		const context = this.keyring.contextGeneration;
 		return {
 			settings: this.settings,
-			saveSettings: () => this.saveSettings(),
+			// 迁移的每一次落盘都读回核对：宿主的 saveData 写失败时不抛错（WIN-12 真机实测：data.json 只读）
+			saveSettings: () =>
+				saveTrustSettingsVerified(
+					() => this.saveSettings(),
+					async () => {
+						try {
+							const dir = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+							return await this.app.vault.adapter.read(`${dir}/data.json`);
+						} catch {
+							return null;
+						}
+					},
+					this.settings,
+				),
 			secrets: this.app.secretStorage,
 			fetchKeyDoc: async () => {
 				if (!this.client || !this.isConfigured()) throw new Error("not configured");

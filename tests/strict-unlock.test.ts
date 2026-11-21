@@ -41,6 +41,9 @@ import {
 	persistenceExplicit,
 	proveByPassword,
 	proveByRewrap,
+	saveTrustSettingsVerified,
+	trustMigrationErrorText,
+	trustSettingsPersisted,
 	TrustMigrationDeps,
 	TrustSettings,
 } from "../src/crypto/trust-migration";
@@ -525,4 +528,80 @@ test("重启恢复：重包装途中 data.json 在任一次落盘处中断 → �
 		assert.deepEqual(await advanceAfterProof(deps2), { ok: true, state: "strict_mode" });
 		assert.equal(await blobRestores({ ...fx, settings: reloaded }), false, "证明之后才清理");
 	}
+});
+
+// ---------- WIN-12 真机验收：宿主 saveData 写失败时不抛错（data.json 只读） ----------
+
+/**
+ * 模拟宿主：Obsidian 的 Plugin.saveData → vault.writeJson 里 try{…}catch{} 吞掉写入错误。
+ * readOnly 时「写」什么都不做也不报错；读回的是磁盘上最后一次真正写进去的内容。
+ */
+function hostDisk(fx: Fixture): { readOnly: boolean; persisted: string; disk(): Record<string, unknown> } {
+	const h = {
+		readOnly: false,
+		persisted: JSON.stringify(fx.settings, undefined, 2),
+		disk: () => JSON.parse(h.persisted) as Record<string, unknown>,
+	};
+	fx.deps.saveSettings = () =>
+		saveTrustSettingsVerified(
+			async () => {
+				fx.saves++;
+				if (!h.readOnly) h.persisted = JSON.stringify(fx.settings, undefined, 2);
+			},
+			async () => h.persisted,
+			fx.settings,
+		);
+	return h;
+}
+
+test("WIN-12 第 5 步：data.json 只读（宿主静默吞掉写入错误）→ 重包装的意图标记写不进去 → 停在上传之前：服务器文档不变、旧材料完好；恢复可写后重试完成", async () => {
+	const fx = await legacyFixture();
+	const disk = hostDisk(fx);
+	const NEW = "a new password after read-only";
+	disk.readOnly = true;
+	const r = await proveByRewrap(fx.deps, NEW);
+	assert.deepEqual(r, { ok: false, error: "settings-write-failed" });
+	assert.equal(fx.server.replaced, 0, "意图标记没落盘就不上传新密钥文档（真机实测：以前照样上传、还报了成功）");
+	assert.equal(keyIdOf(fx.server.doc!), keyIdOf(fx.doc));
+	assert.ok(await materialRestores(fx, fx.doc), "旧材料完好，仍可自动解锁");
+	assert.equal(fx.settings.trustMigration?.pendingRewrapKeyId, undefined, "内存里的意图标记也退回了");
+	assert.equal((disk.disk().trustMigration as { state: string }).state, "legacy_trust_found");
+	assert.match(trustMigrationErrorText("settings-write-failed"), /data.json.*写不进去/);
+	// 处理好（去掉只读）之后重试：完成
+	disk.readOnly = false;
+	const r2 = await proveByRewrap(fx.deps, NEW);
+	assert.equal(r2.ok, true, JSON.stringify(r2));
+	assert.equal((await advanceAfterProof(fx.deps)).ok, true);
+	assert.equal(fx.server.replaced, 1);
+	assert.equal((disk.disk().trustMigration as { state: string }).state, "strict_mode", "磁盘上是严格模式");
+	assert.equal(disk.disk().deviceKeyB64, "");
+	assert.ok((await unlockVaultKey(fx.server.doc!, NEW)) !== null, "新密码能解开服务器上的文档");
+});
+
+test("WIN-12 第 5 步（续）：清理阶段「clearing」写不进去 → SecretStorage 里的材料一个字都不动，内存状态退回；可写后重试照常清理", async () => {
+	const fx = await legacyFixture();
+	const disk = hostDisk(fx);
+	assert.equal((await proveByPassword(fx.deps, PASSWORD)).ok, true);
+	assert.equal((await handlePendingWrites(fx.deps)).ok, true);
+	assert.equal(fx.settings.trustMigration?.state, "pending_writes_handled");
+	disk.readOnly = true;
+	assert.deepEqual(await clearLegacyMaterial(fx.deps), { ok: false, error: "settings-write-failed" });
+	assert.ok(fx.secrets.getSecret(VAULT_KEY_SECRET_ID), "SecretStorage 里的旧材料没被清掉");
+	assert.notEqual(fx.settings.deviceKeyB64, "");
+	assert.equal(fx.settings.trustMigration?.state, "pending_writes_handled", "内存状态退回，重试不会跳过落盘直接清理");
+	// 同一次运行里再点一次：仍然先落盘 clearing（仍只读 → 仍停住）
+	assert.deepEqual(await advanceAfterProof(fx.deps), { ok: false, error: "settings-write-failed" });
+	assert.ok(fx.secrets.getSecret(VAULT_KEY_SECRET_ID));
+	disk.readOnly = false;
+	assert.equal((await advanceAfterProof(fx.deps)).ok, true);
+	assert.equal(fx.secrets.getSecret(VAULT_KEY_SECRET_ID), "");
+	assert.equal((disk.disk().trustMigration as { state: string }).state, "strict_mode");
+});
+
+test("读回核对只比迁移相关的三项：设置页同时改了别的字段不算失败；读不回来 / 不是 JSON 算失败", () => {
+	const s: TrustSettings = { trustDevice: false, deviceKeyB64: "", trustMigration: null };
+	assert.equal(trustSettingsPersisted(s, JSON.stringify({ ...s, autoSync: false, deviceName: "x" })), true);
+	assert.equal(trustSettingsPersisted(s, JSON.stringify({ ...s, trustDevice: true })), false);
+	assert.equal(trustSettingsPersisted(s, null), false);
+	assert.equal(trustSettingsPersisted(s, "{not json"), false);
 });
