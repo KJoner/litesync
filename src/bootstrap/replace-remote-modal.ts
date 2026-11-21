@@ -188,10 +188,18 @@ export class ReplaceRemoteModal extends Modal {
 		const btn = footer.createEl("button", { text: "保存恢复点并执行", cls: "mod-warning" });
 		btn.disabled = true;
 		input.addEventListener("input", () => {
-			btn.disabled = input.value.trim() !== phrase;
+			// 已确认过的作业（中断后续跑）不再受确认短语约束
+			btn.disabled = job.state === "planned" && input.value.trim() !== phrase;
 		});
 		footer.createEl("button", { text: "取消" }).onclick = () => this.close();
 		btn.onclick = () => {
+			// 已经确认过、执行中断后在同一个窗口里点「继续执行」：这是续跑，不是第二次确认——
+			// 与诊断页的「继续执行」完全一样（同一批幂等键，执行许可在 execute 里照样逐项复核）。
+			// 以前这里仍走确认，作业已是 interrupted，只会得到「作业状态不允许确认」、原地卡死（WIN-11 真机实测）
+			if (job.state !== "planned") {
+				void this.execute(job, status, btn);
+				return;
+			}
 			// 确认前复核执行许可（PL-03）：预览之后才出现的停机（完整性、凭据、换连接……）在这里挡住
 			const ok = confirmReplaceJobChecked(this.ctx, job, input.value, Date.now());
 			if (!ok.ok) {

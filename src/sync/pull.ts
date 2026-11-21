@@ -818,11 +818,31 @@ function skip(note: OutcomeNote | undefined, reason: string): Outcome {
 	return "skipped";
 }
 
+/**
+ * 重放的旧变更（INV-05 / 世代单调）：本设备按 fileId 跟踪的同一个对象已经在这条变更**之后**的 revision 上——
+ * 典型是本设备自己写出的一串变更在下一轮拉取时按顺序回放，例如「用本地完整替换远端」里的仅大小写改名：
+ * 删除 Case.md → 在 case.md 上恢复同一对象 → 上传。本地状态早已是终态（case.md @ 最新 revision），
+ * 这些中间态绝不能再落地：在大小写不敏感的文件系统上，回放「删除 Case.md」会碰到已经改名成 case.md 的
+ * 同一个文件，被当成「远端删了、本地改了」另存成新文件重新上传，随后连原对象一起删掉（WIN-11 真机实测）。
+ *
+ * 判据只用**严格小于**：revision 按对象单调递增（删除、恢复、上传各占一个），但**改名不动 revision**
+ * （服务端 rename.go：只推进 metaGeneration）——同 revision 的变更可能是别的设备刚做的改名，必须照常处理。
+ * 比已跟踪 revision 更早的变更则一定发生在本地已知终态之前，没有任何新信息。
+ */
+function isStaleReplay(ctx: SyncContext, change: RemoteChange): boolean {
+	if (change.fileId === undefined || change.revision <= 0) return false;
+	const at = ctx.store.pathByFileId(change.fileId);
+	if (at === undefined) return false;
+	const tracked = ctx.store.get(at);
+	return tracked !== undefined && change.revision < (tracked.revision ?? 0);
+}
+
 async function applyRemoteChange(
 	ctx: SyncContext,
 	change: RemoteChange,
 	note?: OutcomeNote,
 ): Promise<Outcome> {
+	if (isStaleReplay(ctx, change)) return skip(note, "stale-replay-of-known-revision");
 	let path = change.path;
 	let serverPath: string | undefined;
 
@@ -942,6 +962,11 @@ async function applyRemoteChange(
 			ctx.store.markDeleted(path);
 			ctx.store.clearPendingDelete(path);
 			return skip(note, "delete-of-untracked-file");
+		}
+		// 大小写不敏感的文件系统（Windows / macOS）：这个名字本设备没有跟踪，stat 却找到了文件——
+		// 那是另一个已跟踪文件（只差大小写 / 归一化）的别名，不是这条删除的对象，绝不能碰它
+		if (!tracked && ctx.store.collidingPath(path) !== undefined) {
+			return skip(note, "delete-hits-alias-of-another-tracked-file");
 		}
 		const localData = await adapter.readBinary(path);
 		const localHash = await sha256Hex(localData);
