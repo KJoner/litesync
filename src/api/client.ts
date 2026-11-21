@@ -39,6 +39,16 @@ export interface ServerInfo {
 	/** 进行中的迁移（0.13.0+）：非 owner 设备据此知道自己处于受限写入状态 */
 	migrationId?: string;
 	migrationOwnerDeviceId?: string;
+	/**
+	 * 服务端能力位（0.20+）：如 `pairing-v2-redeem`、`vault-init-v2`。
+	 * 只按「数组里有没有这个字符串」判定；未知字符串忽略，旧服务器不返回。
+	 */
+	capabilities?: string[];
+}
+
+/** 服务器是否声明了某项能力（旧服务器没有 capabilities 字段 → 一律 false）。 */
+export function hasCapability(info: Pick<ServerInfo, "capabilities">, cap: string): boolean {
+	return Array.isArray(info.capabilities) && info.capabilities.includes(cap);
 }
 
 /**
@@ -66,7 +76,7 @@ export const PLUGIN_PROTOCOL_VERSION = 6;
  * 协议版本号（6）粒度太粗：同一个协议版本下的两个插件版本，
  * 修没修某个已知 bug 是不一样的。
  */
-export const PLUGIN_VERSION = "0.19.0";
+export const PLUGIN_VERSION = "0.20.0";
 
 /**
  * 平台紧凑 token（随每个请求上报，运维页 Devices 列表用）。
@@ -87,6 +97,11 @@ function detectClientPlatform(): string {
 
 /** 模块加载时一次性判定：平台在进程生命周期内不会变，没必要逐请求重算。 */
 const CLIENT_PLATFORM = detectClientPlatform();
+
+/** 本设备平台的紧凑 token（配对兑换上报用）。 */
+export function clientPlatform(): string {
+	return CLIENT_PLATFORM;
+}
 
 /** 协议不兼容时返回给用户的提示；兼容返回 null。 */
 export function protocolError(info: ServerInfo): string | null {
@@ -784,6 +799,67 @@ export class ApiClient {
 		return res.json as { id: string; expiresAt: number };
 	}
 
+	// ---------- 指定仓库配对 v2（0.20 / ADR-014；服务端声明 pairing-v2-redeem 时可用） ----------
+
+	/**
+	 * 为指定仓库申请一次性设备 grant（5 分钟，绑定 user + vault + 默认 scopes）。
+	 * 设备凭据只能为自己绑定的仓库申请（路径里的 id 不符 → 404）。
+	 */
+	async createPairingGrant(vaultId: string): Promise<PairingGrant> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v2/vaults/${encodeURIComponent(vaultId)}/pairing-grants`,
+			method: "POST",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: "{}",
+			throw: false,
+		});
+		if (res.status !== 200 && res.status !== 201) throw apiError(res.status, "pairing grant failed", res.text);
+		const body = (tryJson(res.text) ?? {}) as Partial<PairingGrant> & { vault?: Partial<PairingGrant["vault"]> };
+		if (typeof body.enrollmentSecret !== "string" || typeof body.grantId !== "string") {
+			throw new ApiError(res.status, "pairing grant failed: malformed response");
+		}
+		return {
+			grantId: body.grantId,
+			enrollmentSecret: body.enrollmentSecret,
+			expiresAt: num(body.expiresAt),
+			vault: {
+				vaultId: String(body.vault?.vaultId ?? vaultId),
+				vaultIdentity: typeof body.vault?.vaultIdentity === "string" ? body.vault.vaultIdentity : undefined,
+				displayName: typeof body.vault?.displayName === "string" ? body.vault.displayName : "",
+			},
+			accountLabel: typeof body.accountLabel === "string" ? body.accountLabel : "",
+		};
+	}
+
+	/** 上传本机加密后的配对包，绑定到 grant（TTL 与 grant 相同）。 */
+	async createPairingV2(grantId: string, ciphertextB64: string): Promise<{ pairId: string; expiresAt: number }> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v2/pairings`,
+			method: "POST",
+			headers: this.headers({ "Content-Type": "application/json" }),
+			body: JSON.stringify({ grantId, ciphertext: ciphertextB64 }),
+			throw: false,
+		});
+		if (res.status !== 200 && res.status !== 201) throw apiError(res.status, "pairing create failed", res.text);
+		const body = (tryJson(res.text) ?? {}) as { pairId?: unknown; id?: unknown; expiresAt?: unknown };
+		const pairId = typeof body.pairId === "string" ? body.pairId : typeof body.id === "string" ? body.id : null;
+		if (pairId === null) throw new ApiError(res.status, "pairing create failed: malformed response");
+		return { pairId, expiresAt: num(body.expiresAt) };
+	}
+
+	/** 发行者撤销：同时撤销密文与尚未兑换的 grant（不存在视为成功）。 */
+	async deletePairingV2(pairId: string): Promise<void> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v2/pairings/${encodeURIComponent(pairId)}`,
+			method: "DELETE",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200 && res.status !== 204 && res.status !== 404) {
+			throw apiError(res.status, "pairing revoke failed", res.text);
+		}
+	}
+
 	/** 撤销配对包（配对窗口关闭时调用；已消费/不存在也视为成功）。 */
 	async deletePairing(id: string): Promise<void> {
 		const res = await requestUrl({
@@ -1087,7 +1163,12 @@ export class ApiClient {
 		return res.json as MigrationStatus;
 	}
 
-	async remove(path: string, baseRevision: number): Promise<void> {
+	/**
+	 * 删除（产生 tombstone）。baseRevision 是 CAS 前提：远端已被别人改过 → 409。
+	 * 返回 tombstone 的 revision 与 sequence（0.20 起调用方可据此识别「自己的」变更；
+	 * 旧调用方忽略返回值即可）。
+	 */
+	async remove(path: string, baseRevision: number): Promise<{ revision: number; sequence: number }> {
 		const res = await requestUrl({
 			url: `${this.base()}/api/v1/file`,
 			method: "DELETE",
@@ -1098,6 +1179,8 @@ export class ApiClient {
 		if (res.status === 409) throw new ConflictError(parseConflict(res.text, path));
 		if (res.status === 404) throw new NotFoundError();
 		if (res.status !== 200) throw new ApiError(res.status, `delete ${path} failed: HTTP ${res.status}`);
+		const body = tryJson(res.text);
+		return { revision: num(body?.revision), sequence: num(body?.sequence) };
 	}
 }
 
@@ -1162,6 +1245,111 @@ export async function enrollDevice(
 	if (res.status === 404) throw new ApiError(404, "注册凭据无效或已过期，请在旧设备上重新生成配对二维码");
 	if (res.status !== 200) throw new ApiError(res.status, `device enroll failed: HTTP ${res.status}`);
 	return res.json as { deviceId: string; deviceToken: string };
+}
+
+/** v2 grant（POST /api/v2/vaults/{id}/pairing-grants 的响应）。 */
+export interface PairingGrant {
+	grantId: string;
+	enrollmentSecret: string;
+	expiresAt: number;
+	vault: { vaultId: string; vaultIdentity?: string; displayName: string };
+	accountLabel: string;
+}
+
+/** envelope 读取结果（不消费）。 */
+export type PairingEnvelopeResult =
+	| { kind: "ok"; ciphertext: string; expiresAt: number; state: string }
+	/** 服务器没有 v2 端点（旧服务器把 /api/* 一律当需要认证 → 401/403/405） */
+	| { kind: "unsupported" }
+	/** 链接已失效（过期 / 已用 / 撤销 / 不存在）：code 来自服务端，无秘密时一律 NOT_FOUND */
+	| { kind: "gone"; code: string };
+
+/** 去掉末尾斜杠的服务器地址（公开端点拼接用）。 */
+function trimServer(serverUrl: string): string {
+	let s = serverUrl.trim();
+	while (s.endsWith("/")) s = s.slice(0, -1);
+	return s;
+}
+
+/**
+ * 读取配对包密文（公开、**不消费**；0.20 / ADR-014）。
+ *
+ * 新设备此刻没有凭据，调不了 /api/v1/info 去看能力位——所以用这个端点本身探测：
+ * 新服务器把它登记为公开路由（200/404/410），旧服务器对任何 /api/* 都要求认证（401）。
+ */
+export async function fetchPairingEnvelope(serverUrl: string, pairId: string): Promise<PairingEnvelopeResult> {
+	const res = await requestUrl({
+		url: `${trimServer(serverUrl)}/api/v2/pairings/${encodeURIComponent(pairId)}/envelope`,
+		method: "GET",
+		throw: false,
+	});
+	if (res.status === 401 || res.status === 403 || res.status === 405 || res.status === 501) return { kind: "unsupported" };
+	const body = tryJson(res.text);
+	if (res.status === 404 || res.status === 410) {
+		return { kind: "gone", code: typeof body?.code === "string" ? body.code : "NOT_FOUND" };
+	}
+	if (res.status !== 200) throw apiError(res.status, "pairing envelope failed", res.text);
+	if (typeof body?.ciphertext !== "string") throw new ApiError(res.status, "pairing envelope: malformed response");
+	return {
+		kind: "ok",
+		ciphertext: body.ciphertext,
+		expiresAt: num(body.expiresAt),
+		state: typeof body.state === "string" ? body.state : "issued",
+	};
+}
+
+/** v2 兑换请求体（exchangeId 由客户端生成并持久化，响应丢失时用同一个重试）。 */
+export interface RedeemRequest {
+	enrollmentSecret: string;
+	exchangeId: string;
+	expectedVaultId: string;
+	device: { name: string; platform: string; clientVersion: string };
+}
+
+export type RedeemResult =
+	| {
+			kind: "ok";
+			deviceId: string;
+			vaultId: string;
+			vaultIdentity?: string;
+			scopes: string;
+			deviceCredential: string;
+	  }
+	/** 服务端明确拒绝（不可用同一请求重试）：code 见约定 §0.1 */
+	| { kind: "rejected"; status: number; code: string }
+	/** 网络失败或 5xx：可以用**同一个 exchangeId** 重试 */
+	| { kind: "network"; message: string };
+
+/** 显式兑换一次性 grant 换取本设备凭据（公开：secret 即认证；0.20 / ADR-014 §5.3）。 */
+export async function redeemDeviceEnrollment(serverUrl: string, req: RedeemRequest): Promise<RedeemResult> {
+	let res;
+	try {
+		res = await requestUrl({
+			url: `${trimServer(serverUrl)}/api/v2/device-enrollments/redeem`,
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(req),
+			throw: false,
+		});
+	} catch (e) {
+		return { kind: "network", message: e instanceof Error ? e.message : String(e) };
+	}
+	if (res.status >= 500) return { kind: "network", message: `HTTP ${res.status}` };
+	const body = tryJson(res.text);
+	if (res.status !== 200 && res.status !== 201) {
+		return { kind: "rejected", status: res.status, code: typeof body?.code === "string" ? body.code : "NOT_FOUND" };
+	}
+	if (typeof body?.deviceCredential !== "string" || typeof body?.vaultId !== "string") {
+		return { kind: "rejected", status: res.status, code: "MALFORMED_RESPONSE" };
+	}
+	return {
+		kind: "ok",
+		deviceId: typeof body.deviceId === "string" ? body.deviceId : "",
+		vaultId: body.vaultId,
+		vaultIdentity: typeof body.vaultIdentity === "string" ? body.vaultIdentity : undefined,
+		scopes: Array.isArray(body.scopes) ? body.scopes.join(",") : typeof body.scopes === "string" ? body.scopes : "",
+		deviceCredential: body.deviceCredential,
+	};
 }
 
 /** 仅本机地址允许走 http://（Token 明文传输的唯一豁免场景）。 */

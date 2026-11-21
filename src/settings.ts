@@ -2,6 +2,8 @@ import { App, debounce, Modal, Notice, Platform, PluginSettingTab, SettingDefini
 import { ApiError, isLoopbackUrl } from "./api/client";
 import { TokenPromptModal } from "./token-prompt-modal";
 import type PrivateSyncPlugin from "./main";
+import type { TrustMigrationRecord } from "./crypto/trust-migration";
+import { summarizeStatus } from "./status-summary";
 import {
 	DEFAULT_BATCH_SECONDS,
 	DEFAULT_MTIME_GRANULARITY_SECONDS,
@@ -26,12 +28,22 @@ export interface PluginSettings {
 	vaultChoice: string;
 	debug: boolean;
 	/**
-	 * 信任此设备：解锁后把 VMK 用随机设备密钥包装存入 SecretStorage，
-	 * 之后启动自动解锁。E2EE 密码本身永远不持久化。
+	 * 可恢复密钥持久化（旧称「信任此设备」）：解锁后把 VMK 用随机设备密钥包装存入
+	 * SecretStorage，之后启动自动解锁。仓库密码本身永远不持久化。
+	 *
+	 * 0.20 起默认**关闭**（严格会话解锁，ADR-013）。旧版本默认开启遗留下来的材料
+	 * 由 trustMigration 状态机处理：先证明能用密码恢复同一把 VMK，再清理。
 	 */
 	trustDevice: boolean;
 	/** 设备密钥（base64，拆分包装的一半；另一半在 SecretStorage） */
 	deviceKeyB64: string;
+	/**
+	 * 密钥策略版本（0.20）：缺失 = 旧版本写下的 data.json，加载时执行一次策略迁移。
+	 * 刻意**不放进 DEFAULT_SETTINGS**——否则旧设置合并默认值后会被误判为已迁移。
+	 */
+	keyPolicyVersion?: number;
+	/** 旧「信任此设备」的迁移进度（ADR-013 状态机；null = 无需迁移） */
+	trustMigration?: TrustMigrationRecord | null;
 	/**
 	 * 实验功能：加密路径与文件名（v0.12.x 仍是 RC，LS-121-C01）。
 	 * 关闭时「加密路径与文件名」命令直接拒绝执行。
@@ -89,7 +101,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	ignorePatterns: ".trash/**\n.DS_Store\nThumbs.db",
 	vaultChoice: "",
 	debug: false,
-	trustDevice: true,
+	// 0.20：新安装默认严格会话解锁（ADR-013）
+	trustDevice: false,
 	deviceKeyB64: "",
 	experimentalMetaEncryption: false,
 	allowIrreversibleMetaErase: false,
@@ -120,67 +133,123 @@ export class SyncSettingTab extends PluginSettingTab {
 
 	getSettingDefinitions(): SettingDefinitionItem[] {
 		const plugin = this.plugin;
+		const configured = (): boolean => plugin.configured;
+		const ready = (): boolean => plugin.configured && plugin.bootstrapReady;
 		return [
+			// ── 首屏状态卡（UI 规格 D06）：已连接仓库 / 设备授权 / 仓库解锁 / 最近同步 / 冲突 + 唯一主按钮 ──
 			{
 				type: "group",
-				heading: "服务器",
+				cls: "litesync-status-card",
 				items: [
 					{
-						name: "Server URL",
-						desc: createFragment((frag) => {
-							frag.appendText("同步服务器地址，例如 https://sync.example.com。还没有服务器？");
-							// 指向自建部署指南（插件绝不代替用户下载/运行服务器程序）
-							frag.createEl("a", {
-								text: "查看部署指南（litesync-server）",
-								href: "https://github.com/KJoner/litesync-server",
-							});
-						}),
-						control: { type: "text", key: "serverUrl", placeholder: "https://sync.example.com" },
-					},
-					{
-						name: "API Token",
-						desc: "你的账户 API Token（lsk_ 开头；管理员也可用 OBSYNC_TOKEN）。保存在 Obsidian SecretStorage，不进入 data.json",
+						name: "LiteSync",
+						aliases: ["状态", "status", "连接", "解锁", "同步"],
 						render: (setting) => {
-							setting.addText((text) => {
-								text.inputEl.type = "password";
-								// 防抖提交（v0.18 / v11 设计 §4.6）：逐字符提交会让定时同步
-								// 拿着半截 Token 撞出假 401（一条常驻错误通知），还伴随
-								// 每键一次的 SecretStorage 写入与绑定作废抖动。
-								// 停顿 800ms 或失焦才算「输完了」。
-								const commit = debounce(
-									(value: string) => void plugin.setApiToken(value.trim()),
-									800,
-									true,
+							const summary = summarizeStatus(plugin.statusInput());
+							setting.setDesc(
+								createFragment((frag) => {
+									for (const line of summary.lines) {
+										const row = frag.createDiv({ cls: `litesync-status-line is-${line.tone}` });
+										row.createSpan({ cls: "litesync-status-label", text: `${line.label}：` });
+										row.createSpan({ text: line.value });
+									}
+								}),
+							);
+							for (const s of summary.secondary) {
+								setting.addButton((btn) =>
+									btn.setButtonText(s.label).onClick(() => plugin.runSecondaryAction(s.kind)),
 								);
-								text
-									.setPlaceholder("Token")
-									.setValue(plugin.getApiToken())
-									.onChange((value) => commit(value));
-								text.inputEl.addEventListener("blur", () => {
-									void plugin.setApiToken(text.inputEl.value.trim());
-								});
-							});
+							}
+							setting.addButton((btn) =>
+								btn
+									.setButtonText(summary.primary.label)
+									.setCta()
+									.setDisabled(summary.primary.label === "同步中…")
+									.onClick(() => plugin.runPrimaryAction(summary.primary.kind)),
+							);
 						},
-					},
-					{
-						name: "测试连接",
-						desc: "验证服务器地址与 Token 是否可用",
-						action: (el) => {
-							el.addClass("is-disabled");
-							void plugin.testConnection().then((msg) => {
-								// null = 已弹出「首次配置」对话框，无需再报消息
-								if (msg !== null) new Notice(msg);
-								el.removeClass("is-disabled");
-							});
-						},
-					},
-					{
-						name: "设备名称",
-						desc: "用于冲突文件命名和服务器日志，例如 MacBook",
-						control: { type: "text", key: "deviceName", placeholder: "MacBook" },
 					},
 				],
 			},
+			// ── 1. 连接与仓库 ──
+			{
+				type: "group",
+				heading: "连接与仓库",
+				items: [
+					{
+						name: "粘贴连接链接",
+						aliases: ["配对", "导入", "二维码", "pairing", "连接 Obsidian"],
+						desc:
+							"在 LiteSync 网页的仓库卡片上点「连接 Obsidian」，或在已接入的设备上点「添加新设备」，会得到一个 5 分钟内有效的链接/二维码。" +
+							"手机扫码后点「在 Obsidian 中打开」即可；没有反应时复制链接粘贴到这里。",
+						visible: () => !configured(),
+						action: () => plugin.openPasteLinkModal(),
+					},
+					{
+						name: "打开网页注册或登录",
+						aliases: ["注册", "登录", "账号", "官网", "新建仓库"],
+						desc: "还没有账号或仓库：在网页上注册、创建一个加密仓库，再回来粘贴它的连接链接。",
+						visible: () => !configured(),
+						action: () => plugin.openWebsite(),
+					},
+					{
+						name: "当前仓库",
+						aliases: ["仓库", "vault", "多仓库", "重命名"],
+						visible: configured,
+						render: (setting) => {
+							setting.setDesc("正在查询当前仓库…");
+							setting.addButton((btn) =>
+								btn.setButtonText("重命名…").onClick(() => new RenameVaultModal(plugin.app, plugin).open()),
+							);
+							void (async () => {
+								try {
+									const vaults = await plugin.listRemoteVaults();
+									const cur = vaults.find((v) => v.current);
+									if (!cur) {
+										setting.setDesc("尚未接入远端仓库（点上方「完成接入」）");
+										return;
+									}
+									plugin.rememberVaultName(cur.name);
+									const extra = vaults.length > 1 ? `；名下共 ${vaults.length} 个仓库` : "";
+									setting.setDesc(
+										`同步到「${cur.name || "默认仓库"}」（远端 ${cur.fileCount} 个文件${extra}）。` +
+											"一个 Obsidian 库同一时间只绑定一个远端仓库；切换或新建仓库请重新运行接入向导。",
+									);
+								} catch {
+									setting.setDesc("无法查询（离线，或服务器版本低于 v0.19）");
+								}
+							})();
+						},
+					},
+					{
+						name: "添加新设备",
+						aliases: ["配对", "二维码", "新设备"],
+						desc: "生成一次性加密连接链接/二维码（只能用一次，很快过期）：新设备导入后先核对仓库，再输入仓库密码。链接里不含仓库密码与长期 Token。",
+						visible: configured,
+						action: () => plugin.openAddDeviceModal(),
+					},
+					{
+						name: "设备列表",
+						aliases: ["设备", "撤销", "devices"],
+						desc: "查看已接入这个仓库的设备",
+						visible: configured,
+						action: () => plugin.openDeviceList(),
+					},
+					{
+						name: "导入另一个连接链接",
+						desc: "改连到另一个服务器或仓库：会暂停当前同步并重新走接入向导（本地笔记保留，同步记录作废）",
+						visible: configured,
+						action: () => plugin.openPasteLinkModal(),
+					},
+					{
+						name: "重新运行接入向导",
+						desc: "重新选择目标仓库（切换 / 新建）与首次同步方式",
+						visible: configured,
+						action: () => plugin.rerunBootstrapWizard(),
+					},
+				],
+			},
+			// ── 2. 同步 ──
 			{
 				type: "group",
 				heading: "同步",
@@ -221,66 +290,22 @@ export class SyncSettingTab extends PluginSettingTab {
 						control: { type: "textarea", key: "ignorePatterns", rows: 4 },
 					},
 					{
-						name: "立即同步",
-						desc: "手动触发一次完整同步",
-						action: () => void plugin.syncNow(),
+						name: "解决同步冲突",
+						desc: "逐个比较本地与远端版本，选择保留哪一份或合并",
+						visible: ready,
+						action: () => plugin.openConflicts(),
 					},
 				],
 			},
+			// ── 3. 加密与设备 ──
 			{
 				type: "group",
-				heading: "设备与迁移",
+				heading: "加密与设备",
 				items: [
 					{
-						name: "当前仓库",
-						aliases: ["仓库", "vault", "多仓库", "重命名"],
-						render: (setting) => {
-							setting.setDesc("正在查询当前仓库…");
-							setting.addButton((btn) =>
-								btn.setButtonText("重命名…").onClick(() => new RenameVaultModal(plugin.app, plugin).open()),
-							);
-							void (async () => {
-								try {
-									const vaults = await plugin.listRemoteVaults();
-									const cur = vaults.find((v) => v.current);
-									if (!cur) {
-										setting.setDesc("尚未接入远端仓库（运行接入向导完成绑定）");
-										return;
-									}
-									const extra = vaults.length > 1 ? `；名下共 ${vaults.length} 个仓库` : "";
-									setting.setDesc(
-										`同步到「${cur.name || "默认仓库"}」（远端 ${cur.fileCount} 个文件${extra}）。切换或新建仓库：重新运行接入向导。`,
-									);
-								} catch {
-									setting.setDesc("无法查询（离线，或服务器版本低于 v0.19）");
-								}
-							})();
-						},
-					},
-					{
-						name: "添加新设备",
-						desc: "生成一次性加密配对二维码/链接：新设备扫码即可自动导入服务器配置（E2EE 密码仍需手动输入）",
-						action: () => plugin.openAddDeviceModal(),
-					},
-					{
-						name: "导入配对链接",
-						desc: "粘贴在其他设备上生成的配对链接，导入其服务器配置",
-						action: () => plugin.openPasteLinkModal(),
-					},
-					{
-						name: "重新运行接入向导",
-						desc: "重新选择目标仓库（切换 / 新建）与接入方式（从远端恢复 / 合并）",
-						action: () => plugin.rerunBootstrapWizard(),
-					},
-				],
-			},
-			{
-				type: "group",
-				heading: "端到端加密 (E2EE)",
-				items: [
-					{
-						name: "状态",
-						aliases: ["E2EE", "端到端加密", "加密"],
+						name: "仓库加密",
+						aliases: ["E2EE", "端到端加密", "加密", "解锁", "锁定"],
+						visible: configured,
 						render: (setting) => {
 							const status = plugin.e2eeStatusText();
 							setting.setDesc(status.desc);
@@ -293,117 +318,241 @@ export class SyncSettingTab extends PluginSettingTab {
 						},
 					},
 					{
-						name: "信任此设备（保持解锁）",
+						name: "密钥保存方式",
+						aliases: ["信任此设备", "自动解锁", "严格会话解锁", "迁移"],
+						render: (setting) => {
+							setting.setDesc(plugin.keyPolicyText());
+							if (plugin.trustMigrationPending()) {
+								setting.addButton((btn) =>
+									btn
+										.setButtonText("迁移到严格会话解锁…")
+										.setCta()
+										.onClick(() => plugin.openTrustMigrationModal()),
+								);
+							}
+						},
+					},
+					{
+						name: "本地文件说明",
 						desc:
-							"解锁后将 Vault Master Key 用随机设备密钥包装存入 Obsidian SecretStorage，" +
-							"之后启动自动解锁。E2EE 密码本身永远不会被保存。",
-						control: { type: "toggle", key: "trustDevice" },
+							"设备授权只用来访问服务器上的密文；仓库解锁才带来解密能力。Obsidian 里已经下载到本地的 Markdown 与附件" +
+							"始终按宿主的正常方式以明文保存——锁定 LiteSync 只暂停同步与远端解密，不会加密或隐藏本地文件。",
+					},
+					{
+						name: "设备名称",
+						desc: "用于冲突文件命名与设备列表，例如 MacBook",
+						control: { type: "text", key: "deviceName", placeholder: "MacBook" },
 					},
 					{
 						name: "忘记此设备",
-						desc: "删除本设备保存的密钥包装并锁定；下次必须重新输入 E2EE 密码",
-						visible: () => plugin.hasTrustedDevice(),
+						desc: "删除本设备保存的自动解锁材料并立即锁定；下次必须重新输入仓库密码",
+						visible: () => plugin.hasTrustedDevice() && !plugin.trustMigrationPending(),
 						action: () => {
 							void plugin.forgetThisDevice().then(() => this.update());
 						},
 					},
 				],
 			},
+			// ── 4. 高级（子页面：手工连接、密钥持久化、高级恢复、隐私增强、实验功能、调试） ──
 			{
-				type: "group",
-				heading: "实验功能（RC，勿用于唯一真实 Vault）",
+				type: "page",
+				name: "高级",
+				desc: "手工填写服务器与 Token、密钥持久化、高级恢复、隐私增强、实验功能",
 				items: [
 					{
-						name: "加密路径与文件名（实验）",
-						desc: createFragment((frag) => {
-							frag.appendText(
-								"开启后才会出现「加密路径与文件名」命令。请只在测试 Vault 或已完整备份的副本上使用。",
-							);
-							frag.createEl("br");
-							frag.appendText("· 迁移前的服务器备份中仍含有明文路径——那既是回滚窗口，也是明文的最后残留处；");
-							frag.createEl("br");
-							frag.appendText("· 迁移到 verifying 之前随时可以无损放弃；complete 并抹除之后不可回滚；");
-							frag.createEl("br");
-							frag.appendText("· 所有设备都必须先升级，旧版本读不了伪名寻址的仓库。");
-							frag.createEl("br");
-							frag.appendText("· 动手前请先在服务器上执行 obsync migration preflight，它会检查有没有设备还没升级。");
-						}),
-						control: { type: "toggle", key: "experimentalMetaEncryption" },
+						type: "group",
+						heading: "手动连接",
+						items: [
+							{
+								name: "Server URL",
+								desc: createFragment((frag) => {
+									frag.appendText(
+										"同步服务器地址，例如 https://sync.example.com。一般不需要手填——粘贴连接链接会自动设置。",
+									);
+									frag.createEl("a", {
+										text: "自建服务器部署指南",
+										href: "https://github.com/KJoner/litesync-server",
+									});
+								}),
+								control: { type: "text", key: "serverUrl", placeholder: "https://sync.example.com" },
+							},
+							{
+								name: "API Token",
+								desc: "账户 API Token（lsk_ 开头）或本设备的设备凭据。保存在 Obsidian SecretStorage，不进入 data.json",
+								render: (setting) => {
+									setting.addText((text) => {
+										text.inputEl.type = "password";
+										// 防抖提交（v0.18 / v11 设计 §4.6）：逐字符提交会让定时同步
+										// 拿着半截 Token 撞出假 401（一条常驻错误通知），还伴随
+										// 每键一次的 SecretStorage 写入与绑定作废抖动。
+										// 停顿 800ms 或失焦才算「输完了」。
+										const commit = debounce(
+											(value: string) => void plugin.setApiToken(value.trim()),
+											800,
+											true,
+										);
+										text
+											.setPlaceholder("Token")
+											.setValue(plugin.getApiToken())
+											.onChange((value) => commit(value));
+										text.inputEl.addEventListener("blur", () => {
+											void plugin.setApiToken(text.inputEl.value.trim());
+										});
+									});
+								},
+							},
+							{
+								name: "测试连接",
+								desc: "验证服务器地址与 Token 是否可用",
+								action: (el) => {
+									el.addClass("is-disabled");
+									void plugin.testConnection().then((msg) => {
+										// null = 已弹出「首次配置」对话框，无需再报消息
+										if (msg !== null) new Notice(msg);
+										el.removeClass("is-disabled");
+									});
+								},
+							},
+						],
 					},
 					{
-						name: "允许不可逆的明文路径抹除（开发者）",
-						desc:
-							"默认关闭。关闭时迁移会停在「已伪名化但未抹除」的**可回退**状态——" +
-							"这是绝大多数情况下你想要的。开启后 complete 会真正覆写数据库、WAL 与 blob 中残留的明文路径，" +
-							"并用哨兵扫描验证覆写生效；这一步**不可逆**，此后只能依靠迁移前的备份恢复。" +
-							"隐私 tombstone ledger 已在 v0.13.0 落地，删除屏障在抹除后仍然完整保留。",
-						visible: () => plugin.settings.experimentalMetaEncryption,
-						control: { type: "toggle", key: "allowIrreversibleMetaErase" },
+						type: "group",
+						heading: "密钥持久化",
+						items: [
+							{
+								name: "本设备自动解锁（可恢复密钥持久化）",
+								aliases: ["信任此设备", "保持解锁"],
+								desc:
+									"默认关闭（严格会话解锁）。开启后，解锁时会把仓库主密钥用随机设备密钥包装：一半存插件 data.json，" +
+									"另一半存 Obsidian SecretStorage，之后启动自动解锁。仓库密码本身不保存；但拿到本设备完整文件与应用数据的人" +
+									"可能因此解开你的笔记。只在你完全掌控的设备上开启。",
+								control: { type: "toggle", key: "trustDevice" },
+							},
+						],
 					},
 					{
-						name: "放弃路径加密迁移",
-						desc: "把仓库的元数据状态从 migrating 退回 plain；已伪名化的文件保持可用，不做任何破坏性操作",
-						visible: () => plugin.metaMigrationActive(),
-						action: () => void plugin.abortMetaMigration(),
-					},
-				],
-			},
-			{
-				type: "group",
-				heading: "隐私增强",
-				items: [
-					{
-						name: "混淆文件大小",
-						desc: createFragment((frag) => {
-							frag.appendText(
-								"把密文填充到桶边界，服务器只看得到大小区间而不是精确字节数。" +
-									"精确大小本身就是内容：已知文档的字节数命中即确认，同一文件的大小序列画出的是编辑节奏。",
-							);
-							frag.createEl("br");
-							frag.appendText("· 成本：单个对象最坏多占 12.5%；小于 4KB 的对象一律按 4KB 计；");
-							frag.createEl("br");
-							frag.appendText("· 只影响开启之后新写入的内容，已有文件在下次修改时才会被填充；");
-							frag.createEl("br");
-							frag.appendText("· 仓库内去重不受影响（填充在密文内部，同样的内容仍得到同样的密文）。");
-						}),
-						control: { type: "toggle", key: "padObjectSizes" },
+						type: "group",
+						heading: "高级恢复",
+						items: [
+							{
+								name: "用本地完整替换远端",
+								aliases: ["覆盖远端", "本地为准", "恢复"],
+								desc:
+									"高风险：以本设备的同步范围为准，覆盖远端的不同文件、删除远端多出来的文件（删除留有记录，可从历史恢复）。" +
+									"执行前会生成完整的差异预览、保存远端原始版本作为恢复点，并要求输入仓库名确认。" +
+									"只想把空仓库初始化成本地内容时，请用接入向导里的「用本地初始化空仓库」。",
+								visible: ready,
+								action: () => plugin.openReplaceRemote(),
+							},
+						],
 					},
 					{
-						name: "混淆同步时机",
-						desc: createFragment((frag) => {
-							frag.appendText(
-								"把上传对齐到时间窗口并加随机抖动，服务器只能判断编辑发生在哪个窗口里，" +
-									"而不是精确到秒。请求节奏本身就是一份打字记录：作息、时区、" +
-									"工作日与假期、此刻是否醒着，都能从中推断。",
-							);
-							frag.createEl("br");
-							frag.appendText(
-								timingDisclosure(
-									plugin.settings.timingBatchSeconds,
-									plugin.settings.mtimeGranularitySeconds,
-								),
-							);
-							frag.createEl("br");
-							frag.appendText("·「立即同步」命令不受影响，用户显式要求的动作不会被推迟。");
-						}),
-						control: { type: "toggle", key: "obfuscateTiming" },
+						type: "group",
+						heading: "隐私增强",
+						items: [
+							{
+								name: "混淆文件大小",
+								desc: createFragment((frag) => {
+									frag.appendText(
+										"把密文填充到桶边界，服务器只看得到大小区间而不是精确字节数。" +
+											"精确大小本身就是内容：已知文档的字节数命中即确认，同一文件的大小序列画出的是编辑节奏。",
+									);
+									frag.createEl("br");
+									frag.appendText("· 成本：单个对象最坏多占 12.5%；小于 4KB 的对象一律按 4KB 计；");
+									frag.createEl("br");
+									frag.appendText("· 只影响开启之后新写入的内容，已有文件在下次修改时才会被填充；");
+									frag.createEl("br");
+									frag.appendText("· 仓库内去重不受影响（填充在密文内部，同样的内容仍得到同样的密文）。");
+								}),
+								control: { type: "toggle", key: "padObjectSizes" },
+							},
+							{
+								name: "只填充这些路径（每行一个前缀）",
+								desc: "留空表示对全部文件生效。多数人只有一小部分笔记值得为它多花空间。",
+								visible: () => plugin.settings.padObjectSizes,
+								control: { type: "textarea", key: "padPathPrefixes" },
+							},
+							{
+								name: "混淆同步时机",
+								desc: createFragment((frag) => {
+									frag.appendText(
+										"把上传对齐到时间窗口并加随机抖动，服务器只能判断编辑发生在哪个窗口里，" +
+											"而不是精确到秒。请求节奏本身就是一份打字记录：作息、时区、" +
+											"工作日与假期、此刻是否醒着，都能从中推断。",
+									);
+									frag.createEl("br");
+									frag.appendText(
+										timingDisclosure(
+											plugin.settings.timingBatchSeconds,
+											plugin.settings.mtimeGranularitySeconds,
+										),
+									);
+									frag.createEl("br");
+									frag.appendText("·「立即同步」命令不受影响，用户显式要求的动作不会被推迟。");
+								}),
+								control: { type: "toggle", key: "obfuscateTiming" },
+							},
+						],
 					},
 					{
-						name: "只填充这些路径（每行一个前缀）",
-						desc: "留空表示对全部文件生效。多数人只有一小部分笔记值得为它多花空间。",
-						visible: () => plugin.settings.padObjectSizes,
-						control: { type: "textarea", key: "padPathPrefixes" },
+						type: "page",
+						name: "实验功能（RC，勿用于唯一真实 Vault）",
+						desc: "加密路径与文件名等仍在验证中的能力",
+						items: [
+							{
+								type: "group",
+								heading: "加密路径与文件名",
+								items: [
+									{
+										name: "加密路径与文件名（实验）",
+										desc: createFragment((frag) => {
+											frag.appendText(
+												"开启后才会出现「加密路径与文件名」命令。请只在测试 Vault 或已完整备份的副本上使用。",
+											);
+											frag.createEl("br");
+											frag.appendText(
+												"· 迁移前的服务器备份中仍含有明文路径——那既是回滚窗口，也是明文的最后残留处；",
+											);
+											frag.createEl("br");
+											frag.appendText("· 迁移到 verifying 之前随时可以无损放弃；complete 并抹除之后不可回滚；");
+											frag.createEl("br");
+											frag.appendText("· 所有设备都必须先升级，旧版本读不了伪名寻址的仓库。");
+											frag.createEl("br");
+											frag.appendText(
+												"· 动手前请先在服务器上执行 obsync migration preflight，它会检查有没有设备还没升级。",
+											);
+										}),
+										control: { type: "toggle", key: "experimentalMetaEncryption" },
+									},
+									{
+										name: "允许不可逆的明文路径抹除（开发者）",
+										desc:
+											"默认关闭。关闭时迁移会停在「已伪名化但未抹除」的可回退状态——" +
+											"这是绝大多数情况下你想要的。开启后 complete 会真正覆写数据库、WAL 与 blob 中残留的明文路径，" +
+											"并用哨兵扫描验证覆写生效；这一步不可逆，此后只能依靠迁移前的备份恢复。",
+										visible: () => plugin.settings.experimentalMetaEncryption,
+										control: { type: "toggle", key: "allowIrreversibleMetaErase" },
+									},
+									{
+										name: "放弃路径加密迁移",
+										desc: "把仓库的元数据状态从 migrating 退回 plain；已伪名化的文件保持可用，不做任何破坏性操作",
+										visible: () => plugin.metaMigrationActive(),
+										action: () => void plugin.abortMetaMigration(),
+									},
+								],
+							},
+						],
 					},
-				],
-			},
-			{
-				type: "group",
-				heading: "调试",
-				items: [
 					{
-						name: "Debug 日志",
-						desc: "在开发者控制台输出同步日志",
-						control: { type: "toggle", key: "debug" },
+						type: "group",
+						heading: "调试",
+						items: [
+							{
+								name: "Debug 日志",
+								desc: "在开发者控制台输出同步日志",
+								control: { type: "toggle", key: "debug" },
+							},
+						],
 					},
 				],
 			},

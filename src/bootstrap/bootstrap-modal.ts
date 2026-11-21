@@ -7,9 +7,11 @@ import {
 	bootstrapLocalInit,
 	bootstrapMerge,
 	bootstrapRemoteWins,
+	completeBootstrap,
 	preflight,
 	PreflightResult,
 } from "./bootstrap-manager";
+import { ReplaceRemoteModal } from "./replace-remote-modal";
 import { classifyBootstrap, vaultPickerVisible } from "./bootstrap-types";
 
 export interface BootstrapWizardHooks {
@@ -28,10 +30,10 @@ export interface BootstrapWizardHooks {
 	setVaultChoice?: (vaultId: string) => Promise<void>;
 	/** 当前的目标仓库选择（settings.vaultChoice；空 = 默认仓库） */
 	vaultChoice?: () => string;
-	/** 「信任此设备」的当前设置（空远端 E2EE 直通道的弹窗默认值） */
-	trustDevice?: () => boolean;
-	/** 持久化「信任此设备」（同上） */
-	setTrustDevice?: (value: boolean) => Promise<void>;
+	/** 解锁/启用弹窗里的密钥策略提示（0.20：严格会话解锁 / 显式持久化 / 待迁移） */
+	keyNote?: () => string;
+	/** 拿到密钥之后的回调（用户显式开启了可恢复密钥持久化时写入本设备材料） */
+	afterKeyAvailable?: () => Promise<void>;
 	/**
 	 * 保存账户 API Token（写 SecretStorage，与设置页填写等效）。
 	 * 配对导入的设备持设备凭据，切换/新建仓库时在向导内直接补填，
@@ -244,13 +246,13 @@ export class BootstrapWizardModal extends Modal {
 	 * WAL/备份，与新仓库的隐私预期不符；既有明文仓库（远端非空）不受影响。
 	 */
 	private renderE2eeButton(footer: HTMLElement): void {
-		footer.createEl("button", { text: "设置 E2EE 密码并初始化", cls: "mod-cta" }).onclick = () => {
+		footer.createEl("button", { text: "用本地初始化空仓库（设置仓库密码）", cls: "mod-cta" }).onclick = () => {
 			new EnableE2eeModal(
 				this.app,
-				this.hooks.trustDevice?.() ?? false,
-				async (password, trustDevice) => {
+				this.hooks.keyNote?.() ?? "",
+				async (password) => {
 					await enableE2eeOnEmptyRemote(this.ctx, password);
-					await this.hooks.setTrustDevice?.(trustDevice);
+					await this.hooks.afterKeyAvailable?.();
 					// 必须在启用 E2EE 之后重跑 preflight：completeBootstrap 会把 pending
 					// binding 里的 keyEpoch 写进正式 binding，用启用前的旧值（0）会产出
 					// AAD 错绑的密文（与 main.ts 首次配置三选项同一条约束）
@@ -266,6 +268,49 @@ export class BootstrapWizardModal extends Modal {
 				},
 			).open();
 		};
+	}
+
+	/**
+	 * 接入向导里的「用本地完整替换远端」（ADR-016）：作业完成后以 local-replace 模式完成接入。
+	 *
+	 * 完成接入时**不再**跑 preflight：那会因为账本归属尚未确立而把作业刚建立的跟踪状态
+	 * 当成「别的仓库的旧账」整本作废。直接用 /info 与作业记录的计划水位完成接入——
+	 * 水位之后的变更已核对全是本作业写入的，普通同步拉到它们时按 serverHash 直接对齐。
+	 */
+	private async openReplace(): Promise<void> {
+		let name = "";
+		try {
+			name = (await this.ctx.client.listVaults()).find((v) => v.current)?.name ?? "";
+		} catch {
+			/* 旧服务器：用默认短语确认 */
+		}
+		new ReplaceRemoteModal(this.app, this.ctx, {
+			bootstrapContext: true,
+			vaultName: name,
+			vaultChoice: this.hooks.vaultChoice?.() ?? "",
+			// 接入向导期间 bootstrap 仍是 pending，普通同步本来就被拦住
+			holdSync: () => {},
+			releaseSync: () => {},
+			onCompleted: async (job) => {
+				const info = await this.ctx.client.info();
+				completeBootstrap(
+					this.ctx,
+					{
+						info,
+						snapshotSequence: job.plannedHeadSequence,
+						repoEpoch: job.repoEpoch,
+						remoteFiles: [],
+						localPaths: [],
+						commonCount: 0,
+						e2eeEnabled: this.ctx.e2ee.enabled,
+					},
+					"local-replace",
+				);
+				await this.ctx.store.save();
+				this.close();
+				this.hooks.onDone();
+			},
+		}).open();
 	}
 
 	private async runPreflight(): Promise<void> {
@@ -371,29 +416,21 @@ export class BootstrapWizardModal extends Modal {
 			}
 			case "both": {
 				contentEl.createEl("p", {
-					text: `当前 Vault 已包含 ${pre.localPaths.length} 个文件，远端也已有 ${pre.remoteFiles.length} 个文件。请选择接入方式：`,
+					text: `当前 Vault 已包含 ${pre.localPaths.length} 个文件，远端也已有 ${pre.remoteFiles.length} 个文件。请选择首次同步方式：`,
 				});
+				const remoteOnly = pre.remoteFiles.length - pre.commonCount;
+				const localOnly = pre.localPaths.length - pre.commonCount;
 
-				const optA = contentEl.createDiv({ cls: "litesync-hunk" });
-				optA.createDiv({ cls: "litesync-hunk-label", text: "从远端恢复，替换本地内容（推荐用于新设备）" });
-				optA.createDiv({
-					cls: "litesync-history-meta",
-					text: "本设备上的同步文件将以远端版本为准；本地不同的内容会先进入回收站，不会永久删除。",
-				});
-				const btnA = optA.createEl("button", { text: "从远端恢复此设备", cls: "mod-cta" });
-				btnA.onclick = () =>
-					void run(btnA, "恢复", async () => {
-						await bootstrapRemoteWins(this.ctx, pre, onProgress);
-						new Notice("已从远端恢复此设备 ✓（被替换的本地内容在回收站）");
-					});
-
+				// ① 合并（推荐默认，UI 规格 D03）：两边都不丢
 				const optB = contentEl.createDiv({ cls: "litesync-hunk" });
-				optB.createDiv({ cls: "litesync-hunk-label", text: "保留本地内容，与远端合并" });
+				optB.createDiv({ cls: "litesync-hunk-label", text: "合并本地与远端（推荐）" });
 				optB.createDiv({
 					cls: "litesync-history-meta",
-					text: "两边数据都不丢：互补文件互相同步；同路径不同内容的 Markdown 进入冲突解决器，其他文件保留两个版本。",
+					text:
+						`两边数据都不丢：远端独有的 ${remoteOnly} 个下载到本地、本地独有的 ${localOnly} 个上传；` +
+						`同路径的 ${pre.commonCount} 个内容相同即直接对齐，不同的 Markdown 进入冲突解决器（没有共同祖先时不强行合并），其他文件保留两个版本。`,
 				});
-				const btnB = optB.createEl("button", { text: "与远端合并" });
+				const btnB = optB.createEl("button", { text: "合并本地与远端", cls: "mod-cta" });
 				btnB.onclick = () =>
 					void run(btnB, "合并", async () => {
 						const r = await bootstrapMerge(this.ctx, pre, onProgress);
@@ -403,6 +440,39 @@ export class BootstrapWizardModal extends Modal {
 							10000,
 						);
 					});
+
+				// ② 远端替换本地
+				const optA = contentEl.createDiv({ cls: "litesync-hunk" });
+				optA.createDiv({ cls: "litesync-hunk-label", text: "从远端恢复本地（远端替换本地）" });
+				optA.createDiv({
+					cls: "litesync-history-meta",
+					text:
+						`本设备的同步范围以远端为准：下载远端独有的 ${remoteOnly} 个；同路径的 ${pre.commonCount} 个中内容不同的以远端覆盖；` +
+						`本地独有的 ${localOnly} 个移除。被覆盖或移除的本地文件先进入回收站（Obsidian 的 .trash 或系统回收站），回收失败就保留并停止，不会永久删除。`,
+				});
+				const btnA = optA.createEl("button", { text: "从远端恢复此设备" });
+				btnA.onclick = () =>
+					void run(btnA, "恢复", async () => {
+						await bootstrapRemoteWins(this.ctx, pre, onProgress);
+						new Notice("已从远端恢复此设备 ✓（被替换的本地内容在回收站）");
+					});
+
+				// ③ 本地替换远端：高级恢复作业（ADR-016），与「初始化空仓库」分开命名
+				const optC = contentEl.createDiv({ cls: "litesync-hunk" });
+				const unfinished = this.ctx.store.state.replaceJob;
+				optC.createDiv({ cls: "litesync-hunk-label", text: "用本地完整替换远端（高级恢复，高风险）" });
+				optC.createDiv({
+					cls: "litesync-history-meta",
+					text:
+						"远端变成本设备的样子：不同的被本地覆盖、远端多出来的被删除（留有删除记录）。会先生成完整差异预览、" +
+						"保存远端原始版本作为恢复点，并要求输入仓库名确认；其他设备下次同步会收到这些变化。",
+				});
+				const btnC = optC.createEl("button", {
+					text: unfinished && unfinished.bootstrapContext && unfinished.state !== "completed" && unfinished.state !== "abandoned"
+						? "继续未完成的替换作业…"
+						: "预览本地替换远端…",
+				});
+				btnC.onclick = () => void this.openReplace();
 				break;
 			}
 		}

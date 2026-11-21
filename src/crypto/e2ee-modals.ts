@@ -1,28 +1,31 @@
 import { App, Modal, Notice } from "obsidian";
 import { MigrationProgress } from "./migration";
 
-/** 解锁弹窗：输入 E2EE 密码 + 是否信任此设备。onSubmit 返回错误信息或 null（成功）。 */
+/**
+ * 解锁弹窗：输入仓库密码。onSubmit 返回错误信息或 null（成功）。
+ *
+ * 0.20（ADR-013）起不再有「信任此设备」勾选框：新安装默认严格会话解锁，
+ * 「可恢复密钥持久化」只能在高级设置里**显式**开启。keyNote 由调用方按当前策略
+ * 生成，告诉用户这次解锁会不会在本设备留下可自动还原密钥的材料。
+ */
 export class UnlockModal extends Modal {
 	private busy = false;
 
 	constructor(
 		app: App,
-		private defaultTrust: boolean,
-		private onSubmit: (password: string, trustDevice: boolean) => Promise<string | null>,
+		private keyNote: string,
+		private onSubmit: (password: string) => Promise<string | null>,
 	) {
 		super(app);
 	}
 
 	onOpen(): void {
-		this.titleEl.setText("解锁端到端加密");
+		this.titleEl.setText("解锁仓库");
 		const { contentEl } = this;
-		contentEl.createDiv({ text: "输入 E2EE 密码以解锁同步（密码只在内存中使用，不会被保存）。" });
+		contentEl.createDiv({ text: "输入这个仓库的密码（端到端加密）以解锁同步。密码只在内存中使用，不会被保存。" });
 		const input = contentEl.createEl("input", { type: "password", cls: "litesync-modal-input" });
-
-		const trustLabel = contentEl.createEl("label", { cls: "litesync-trust-label" });
-		const trustBox = trustLabel.createEl("input", { type: "checkbox" });
-		trustBox.checked = this.defaultTrust;
-		trustLabel.appendText(" 信任此设备（之后启动自动解锁）");
+		input.setAttribute("autocomplete", "current-password");
+		contentEl.createDiv({ cls: "litesync-history-meta", text: this.keyNote });
 
 		const errorEl = contentEl.createDiv({ cls: "litesync-history-meta" });
 		const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
@@ -34,7 +37,7 @@ export class UnlockModal extends Modal {
 			btn.setText("解锁中…");
 			btn.disabled = true;
 			try {
-				const err = await this.onSubmit(input.value, trustBox.checked);
+				const err = await this.onSubmit(input.value);
 				if (err === null) {
 					this.close();
 					return;
@@ -48,24 +51,24 @@ export class UnlockModal extends Modal {
 		};
 		btn.onclick = () => void submit();
 		input.addEventListener("keydown", (e) => {
-			if (e.key === "Enter") void submit();
+			if (e.key === "Enter") {
+				// iOS：回车提交并收起软键盘（底部按钮可能被键盘挡住）
+				input.blur();
+				void submit();
+			}
 		});
 		window.setTimeout(() => input.focus(), 50);
 	}
 }
 
-/** 启用 E2EE 弹窗：设置密码 + 是否信任此设备 + 执行迁移。 */
+/** 启用 E2EE 弹窗：设置仓库密码 + 执行迁移（或空仓直接启用）。 */
 export class EnableE2eeModal extends Modal {
 	private busy = false;
 
 	constructor(
 		app: App,
-		private defaultTrust: boolean,
-		private onEnable: (
-			password: string,
-			trustDevice: boolean,
-			onProgress: (p: MigrationProgress) => void,
-		) => Promise<number>,
+		private keyNote: string,
+		private onEnable: (password: string, onProgress: (p: MigrationProgress) => void) => Promise<number>,
 		/** 场景化文案（如首次配置的空仓启用——那时没有迁移，默认文案会说谎） */
 		private copy?: { note?: string; success?: (migrated: number) => string },
 	) {
@@ -81,7 +84,7 @@ export class EnableE2eeModal extends Modal {
 		});
 		const strong = warn.createEl("p");
 		strong.createEl("strong", {
-			text: "⚠️ 密码一旦丢失，服务器上的数据将永远无法恢复；本版本不支持关闭 E2EE 或修改密码。",
+			text: "⚠️ 仓库密码与账号登录密码无关，丢失后服务器上的数据将永远无法恢复——重置账号密码也找不回它。",
 		});
 		warn.createEl("p", {
 			text:
@@ -89,15 +92,13 @@ export class EnableE2eeModal extends Modal {
 				"迁移过程会把当前所有文件重新加密上传，并在验证密文后清理服务器上的明文历史。请确保其他设备此刻不在同步。",
 		});
 
-		contentEl.createDiv({ text: "设置 E2EE 密码（至少 8 个字符）：" });
+		contentEl.createDiv({ text: "设置仓库密码（至少 8 个字符）：" });
 		const pw1 = contentEl.createEl("input", { type: "password", cls: "litesync-modal-input" });
+		pw1.setAttribute("autocomplete", "new-password");
 		contentEl.createDiv({ text: "再次输入确认：" });
 		const pw2 = contentEl.createEl("input", { type: "password", cls: "litesync-modal-input" });
-
-		const trustLabel = contentEl.createEl("label", { cls: "litesync-trust-label" });
-		const trustBox = trustLabel.createEl("input", { type: "checkbox" });
-		trustBox.checked = this.defaultTrust;
-		trustLabel.appendText(" 信任此设备（之后启动自动解锁）");
+		pw2.setAttribute("autocomplete", "new-password");
+		contentEl.createDiv({ cls: "litesync-history-meta", text: this.keyNote });
 
 		const progressEl = contentEl.createDiv({ cls: "litesync-history-meta" });
 		const errorEl = contentEl.createDiv({ cls: "litesync-history-meta" });
@@ -132,7 +133,7 @@ export class EnableE2eeModal extends Modal {
 			btn.disabled = true;
 			btn.setText("迁移中…");
 			try {
-				const migrated = await this.onEnable(pw1.value, trustBox.checked, (p) => {
+				const migrated = await this.onEnable(pw1.value, (p) => {
 					progressEl.setText(`加密迁移中 ${p.done}/${p.total}：${p.current}`);
 				});
 				new Notice(this.copy?.success?.(migrated) ?? `端到端加密已启用，共迁移 ${migrated} 个文件 ✓`, 10000);

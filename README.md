@@ -11,7 +11,24 @@ Works on desktop and mobile (Obsidian 1.13+).
 > one command (runs happily on a 1-core / 256MB VPS):
 > **<https://github.com/KJoner/litesync-server>**
 
-## Getting started (first device)
+## Getting started with a vault created on the web (server ≥ v0.20)
+
+1. Sign up or sign in on the LiteSync web app, create a vault and choose its **vault
+   password** (separate from your account password; encryption is initialized in your browser)
+2. On the vault card, click **Connect Obsidian** to get a link / QR code that is valid for
+   5 minutes and works once
+3. Install LiteSync in Obsidian → on the first settings screen click **Paste connection link**
+   (on a phone: scan with the system camera → **Open in Obsidian**) → **review the server,
+   account and vault** → confirm
+4. Enter the vault password, then pick how this device should do its first sync (the
+   recommended default is *merge local and remote*)
+
+The link only carries a one-time enrollment secret — no long-lived token, no vault password.
+Opening or refreshing the landing page does not use it up; it is redeemed only when you
+confirm inside Obsidian, and a redemption interrupted by a network failure can be retried
+with the same exchange id without creating a second device.
+
+## Getting started (self-hosted, manual setup)
 
 1. Deploy the server — one line on your VPS, it prints your API token when done:
 
@@ -19,12 +36,12 @@ Works on desktop and mobile (Obsidian 1.13+).
    bash <(wget -qO- https://raw.githubusercontent.com/KJoner/litesync-server/master/scripts/litesync-install.sh)
    ```
 
-2. Install LiteSync in Obsidian and open its settings
+2. Install LiteSync in Obsidian and open Settings → **Advanced → Manual connection**
 3. Fill in **Server URL** and **API Token**, hit **Test Connection**
 4. If the remote vault is still empty, the test offers the next step right
-   there: **Close** / **Sync now** / **Add E2EE and sync now**. On an empty
-   vault there is no migration — the very first upload is already ciphertext,
-   so your notes never reach the server in plaintext
+   there: **Close** / **Set up E2EE and sync now** (new vaults are always end-to-end
+   encrypted). On an empty vault there is no migration — the very first upload is already
+   ciphertext, so your notes never reach the server in plaintext
 5. Otherwise the onboarding wizard opens and asks how this device should join
    the existing remote vault
 
@@ -34,16 +51,18 @@ That's it — edits now sync automatically in the background.
 
 You never type the server config twice:
 
-1. On a configured device: Settings → **Devices & migration** → **Add device**
+1. On a configured device: Settings → **Connection & vault** → **Add device** (or
+   **Connect Obsidian** on the web vault card)
 2. On the new device: install LiteSync, then scan the QR code with the system
-   camera (or open the pairing link) → **Open in Obsidian** → confirm import
-3. If E2EE is enabled, type your password once (it is never transmitted)
-4. In the onboarding wizard, pick **Restore from remote** — done
+   camera (or open the link) → **Open in Obsidian** → **review the vault** → confirm
+   (server ≥ v0.20; older servers can only show you the server, not the vault)
+3. Type the vault password once (it is never transmitted)
+4. Pick the first-sync mode in the onboarding wizard — done
 
-The pairing package is encrypted on-device and expires in 5 minutes after a
-single use; the server only ever sees ciphertext. If your vault on the new
-device already has notes, the wizard offers a safe **merge** instead — nothing
-is ever silently overwritten, and nothing is ever permanently deleted.
+The pairing package is encrypted on-device, expires quickly and works once;
+the server only ever sees ciphertext. If your vault on the new device already
+has notes, the wizard recommends a safe **merge** — nothing is ever silently
+overwritten, and nothing is ever permanently deleted.
 
 ## Features
 
@@ -58,8 +77,16 @@ is ever silently overwritten, and nothing is ever permanently deleted.
 - **End-to-end encryption** — PBKDF2 (600k iterations) + AES-256-GCM; the
   password and master key never leave your devices, the server only ever
   stores ciphertext
-- **Trusted device** — remember device authorization (split-key wrapping via
-  Obsidian SecretStorage) instead of your password
+- **Strict session unlock (default since 0.20)** — the vault password and the
+  key material derived from it are never persisted: after a restart, lock or vault
+  switch you unlock again. Keeping the device unlocked across restarts (split-key
+  wrapping via Obsidian SecretStorage) is an explicit opt-in under Advanced. Devices
+  upgraded from 0.19 keep auto-unlocking until you prove you can unlock with the
+  password — only then is the old material cleared. Locking LiteSync never encrypts
+  the Markdown files Obsidian already keeps on disk
+- **Advanced recovery: replace remote with local** — a previewed, confirmed,
+  resumable job with a recovery point and a one-click rollback (distinct from
+  initializing an empty vault)
 - **Metadata privacy (optional, off by default)** — *size obfuscation* pads
   ciphertext to bucket boundaries so the server sees a size range instead of an
   exact byte count (worst case +12.5%), and *timing obfuscation* aligns uploads
@@ -199,9 +226,12 @@ The accurate claim is:
 > still hide a file you have never seen.
 
 Signed checkpoints (v0.15) are signed by your **devices**, never by the server.
-A new device does not trust the first manifest the server offers — it receives a
-trusted anchor through device pairing, whose key travels only in the link's
-`#fragment`.
+When you add a device from one that already holds a **verified** checkpoint anchor
+(0.20+), the anchor travels inside the encrypted pairing package — whose key lives
+only in the link's `#fragment`, so the server can neither read nor alter it — and the
+connect dialog says so. Links issued from the web, or from a device that has no anchor
+yet, make the new device **trust the server's current state on first use**; the UI
+states this plainly instead of calling it verified.
 
 ### What the server still learns even with E2EE on
 

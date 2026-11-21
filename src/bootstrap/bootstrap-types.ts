@@ -3,7 +3,11 @@
  * 必须先通过接入向导明确「本地与远端的关系」。
  */
 
-export type BootstrapMode = "remote-wins" | "merge" | "local-init" | "legacy";
+/**
+ * 接入方式。local-init 只用于**空**远端；local-replace（0.20 / ADR-016）是
+ * 「用本地完整替换非空远端」的高级恢复作业完成后的接入记录——两者刻意分开命名。
+ */
+export type BootstrapMode = "remote-wins" | "merge" | "local-init" | "local-replace" | "legacy";
 
 export interface BootstrapState {
 	/**

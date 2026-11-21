@@ -8,6 +8,7 @@ import { isFileId, isGeneration } from "../utils/validate";
 import { TrustAnchor } from "../sync/freshness";
 import { evalFailpoint, FP } from "../utils/failpoint";
 import { platformCollisionKey } from "../utils/vault-path";
+import type { ReplaceJob } from "../bootstrap/replace-types";
 
 /**
  * 每个已同步文件的本地状态缓存。
@@ -245,6 +246,24 @@ export interface PersistedState {
 	 * 恢复合并完成后清除。存在时接入向导走恢复流程而不是普通接入。
 	 */
 	recovery: RecoveryState | null;
+	/**
+	 * 配对包携带的已验证信任锚（0.20 / ADR-014）：导入时暂存，**接入完成时**才采纳。
+	 *
+	 * 不在导入那一刻直接写进 trustAnchor：向导的 preflight 发现旧账本属于别的仓库时
+	 * 会整本作废（含信任锚）——锚得等账本归属确立、且 vaultIdentity 与 repoEpoch
+	 * 都与配对包一致之后再落到正式位置。
+	 */
+	pendingPairingTrust: PendingPairingTrust | null;
+	/** 「用本地完整替换远端」作业（0.20 / ADR-016）：进行中或最近一次 */
+	replaceJob: ReplaceJob | null;
+}
+
+/** 导入端暂存的配对信任锚。 */
+export interface PendingPairingTrust {
+	/** 配对包里核对过的仓库身份（= v1 info.vaultId） */
+	vaultIdentity: string;
+	anchor: { repoEpoch: string; checkpointHash: string; headSequence: number; devicePublicKeys: Record<string, string> };
+	receivedAt: number;
 }
 
 function emptyState(): PersistedState {
@@ -266,6 +285,8 @@ function emptyState(): PersistedState {
 		checkpointChain: [],
 		binding: null,
 		recovery: null,
+		pendingPairingTrust: null,
+		replaceJob: null,
 	};
 }
 
@@ -898,6 +919,8 @@ function normalizeState(raw: Partial<PersistedState>): PersistedState {
 		checkpointChain: Array.isArray(raw.checkpointChain) ? raw.checkpointChain.slice(-64) : [],
 		binding: normalizeBinding(raw.binding),
 		recovery: raw.recovery && typeof raw.recovery === "object" ? raw.recovery : null,
+		pendingPairingTrust: normalizePendingPairingTrust(raw.pendingPairingTrust),
+		replaceJob: normalizeReplaceJob(raw.replaceJob),
 	};
 	// v0.2 状态升级：当时全部为明文，serverHash 与 hash 相同
 	for (const fs of Object.values(state.files)) {
@@ -1027,6 +1050,39 @@ function normalizeBlockedChanges(raw: unknown): Record<string, BlockedChange> {
  * 宁可「没有信任链」也不要「半个信任链」：一个缺了公钥集合的锚会让
  * 所有 checkpoint 都被判成 unknown-signer，用户只会看到同步莫名其妙地停了。
  */
+function normalizePendingPairingTrust(raw: unknown): PendingPairingTrust | null {
+	if (!raw || typeof raw !== "object") return null;
+	const p = raw as Partial<PendingPairingTrust>;
+	const a = p.anchor;
+	if (typeof p.vaultIdentity !== "string" || !a || typeof a !== "object") return null;
+	if (typeof a.repoEpoch !== "string" || typeof a.checkpointHash !== "string" || typeof a.headSequence !== "number") {
+		return null;
+	}
+	if (!a.devicePublicKeys || typeof a.devicePublicKeys !== "object") return null;
+	return {
+		vaultIdentity: p.vaultIdentity,
+		anchor: {
+			repoEpoch: a.repoEpoch,
+			checkpointHash: a.checkpointHash,
+			headSequence: a.headSequence,
+			devicePublicKeys: a.devicePublicKeys,
+		},
+		receivedAt: typeof p.receivedAt === "number" ? p.receivedAt : 0,
+	};
+}
+
+/** 替换作业规整：结构不完整就丢弃作业本身（恢复点文件留在插件目录，不受影响）。 */
+function normalizeReplaceJob(raw: unknown): ReplaceJob | null {
+	if (!raw || typeof raw !== "object") return null;
+	const j = raw as Partial<ReplaceJob>;
+	if (typeof j.jobId !== "string" || typeof j.state !== "string" || !Array.isArray(j.items)) return null;
+	if (typeof j.plannedHeadSequence !== "number" || typeof j.vaultIdentity !== "string") return null;
+	return {
+		...(j as ReplaceJob),
+		ownSequences: Array.isArray(j.ownSequences) ? j.ownSequences : [],
+	};
+}
+
 function normalizeTrustAnchor(raw: unknown): TrustAnchor | null {
 	if (!raw || typeof raw !== "object") return null;
 	const a = raw as Partial<TrustAnchor>;

@@ -28,8 +28,28 @@ interface TrustBlob {
 }
 
 /** vault key 文档的稳定标识（密钥材料变化即失配）。 */
-function keyIdOf(doc: VaultKeyDoc): string {
+export function keyIdOf(doc: VaultKeyDoc): string {
 	return doc.wrappedKey.slice(0, 24);
+}
+
+/**
+ * SecretStorage 的最小接口（v0.20）：旧信任迁移的纯逻辑经它读写包装材料，
+ * 测试用内存实现替身——不必拉起整个 Obsidian App。
+ */
+export interface SecretStore {
+	getSecret(id: string): string | null;
+	setSecret(id: string, value: string): void;
+}
+
+/** 读出包装 VMK 的 blob 中记录的 keyId（不解密；blob 缺失或损坏返回 null）。 */
+export function trustBlobKeyId(blobJson: string | null): string | null {
+	if (!blobJson) return null;
+	try {
+		const blob = JSON.parse(blobJson) as Partial<TrustBlob>;
+		return blob.v === 1 && typeof blob.keyId === "string" ? blob.keyId : null;
+	} catch {
+		return null;
+	}
 }
 
 function trustAad(keyId: string): Uint8Array {

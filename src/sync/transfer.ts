@@ -455,6 +455,12 @@ export interface UploadOptions {
 	 * 调用方把**经 AAD 认证的**远端世代传进来，这里取两者较大者 + 1。
 	 */
 	generationFloor?: number;
+	/**
+	 * 幂等键（0.20）：调用方在**计划阶段**就固定好的 operationId。响应丢失后用同一个 id 重试，
+	 * 服务端返回首次提交的结果而不是产生第二个 revision——即使重试时密文因新 IV 而不同。
+	 * 未提供时不发送（保持旧行为）。
+	 */
+	operationId?: string;
 }
 
 /** 上传明文内容（E2EE 启用时自动加密，默认 LSE3；meta 模式自动伪名 + 挂元数据）。 */
@@ -534,6 +540,7 @@ export async function uploadFromPlain(
 		action,
 		sendFileId,
 		meta,
+		opts?.operationId,
 	);
 	// 服务器回报的身份必须合法；E2EE 下还必须与本地用于加密的 fileId 完全一致，
 	// 否则这份密文将来会因 AAD 不符而无法解密（LS-121-C03）
@@ -543,13 +550,25 @@ export async function uploadFromPlain(
 			`服务器返回的 fileId 与本次加密使用的身份不一致（${path}），已停止同步以免写入无法解密的内容`,
 		);
 	}
+	// 带幂等键的重试可能命中「首次提交已成功」：服务端返回的是那一次的内容 hash 与世代
+	//（这次的密文因新 IV 而不同、从未落库）。此时必须以服务端确认值为准，否则本地记下的
+	// serverHash 指向一份服务器上并不存在的密文
+	const replayed = opts?.operationId !== undefined && typeof res.hash === "string" && res.hash !== "" && res.hash !== cipherHash;
 	return {
 		revision: res.revision,
-		cipherHash,
+		cipherHash: replayed ? res.hash : cipherHash,
 		sequence: res.sequence,
 		fileId: confirmed,
-		generation,
+		generation: replayed && typeof res.contentGeneration === "number" ? res.contentGeneration : generation,
 		metaGeneration,
 		serverPseudonym: metaEncrypted(ctx) ? serverPath : undefined,
 	};
+}
+
+/**
+ * 解码一份已下载的原始字节（0.20 / ADR-016 反向作业：恢复点里保存的是当时的服务器原始字节，
+ * E2EE 下为密文）。历史内容本来就是旧世代，不做回退检查；hash 与 AAD 校验照常进行。
+ */
+export async function decodeSnapshot(ctx: SyncContext, path: string, dl: DownloadResult): Promise<PlainDownload> {
+	return decode(ctx, path, dl, { enforceGeneration: false });
 }

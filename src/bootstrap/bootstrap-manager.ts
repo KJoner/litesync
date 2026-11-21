@@ -11,8 +11,9 @@ import { sha256Hex } from "../utils/hash";
 import { keepBothVersions } from "../sync/conflict";
 import { SyncContext } from "../sync/context";
 import { resolveSnapshotPaths, trashLocal } from "../sync/pull";
-import { isStaleResurrection } from "../sync/push";
+import { isStaleResurrection, restoreObject } from "../sync/push";
 import { downloadPlain, uploadFromPlain, writeIfLocalUnchanged } from "../sync/transfer";
+import { adoptTrustAnchorFromPairing } from "../sync/checkpoint-sync";
 
 export interface PreflightResult {
 	info: ServerInfo;
@@ -120,9 +121,34 @@ async function ensureResolvedPre(ctx: SyncContext, pre: PreflightResult): Promis
 	};
 }
 
-function completeBootstrap(ctx: SyncContext, pre: PreflightResult, mode: "remote-wins" | "merge" | "local-init"): void {
+export function completeBootstrap(
+	ctx: SyncContext,
+	pre: PreflightResult,
+	mode: "remote-wins" | "merge" | "local-init" | "local-replace",
+): void {
 	ctx.store.state.lastSequence = pre.snapshotSequence;
 	ctx.store.completeBootstrap(mode, pre.info.vaultId, pre.snapshotSequence, pre.repoEpoch, pre.info.keyEpoch);
+	adoptPendingPairingTrust(ctx, pre);
+}
+
+/**
+ * 采纳配对包带来的已验证信任锚（0.20 / ADR-014）。
+ *
+ * 只有在账本归属刚刚确立、且仓库身份与 repoEpoch 都与配对包一致时才采纳：
+ * 向导期间换过仓库、或服务器在此期间做过灾备恢复，这个锚描述的就不是眼前的仓库，
+ * 宁可退回「首次信任」也不能拿一个对不上的锚去判别真伪。用完即清。
+ */
+function adoptPendingPairingTrust(ctx: SyncContext, pre: PreflightResult): void {
+	const pending = ctx.store.state.pendingPairingTrust;
+	if (!pending) return;
+	ctx.store.state.pendingPairingTrust = null;
+	const epoch = pre.repoEpoch ?? pre.info.repoEpoch ?? "";
+	if (ctx.store.state.trustAnchor !== null) return; // 已有本地锚（不覆盖更可信的东西）
+	if (pending.vaultIdentity !== pre.info.vaultId || pending.anchor.repoEpoch !== epoch) {
+		ctx.log("pairing: 配对包的信任锚与当前仓库不符（仓库或 repoEpoch 不同），按首次信任处理");
+		return;
+	}
+	adoptTrustAnchorFromPairing(ctx, pending.anchor, ctx.store.state.deviceId, ctx.deviceSigningPublicKey?.() ?? "");
 }
 
 /** 本地初始化远端（远端为空）：标记就绪后由普通同步把本地文件全部推上去。 */
@@ -346,7 +372,15 @@ export async function bootstrapMerge(
 					ctx.notify(`检测到已删除文件的陈旧副本，不会重新上传：${path}`);
 					continue;
 				}
-				out = await uploadFromPlain(ctx, path, data, e.server.revision, stat.mtime);
+				// 协议 v6（ADR-002 §3.6）：普通上传穿不透墓碑——带墓碑 revision 重传只会再撞
+				// 同一个 409。必须先显式恢复（身份与 revision 连续），再在恢复出的 revision 上传
+				//（与 push 的同名处理一致；0.20 修复）
+				const restored = await restoreObject(ctx, path, e.server);
+				if (restored === null) {
+					ctx.notify(`无法恢复已删除的文件（服务器未提供对象身份）：${path}`);
+					continue;
+				}
+				out = await uploadFromPlain(ctx, path, data, restored.revision, stat.mtime);
 			} else {
 				throw e;
 			}

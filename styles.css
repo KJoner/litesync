@@ -245,3 +245,74 @@
 	padding: 4px 8px;
 	margin: 6px 0;
 }
+
+/* ---------- 设置页首屏状态卡（0.20 / UI 规格 D06）：只用宿主变量，随主题明暗 ---------- */
+.litesync-status-card .setting-item {
+	flex-wrap: wrap;
+	gap: var(--size-4-2);
+}
+.litesync-status-card .setting-item-info {
+	min-width: 0;
+	flex: 1 1 260px;
+}
+.litesync-status-line {
+	line-height: 1.6;
+	overflow-wrap: anywhere;
+}
+.litesync-status-label {
+	color: var(--text-muted);
+}
+.litesync-status-line.is-ok span:last-child {
+	color: var(--text-success);
+}
+.litesync-status-line.is-warn span:last-child {
+	color: var(--text-warning);
+}
+.litesync-status-line.is-error span:last-child {
+	color: var(--text-error);
+}
+.litesync-status-card .setting-item-control {
+	flex-wrap: wrap;
+	justify-content: flex-end;
+}
+
+/* ---------- 连接链接核对（0.20 配对导入 v2） ---------- */
+.litesync-confirm-table {
+	display: grid;
+	grid-template-columns: max-content minmax(0, 1fr);
+	gap: var(--size-4-1) var(--size-4-3);
+	margin: var(--size-4-2) 0;
+}
+.litesync-confirm-table > :nth-child(odd) {
+	color: var(--text-muted);
+}
+.litesync-confirm-table > :nth-child(even) {
+	overflow-wrap: anywhere;
+}
+
+/* ---------- 本地完整替换远端（0.20 高级恢复） ---------- */
+.litesync-plan-counts {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+	gap: var(--size-4-2);
+	margin: var(--size-4-2) 0;
+}
+.litesync-plan-count {
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	padding: var(--size-4-2);
+}
+.litesync-plan-count strong {
+	display: block;
+	font-size: var(--font-ui-large);
+}
+.litesync-plan-list {
+	max-height: 240px;
+	overflow: auto;
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	padding: var(--size-4-2);
+	overflow-wrap: anywhere;
+}

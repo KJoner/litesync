@@ -325,11 +325,13 @@ async function renameMetadata(
  * 恢复请求必须原样带回前两者（防复活锚点），并提交严格更新的内容世代（抗回退）。
  * 服务器没给 fileId（旧版本）时返回 null，调用方放弃而不是盲目重建。
  */
-async function restoreObject(
+export async function restoreObject(
 	ctx: SyncContext,
 	path: string,
 	server: { revision: number; fileId?: string; contentGeneration?: number },
-): Promise<{ fileId: string; revision: number } | null> {
+	/** 幂等键（0.20：高级恢复作业在计划阶段固定；普通 push 不传） */
+	operationId?: string,
+): Promise<{ fileId: string; revision: number; sequence: number } | null> {
 	if (!server.fileId) return null;
 	const tracked = ctx.store.get(path);
 	const nextGen = Math.max(server.contentGeneration ?? 0, tracked?.generation ?? 0) + 1;
@@ -350,13 +352,17 @@ async function restoreObject(
 			canonicalHash: await canonicalPathHmac(keys, path),
 		};
 	}
-	const out = await ctx.client.restore(server.fileId, {
-		expectedTombstoneRevision: server.revision,
-		contentGeneration: nextGen,
-		pseudonym,
-		metaEnc: meta?.metaEnc,
-		canonicalHash: meta?.canonicalHash,
-	});
+	const out = await ctx.client.restore(
+		server.fileId,
+		{
+			expectedTombstoneRevision: server.revision,
+			contentGeneration: nextGen,
+			pseudonym,
+			metaEnc: meta?.metaEnc,
+			canonicalHash: meta?.canonicalHash,
+		},
+		operationId,
+	);
 	// generation 必须记账：restore 已把服务器上该对象的 contentGeneration 推到
 	// nextGen——紧接着的内容上传要在它**之上**（nextGen+1）。漏记的话上传会从
 	// tracked（空 → 0）推导出 generation 1 ≤ nextGen，被服务器按回退拒绝（409），
@@ -370,7 +376,7 @@ async function restoreObject(
 		...(metaEncrypted(ctx) ? { metaGeneration: 1 } : { metaGeneration: out.metaGeneration }),
 		serverPseudonym: metaEncrypted(ctx) ? out.path : undefined,
 	});
-	return { fileId: out.fileId, revision: out.revision };
+	return { fileId: out.fileId, revision: out.revision, sequence: out.sequence ?? 0 };
 }
 
 type Outcome = "pushed" | "skipped" | "conflict";

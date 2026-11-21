@@ -43,17 +43,19 @@ scripts\dev-deploy.ps1   # 构建并部署到本机测试 Vault（PowerShell）
 ```
 src/
 ├── main.ts              插件入口：命令注册、状态栏、设置装配、生命周期
-├── settings.ts          设置页（Obsidian 1.13 声明式 API）+ PluginSettings
+├── settings.ts          设置页（Obsidian 1.13 声明式 API）+ PluginSettings；状态卡 + 四节（0.20）
+├── status-summary.ts    状态卡的纯判定：几行状态 + 唯一主按钮（可测）
+├── onboarding.ts        新手入口：「打开网页注册或登录」
 ├── api/client.ts        HTTP 客户端、协议常量、错误码 → 类型化异常
 ├── sync/                同步引擎（见下）
 ├── state/store.ts       StateStore：state.json、FileState 缓存、绑定指纹、信任锚
-├── bootstrap/           首次接入：向导、三种接入模式、空仓三选项对话框
-├── crypto/              E2EE：信封、密钥环、设备信任、元数据迁移、填充、签名
+├── bootstrap/           首次接入：向导、接入模式、空仓对话框；replace-remote*：本地完整替换远端（ADR-016）
+├── crypto/              E2EE：信封、密钥环、设备信任、元数据迁移、填充、签名；trust-migration*：严格解锁与旧信任迁移（ADR-013）
 ├── merge/               三方合并引擎（diff3 + Markdown 分词 + 智能合并）
 ├── conflict-ui/         冲突解决器界面
 ├── history/             版本历史界面
 ├── share/               分享创建界面
-├── pairing/             设备配对：二维码、深链导入、设备列表
+├── pairing/             设备配对：二维码、深链导入、设备列表；pairing-v2：先核对后兑换、exchangeId 续传（ADR-014）
 ├── diagnostics/         平台兼容性自检
 └── utils/               路径归一、忽略规则、哈希、时间混淆、失败点注入
 ```
@@ -128,6 +130,15 @@ src/
   **空远端初始化强制 E2EE**（0.19.x）：向导与首次配置对话框都没有明文
   初始化按钮；既有明文仓库不受影响。仓库重命名 `PATCH /api/v1/vaults/{id}`
   只动展示名（设置页「当前仓库」条目）。
+- **严格会话解锁（0.20 / ADR-013）**：新安装 `trustDevice=false`；「本设备自动解锁」只在高级区显式开启。
+  旧设备的信任材料由 `crypto/trust-migration.ts` 状态机处理——**先证明能用密码恢复同一把 VMK，再清理**；
+  `persistTrust` 只在显式开启时执行，迁移未完成时开关与「忘记此设备」一律转交迁移向导。
+- **连接链接 v2（0.20 / ADR-014）**：新设备无凭据，靠 `GET /api/v2/pairings/{id}/envelope` 的状态码探测服务端能力
+  （401/403/405 = 旧服务端）；兑换前把 `{exchangeId, enrollmentSecret,…}` 存 SecretStorage（`litesync-pending-redeem`），
+  断网可续传。配对包信任锚先暂存在 `state.pendingPairingTrust`，**接入完成时**（vaultIdentity + repoEpoch 吻合）才采纳。
+- **本地完整替换远端（0.20 / ADR-016）**：`bootstrap/replace-remote.ts`，作业存 `state.replaceJob`；
+  恢复点写插件目录 `replace-recovery/<jobId>/`（不与 LocalCommitter 按周清理的 `recovery/` 混用）（唯一允许的直接写盘处，带路径校验）；
+  未完成的作业在启动时冻结普通同步（gate.beginMigration）直到用户续跑或放弃。
 - **多用户（v0.18 服务端）**：对插件透明——用户 Token 映射到自己的
   Vault，`/api/v1/info` 返回该 Vault 的 `vaultId`/epochs。插件不感知租户。
 
@@ -146,14 +157,17 @@ src/
 
 ## 7. 测试组织
 
-`tests/` 目录自动发现，当前 289 条。分类：
+`tests/` 目录自动发现，当前 356 条（0.20.0）。分类：
 
 - `unit` / `merge` / `smart-merge` / `crypto` / `store` / `device-trust`：基础单元；
 - `crashpoint.test.ts`：**崩溃点注入**（`utils/failpoint.ts` 在关键步骤间强制中断）；
 - `adversarial.test.ts`：对抗性协议（恶意服务器的每一种伎俩）；
 - `crossplatform.test.ts` / `realfs.test.ts` / `nonatomic.test.ts`：文件系统语义；
 - `padding.test.ts` / `timing.test.ts`：隐私增强的成本与承诺；
-- `v6 / v121 / v131 / v132 / rc3-regressions`：按版本归档的回归。
+- `v6 / v121 / v131 / v132 / rc3-regressions`：按版本归档的回归；
+- `strict-unlock` / `pairing-v2` / `replace-remote` / `settings-layout`：0.20 公开化（严格解锁迁移、连接链接 v2、高级恢复作业、设置页结构）。
+  `replace-remote.test.ts` 里的内存服务端按协议 v6 语义建模（墓碑挡住普通上传、operationId 幂等、LSE3 世代单调）——
+  改服务端语义时记得同步改它，否则测试会和真实服务器分叉。
 
 **新修一个 bug 就补一条回归测试，并标注它覆盖的 INV 编号。**
 

@@ -1,5 +1,13 @@
 import { Notice, Platform, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
-import { ApiClient, protocolError, RemoteVault } from "./api/client";
+import {
+	ApiClient,
+	enrollDevice,
+	fetchPairingEnvelope,
+	isLoopbackUrl,
+	protocolError,
+	redeemDeviceEnrollment,
+	RemoteVault,
+} from "./api/client";
 import { bootstrapLocalInit, preflight } from "./bootstrap/bootstrap-manager";
 import { BootstrapWizardModal } from "./bootstrap/bootstrap-modal";
 import { FirstSyncModal } from "./bootstrap/first-sync-modal";
@@ -22,11 +30,16 @@ import {
 } from "./crypto/migration";
 import { HistoryModal } from "./history/history-view";
 import { DeviceListModal } from "./pairing/device-list-modal";
-import { PasteLinkModal, registerImportHandler } from "./pairing/import-handler";
+import { PasteLinkModal, registerImportHandler, resumePendingRedeem } from "./pairing/import-handler";
+import { consumePairing, PairingConfig } from "./pairing/pairing";
+import { PairingTransport } from "./pairing/pairing-v2";
+import { OpenWebsiteModal, websiteUrl } from "./onboarding";
+import { jobUnfinished } from "./bootstrap/replace-remote";
+import { ReplaceRemoteModal } from "./bootstrap/replace-remote-modal";
 import { AddDeviceModal } from "./pairing/pairing-modal";
 import { DEFAULT_SETTINGS, PluginSettings, SyncSettingTab } from "./settings";
 import { ShareManageModal, ShareModal } from "./share/share-modal";
-import { StateStore } from "./state/store";
+import { PendingPairingTrust, StateStore } from "./state/store";
 import { SyncContext } from "./sync/context";
 import { SyncBlockedError, SyncGate, syncGateBlock } from "./sync/gate";
 import { loadOrCreateSigningKey } from "./crypto/signing-key";
@@ -36,7 +49,18 @@ import { SyncManager, SyncStatus } from "./sync/sync-manager";
 import { IgnoreMatcher } from "./utils/ignore";
 import { renderProbeReport, runPlatformProbe } from "./diagnostics/platform-probe";
 import { nextFlushDelay, quantizeMtime } from "./utils/timing";
-import { VaultKeyDoc } from "./crypto/crypto";
+import { importVmk, VaultKeyDoc } from "./crypto/crypto";
+import {
+	advanceAfterProof,
+	applyKeyPolicy,
+	clearLegacyMaterial,
+	keyPolicyLabel,
+	migrationPending,
+	persistenceExplicit,
+	TrustMigrationDeps,
+} from "./crypto/trust-migration";
+import { TrustMigrationModal } from "./crypto/trust-migration-modal";
+import { PrimaryActionKind, SecondaryActionKind, StatusInput } from "./status-summary";
 
 /** vault key 的密钥材料是否发生变化（换库 / 轮换；影响绑定指纹）。 */
 function vaultKeyMaterialChanged(before: VaultKeyDoc | null, after: VaultKeyDoc | null): boolean {
@@ -62,6 +86,8 @@ export default class PrivateSyncPlugin extends Plugin {
 	private signingKeyPkcs8 = "";
 	/** 待登记到服务器的签名公钥（登记成功后清空） */
 	private pendingSigningPublicKey = "";
+	/** 本设备签名公钥（常驻，不随登记清空；采纳配对信任锚时把自己加入信任集合） */
+	private signingPublicKeyB64 = "";
 	private client: ApiClient | null = null;
 	private manager: SyncManager | null = null;
 	private ctx: SyncContext | null = null;
@@ -71,6 +97,10 @@ export default class PrivateSyncPlugin extends Plugin {
 	private foregroundTimer: number | null = null;
 	private intervalId: number | null = null;
 	private lastStatus: SyncStatus = "idle";
+	/** 本次运行最近一次成功同步的时刻（设置页状态卡；不落盘，避免每轮同步写 data.json） */
+	private lastSyncAt = 0;
+	/** 最近一次查询到的当前仓库名（状态卡；null = 尚未查询） */
+	private currentVaultName: string | null = null;
 	private keyring = new Keyring();
 	/** 同步安全 Gate（v0.12.1）：手动命令与自动同步共用的许可判断 */
 	private gate = new SyncGate();
@@ -209,8 +239,11 @@ export default class PrivateSyncPlugin extends Plugin {
 
 		// E2EE：加载缓存的 vault key 文档
 		this.keyring.setDoc(this.store.state.e2ee);
+		// 旧信任迁移（ADR-013）：补齐仓库身份；clearing 中途崩溃的先把清理做完
+		await this.prepareTrustMigration();
 		if (this.keyring.needsUnlock) {
-			// ① Trusted Device 自动解锁（设备密钥 + SecretStorage 中的包装 VMK）
+			// ① 可恢复密钥持久化（用户显式开启，或旧版本遗留、迁移完成前照常可用）：
+			// 设备密钥 + SecretStorage 中的包装 VMK。严格模式下两者都不存在，这里自然跳过
 			if (this.settings.trustDevice && this.settings.deviceKeyB64 && this.keyring.doc) {
 				const raw = await loadTrustedVmk(this.app, this.settings.deviceKeyB64, this.keyring.doc);
 				if (raw) {
@@ -218,12 +251,11 @@ export default class PrivateSyncPlugin extends Plugin {
 					raw.fill(0);
 				}
 			}
-			// ② v3.1 迁移：旧版明文密码解锁一次 → 转为 Trusted Device → 从磁盘抹除
+			// ② v3.1 迁移：旧版明文密码只用来解锁**本次运行**，随即从磁盘抹除。
+			// 0.20 起不再顺手把它转成设备信任——那会凭空制造出可自动解锁的材料
 			if (this.keyring.needsUnlock && this.legacyE2eePassword) {
 				if (await this.keyring.unlock(this.legacyE2eePassword)) {
-					this.settings.trustDevice = true;
-					await this.persistTrust();
-					new Notice("已把旧的「记住密码」迁移为「信任此设备」，明文密码已从磁盘移除");
+					new Notice("已从磁盘移除旧版本保存的明文仓库密码。本次运行已解锁，下次启动需要重新输入。");
 				}
 			}
 			this.legacyE2eePassword = "";
@@ -253,6 +285,7 @@ export default class PrivateSyncPlugin extends Plugin {
 			const signing = await loadOrCreateSigningKey(this.app);
 			this.signingKeyPkcs8 = signing.privateKeyPkcs8B64;
 			this.pendingSigningPublicKey = signing.publicKeyB64;
+			this.signingPublicKeyB64 = signing.publicKeyB64;
 		} catch (e) {
 			console.debug("[litesync] signing key unavailable", e);
 		}
@@ -286,6 +319,7 @@ export default class PrivateSyncPlugin extends Plugin {
 			signingKeyPkcs8: () => this.signingKeyPkcs8,
 			signingPublicKey: () => this.pendingSigningPublicKey,
 			onSigningKeyRegistered: () => void (this.pendingSigningPublicKey = ""),
+			deviceSigningPublicKey: () => this.signingPublicKeyB64,
 			log: (msg) => {
 				// 仅在用户显式开启 Debug 时输出；用 debug 级别不污染默认控制台
 				if (this.settings.debug) console.debug(`[litesync] ${msg}`);
@@ -330,6 +364,123 @@ export default class PrivateSyncPlugin extends Plugin {
 				void this.manager.sync("startup");
 			}
 		}
+		// 上次运行停在「已证明、待清理」的迁移：不需要用户再输入任何东西，自动走完
+		void this.resumeTrustMigration();
+		// 未完成的「用本地完整替换远端」作业：用户决定续跑或放弃之前，普通同步保持暂停
+		const rj = this.store.state.replaceJob;
+		if (rj && jobUnfinished(rj) && !rj.bootstrapContext) {
+			this.holdReplaceGate();
+			new Notice(
+				"LiteSync：有一个未完成的「用本地完整替换远端」作业，普通同步已暂停。\n" +
+					"打开 设置 → LiteSync → 高级 → 用本地完整替换远端，继续或放弃。",
+				15000,
+			);
+		}
+		// 上次的设备连接兑换没收到响应（断网/崩溃）：提示用同一个兑换编号继续
+		void this.resumePendingRedeem();
+	}
+
+	// ---------- 严格会话解锁与旧信任迁移（v0.20 / ADR-013） ----------
+
+	private async prepareTrustMigration(): Promise<void> {
+		const tm = this.settings.trustMigration;
+		if (!tm) return;
+		const vid = this.store?.state.bootstrap.remoteVaultId ?? "";
+		if (!tm.vaultIdentity && vid) {
+			tm.vaultIdentity = vid;
+			await this.saveSettings();
+		}
+		// clearing 之后崩溃：恢复能力早已证明，先把清理做完（幂等），本次不再自动解锁
+		if (tm.state === "clearing") await clearLegacyMaterial(this.trustDeps());
+	}
+
+	private async resumeTrustMigration(): Promise<void> {
+		const tm = this.settings.trustMigration;
+		if (!tm) return;
+		if (tm.state === "recovery_proven" || tm.state === "pending_writes_handled") {
+			const r = await advanceAfterProof(this.trustDeps());
+			if (r.ok && r.state === "strict_mode") new Notice("LiteSync：已完成迁移到严格会话解锁");
+			this.refreshSettingsTab();
+			return;
+		}
+		if (tm.state === "legacy_trust_found" && !tm.noticeShown) {
+			tm.noticeShown = true;
+			await this.saveSettings();
+			new Notice(
+				"LiteSync：本设备仍在使用旧的「信任此设备」模式（待迁移）。\n" +
+					"打开 设置 → LiteSync → 加密与设备，验证仓库密码后即可切换到严格会话解锁。",
+				15000,
+			);
+		}
+	}
+
+	/** 迁移逻辑的 I/O 组装（ADR-013）。 */
+	trustDeps(): TrustMigrationDeps {
+		return {
+			settings: this.settings,
+			saveSettings: () => this.saveSettings(),
+			secrets: this.app.secretStorage,
+			fetchKeyDoc: async () => {
+				if (!this.client || !this.isConfigured()) throw new Error("not configured");
+				return this.client.getVaultKeyWithFingerprint();
+			},
+			replaceKeyDoc: async (doc, fingerprint) => {
+				if (!this.client) throw new Error("not configured");
+				await this.client.putVaultKey(doc, true, fingerprint);
+			},
+			cachedKeyDoc: () => this.store?.state.e2ee ?? this.keyring.doc,
+			onKeyDocReplaced: async (doc, vmkRaw) => {
+				// 同一把 VMK、新的包装：密钥环保持解锁（setDoc 会因 wrappedKey 变化而锁定），
+				// 本地缓存换成新文档；vault key 材料变了 → 绑定必须重新校验（LS-121-C02）
+				this.keyring.adopt(doc, await importVmk(vmkRaw));
+				if (this.store) {
+					this.store.state.e2ee = doc;
+					await this.store.save();
+				}
+				this.invalidateBinding("仓库密钥文档已用新密码重新包装");
+			},
+			pendingWrites: async () => {
+				if (!this.store) return { count: this.queue.size, durable: false };
+				// 入队即落盘（§6.3）；这里再落一次盘并确认状态文件健康，才算「已在 durable journal 中」
+				await this.store.save();
+				return { count: this.queue.size, durable: !this.store.corrupted };
+			},
+			drainQueue: async () => {
+				if (!this.manager || !this.bootstrapReady || this.keyring.needsUnlock || this.queue.size === 0) return;
+				await this.manager.fullSync("trust-migration");
+			},
+			now: () => Date.now(),
+		};
+	}
+
+	openTrustMigrationModal(): void {
+		new TrustMigrationModal(this.app, this.trustDeps(), () => this.refreshSettingsTab()).open();
+	}
+
+	/** 是否有尚未完成的旧信任迁移（设置页据此显示「旧设备信任待迁移」）。 */
+	trustMigrationPending(): boolean {
+		return migrationPending(this.settings);
+	}
+
+	/** 当前密钥策略的一句话说明。 */
+	keyPolicyText(): string {
+		return keyPolicyLabel(this.settings);
+	}
+
+	/** 解锁/启用弹窗里的策略提示：这次解锁会不会在本设备留下可自动还原密钥的材料。 */
+	private unlockNote(): string {
+		if (migrationPending(this.settings)) {
+			return "本设备仍在使用旧的「信任此设备」模式（待迁移）。迁移入口在 设置 → 加密与设备。";
+		}
+		if (persistenceExplicit(this.settings)) {
+			return "你开启了「本设备自动解锁」：解锁后会在本设备保存可自动还原密钥的材料（可在 设置 → 高级 中关闭）。";
+		}
+		return "严格会话解锁：只在本次运行有效，锁定、切换仓库或重启 Obsidian 后需要重新输入。";
+	}
+
+	/** 用户显式开启了「可恢复密钥持久化」时，在拿到密钥后写入本设备材料。 */
+	private async maybePersistTrust(): Promise<void> {
+		if (persistenceExplicit(this.settings)) await this.persistTrust();
 	}
 
 	// ---------- Bootstrap（首次接入向导，v8） ----------
@@ -348,8 +499,8 @@ export default class PrivateSyncPlugin extends Plugin {
 		new BootstrapWizardModal(this.app, this.ctx, {
 			setVaultChoice: (id) => this.setVaultChoice(id),
 			vaultChoice: () => this.settings.vaultChoice,
-			trustDevice: () => this.settings.trustDevice,
-			setTrustDevice: (v) => this.setTrustDevice(v),
+			keyNote: () => this.unlockNote(),
+			afterKeyAvailable: () => this.maybePersistTrust(),
 			setApiToken: (t) => this.setApiToken(t),
 			openUnlock: (onUnlocked) => this.openUnlockModal(onUnlocked),
 			onDone: () => {
@@ -380,10 +531,142 @@ export default class PrivateSyncPlugin extends Plugin {
 	/** 「添加新设备」：生成一次性加密配对包并展示二维码/链接。 */
 	openAddDeviceModal(): void {
 		if (!this.client || !this.isConfigured()) {
-			new Notice("请先在设置中填写 Server URL 和 API Token");
+			new Notice("请先连接仓库");
 			return;
 		}
-		new AddDeviceModal(this.app, this.client, this.settings).open();
+		new AddDeviceModal(this.app, this.client, this.settings, () => ({
+			anchor: this.store?.state.trustAnchor ?? null,
+			repoEpoch: this.store?.state.bootstrap.repoEpoch,
+			bootstrapReady: this.bootstrapReady,
+		})).open();
+	}
+
+	// ---------- 连接链接导入（0.20 / ADR-014） ----------
+
+	/** 配对网络 I/O（新设备此刻没有凭据，全部是公开端点）。 */
+	pairingTransport(): PairingTransport {
+		return {
+			fetchEnvelope: (server, id) => fetchPairingEnvelope(server, id),
+			redeem: (server, req) => redeemDeviceEnrollment(server, req),
+			consumeLegacy: (server, id) => consumePairing(server, id),
+			enrollLegacy: (server, secret, name) => enrollDevice(server, secret, name),
+		};
+	}
+
+	/** 兑换时上报的设备名（设置里没填时按平台给一个能认出来的默认名）。 */
+	deviceNameForEnrollment(): string {
+		if (this.settings.deviceName) return this.settings.deviceName;
+		if (Platform.isIosApp) return "iPhone / iPad 上的 Obsidian";
+		if (Platform.isAndroidApp) return "Android 上的 Obsidian";
+		return "桌面 Obsidian";
+	}
+
+	/**
+	 * 写入导入的连接配置（凭据进 SecretStorage）并把本设备重置为待接入。
+	 *
+	 * 一个本地 Obsidian 库同一时刻只绑定一个远端仓库：改连 = 作废绑定、暂停原同步，
+	 * 旧账本在向导 preflight 发现归属不符时作废（本地笔记一个都不动）。
+	 */
+	async applyPairingConfig(
+		config: PairingConfig,
+		credential: string,
+		v2: {
+			vaultId: string;
+			vaultIdentity: string;
+			anchor: PendingPairingTrust["anchor"] | null;
+		} | null,
+	): Promise<void> {
+		const url = config.serverUrl.trim().replace(/\/+$/, "");
+		// 安全红线（v9）：凭据绝不走明文 HTTP 出本机
+		if (/^http:\/\//i.test(url) && !isLoopbackUrl(url)) {
+			throw new Error("连接配置中的服务器地址是非本机的 http://，已拒绝导入（凭据会被明文暴露）");
+		}
+		this.settings.serverUrl = url;
+		if (typeof config.syncIntervalSeconds === "number") this.settings.syncIntervalSeconds = config.syncIntervalSeconds;
+		if (typeof config.syncObsidian === "boolean") this.settings.syncObsidian = config.syncObsidian;
+		if (typeof config.ignorePatterns === "string") this.settings.ignorePatterns = config.ignorePatterns;
+		// v2：凭据绑定的仓库就是核对过的那一个；旧包没有仓库信息 → 用账户默认仓库
+		this.settings.vaultChoice = v2?.vaultId ?? "";
+		this.currentVaultName = config.selectedVault?.displayName ?? null;
+		await this.setApiToken(credential);
+		await this.saveSettings();
+		this.applySettings();
+		this.resetBootstrapState();
+		if (this.store) {
+			this.store.state.pendingPairingTrust =
+				v2?.anchor && v2.vaultIdentity
+					? { vaultIdentity: v2.vaultIdentity, anchor: v2.anchor, receivedAt: Date.now() }
+					: null;
+			await this.store.save();
+		}
+	}
+
+	/** 上次兑换没收到响应：在服务端保留窗口内用同一个兑换编号续传。 */
+	private async resumePendingRedeem(): Promise<void> {
+		await resumePendingRedeem(this);
+	}
+
+	// ---------- 高级恢复：用本地完整替换远端（0.20 / ADR-016） ----------
+
+	/** 作业执行期间（及中断后、用户决定之前）冻结普通同步。 */
+	private replaceGateHeld = false;
+
+	private holdReplaceGate(): void {
+		if (this.replaceGateHeld) return;
+		this.gate.beginMigration("「用本地完整替换远端」作业");
+		this.replaceGateHeld = true;
+	}
+
+	private releaseReplaceGate(): void {
+		if (!this.replaceGateHeld) return;
+		this.gate.endMigration();
+		this.replaceGateHeld = false;
+	}
+
+	/** 设置页 → 高级 → 高级恢复（已接入的设备）。 */
+	openReplaceRemote(): void {
+		if (!this.ctx || !this.manager || !this.client || !this.bootstrapReady) {
+			new Notice("请先完成接入");
+			return;
+		}
+		if (this.keyring.needsUnlock) {
+			new Notice("请先解锁仓库");
+			this.openUnlockModal();
+			return;
+		}
+		void (async () => {
+			let name = this.currentVaultName ?? "";
+			try {
+				const cur = (await this.client!.listVaults()).find((v) => v.current);
+				if (cur) name = cur.name;
+			} catch {
+				/* 旧服务器没有 vaults 端点：用默认短语确认 */
+			}
+			new ReplaceRemoteModal(this.app, this.ctx!, {
+				bootstrapContext: false,
+				vaultName: name,
+				vaultChoice: this.settings.vaultChoice,
+				// 先等同步收敛：待推送队列里的本地修改若不先推完，作业的预览与真实状态不一致
+				beforePlan: async () => {
+					await this.manager!.fullSync("pre-replace");
+				},
+				holdSync: () => this.holdReplaceGate(),
+				releaseSync: () => this.releaseReplaceGate(),
+				onCompleted: async () => {
+					void this.manager?.sync("replace-done");
+				},
+			}).open();
+		})();
+	}
+
+	/** 打开网页注册/登录（已知服务器时直接打开，否则先问地址）。 */
+	openWebsite(): void {
+		const url = websiteUrl(this.settings.serverUrl);
+		if (url) {
+			window.open(url);
+			return;
+		}
+		new OpenWebsiteModal(this.app, (u) => window.open(u)).open();
 	}
 
 	/** 「导入配对链接」：手动粘贴其他设备生成的配对链接。 */
@@ -698,10 +981,10 @@ export default class PrivateSyncPlugin extends Plugin {
 	private openFirstSyncE2eeModal(): void {
 		new EnableE2eeModal(
 			this.app,
-			this.settings.trustDevice,
-			async (password, trustDevice) => {
+			this.unlockNote(),
+			async (password) => {
 				await enableE2eeOnEmptyRemote(this.ctx!, password);
-				await this.setTrustDevice(trustDevice);
+				await this.maybePersistTrust();
 				// 必须在启用 E2EE 之后重跑 preflight：completeBootstrap 会把 pending binding
 				// 里的 keyEpoch 写进正式 binding，用启用前的旧值（0）会产出 AAD 错绑的密文
 				await this.firstSyncNow();
@@ -933,6 +1216,7 @@ export default class PrivateSyncPlugin extends Plugin {
 	}
 
 	private updateStatus(status: SyncStatus, detail?: string): void {
+		if (status === "synced" || status === "conflict") this.lastSyncAt = Date.now();
 		if (!this.statusEl) return;
 		this.lastStatus = status;
 		const texts: Record<SyncStatus, string> = {
@@ -962,6 +1246,69 @@ export default class PrivateSyncPlugin extends Plugin {
 					: null;
 	}
 
+	// ---------- 设置页状态卡（v0.20 / UI 规格 D06） ----------
+
+	/** 是否已填写服务器与凭据（设置页据此切换新手入口与日常入口）。 */
+	get configured(): boolean {
+		return this.isConfigured();
+	}
+
+	/** 状态卡输入：只读快照。 */
+	statusInput(): StatusInput {
+		return {
+			configured: this.isConfigured(),
+			bootstrapReady: this.bootstrapReady,
+			credentialRejected: this.gate.sessionBlock()?.reason === "credential-rejected",
+			e2ee: !this.keyring.enabled ? "disabled" : this.keyring.needsUnlock ? "locked" : "unlocked",
+			vaultName: this.currentVaultName,
+			lastSyncAt: this.lastSyncAt,
+			conflicts: this.store?.conflictPaths().length ?? 0,
+			migrationPending: migrationPending(this.settings),
+			keyPolicyText: keyPolicyLabel(this.settings),
+			syncing: this.manager?.isSyncing ?? false,
+			now: Date.now(),
+		};
+	}
+
+	/** 记住当前仓库名（设置页查询到后调用；只在内存里）。 */
+	rememberVaultName(name: string): void {
+		this.currentVaultName = name;
+	}
+
+	runPrimaryAction(kind: PrimaryActionKind): void {
+		switch (kind) {
+			case "connect":
+			case "reconnect":
+				this.openPasteLinkModal();
+				return;
+			case "finish-setup":
+				this.openBootstrapWizard();
+				return;
+			case "unlock":
+				this.openUnlockModal();
+				return;
+			case "sync-now":
+				void this.syncNow().then(() => this.refreshSettingsTab());
+				return;
+		}
+	}
+
+	runSecondaryAction(kind: SecondaryActionKind): void {
+		if (kind === "migrate") this.openTrustMigrationModal();
+		else if (this.ctx) new ConflictListModal(this.ctx).open();
+	}
+
+	/** 打开冲突列表（设置页「同步」节）。 */
+	openConflicts(): void {
+		if (this.ctx) new ConflictListModal(this.ctx).open();
+	}
+
+	/** 设备列表（设置页「连接与仓库」节）。 */
+	openDeviceList(): void {
+		if (this.client && this.isConfigured()) new DeviceListModal(this.app, this.client).open();
+		else new Notice("请先连接仓库");
+	}
+
 	// ---------- E2EE ----------
 
 	/** 设置页的 E2EE 状态与按钮文案。 */
@@ -970,9 +1317,9 @@ export default class PrivateSyncPlugin extends Plugin {
 			return { desc: "未启用：服务器保存明文（仅 HTTPS 传输加密）", action: "启用端到端加密…" };
 		}
 		if (this.keyring.needsUnlock) {
-			return { desc: "已启用 · 🔒 未解锁（同步已暂停）", action: "解锁…" };
+			return { desc: "已启用 · 🔒 已锁定（同步暂停，待同步的修改保留在本机）", action: "解锁…" };
 		}
-		return { desc: "已启用 · 🔓 已解锁", action: "锁定本设备" };
+		return { desc: "已启用 · 🔓 已解锁（本次运行有效）", action: "锁定" };
 	}
 
 	async e2eeAction(): Promise<void> {
@@ -995,7 +1342,7 @@ export default class PrivateSyncPlugin extends Plugin {
 	 * 把选仓库和接入方式各走两遍）。
 	 */
 	openUnlockModal(onUnlocked?: () => void): void {
-		new UnlockModal(this.app, this.settings.trustDevice, async (password, trustDevice) => {
+		new UnlockModal(this.app, this.unlockNote(), async (password) => {
 			// 新设备可能还没有缓存 vault key 文档，先从服务器获取
 			if (!this.keyring.doc) {
 				if (!this.client) return "插件尚未初始化完成";
@@ -1012,8 +1359,8 @@ export default class PrivateSyncPlugin extends Plugin {
 				}
 			}
 			if (!(await this.keyring.unlock(password))) return "密码错误";
-			await this.setTrustDevice(trustDevice);
-			new Notice("E2EE 已解锁 ✓");
+			await this.maybePersistTrust();
+			new Notice("仓库已解锁 ✓");
 			this.updateStatus("idle");
 			this.refreshSettingsTab();
 			if (onUnlocked) {
@@ -1034,7 +1381,7 @@ export default class PrivateSyncPlugin extends Plugin {
 			new Notice("插件尚未初始化完成，请稍候");
 			return;
 		}
-		new EnableE2eeModal(this.app, this.settings.trustDevice, async (password, trustDevice, onProgress) => {
+		new EnableE2eeModal(this.app, this.unlockNote(), async (password, onProgress) => {
 			const migrated = await enableE2ee(
 				this.ctx!,
 				password,
@@ -1042,7 +1389,7 @@ export default class PrivateSyncPlugin extends Plugin {
 				() => this.manager!.fullSync("pre-e2ee-migration"),
 				onProgress,
 			);
-			await this.setTrustDevice(trustDevice);
+			await this.maybePersistTrust();
 			this.updateStatus("synced");
 			this.refreshSettingsTab();
 			return migrated;
@@ -1067,10 +1414,21 @@ export default class PrivateSyncPlugin extends Plugin {
 		await this.saveSettings();
 	}
 
-	/** 开关「信任此设备」：开 → 立即持久化（若已解锁）；关 → 删除本地信任。 */
-	async setTrustDevice(value: boolean): Promise<void> {
+	/**
+	 * 开关「可恢复密钥持久化」（高级区，显式选择）：开 → 立即持久化（若已解锁）；关 → 删除本地材料。
+	 *
+	 * 旧版本遗留的材料尚未证明可恢复时（ADR-013），开关**不能**直接删它——
+	 * 对忘了密码的用户那可能是唯一的钥匙。此时改为打开迁移向导，返回 false。
+	 */
+	async setTrustDevice(value: boolean): Promise<boolean> {
+		if (migrationPending(this.settings)) {
+			this.openTrustMigrationModal();
+			return false;
+		}
 		this.settings.trustDevice = value;
 		if (value) {
+			// 显式开启：不再是「旧版本默认留下来的」，迁移记录作废
+			this.settings.trustMigration = null;
 			await this.saveSettings();
 			await this.persistTrust();
 		} else {
@@ -1078,10 +1436,15 @@ export default class PrivateSyncPlugin extends Plugin {
 			this.settings.deviceKeyB64 = "";
 			await this.saveSettings();
 		}
+		return true;
 	}
 
-	/** 忘记此设备：删除设备信任并立即锁定。 */
+	/** 忘记此设备：删除设备信任并立即锁定（旧材料未证明可恢复时转交迁移向导）。 */
 	async forgetThisDevice(): Promise<void> {
+		if (migrationPending(this.settings)) {
+			this.openTrustMigrationModal();
+			return;
+		}
 		forgetTrustedDevice(this.app);
 		this.settings.trustDevice = false;
 		this.settings.deviceKeyB64 = "";
@@ -1101,9 +1464,16 @@ export default class PrivateSyncPlugin extends Plugin {
 		delete raw.rememberE2eePassword;
 
 		this.settings = { ...DEFAULT_SETTINGS, ...raw };
-		if (hadLegacyRemember) this.settings.trustDevice = true; // 语义等价迁移
+		if (hadLegacyRemember) this.settings.trustDevice = true; // 语义等价迁移（随后由密钥策略处理）
 
-		if (this.legacyE2eePassword !== "" || hadLegacyRemember) {
+		// 密钥策略迁移（0.20 / ADR-013）：只执行一次。旧材料完整 → 进入待迁移；
+		// 不完整（还原不出 VMK）→ 直接严格；新安装 → 什么都不做
+		const policyChanged = applyKeyPolicy(this.settings, this.app.secretStorage, {
+			vaultIdentity: "",
+			now: Date.now(),
+		});
+
+		if (this.legacyE2eePassword !== "" || hadLegacyRemember || policyChanged) {
 			await this.saveSettings(); // 立刻回写，把明文密码从 data.json 抹掉
 		}
 	}

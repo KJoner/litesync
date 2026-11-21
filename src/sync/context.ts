@@ -62,6 +62,11 @@ export interface SyncContext {
 	signingPublicKey?: () => string;
 	/** 登记成功回调（main 侧据此不再重复登记） */
 	onSigningKeyRegistered?: () => void;
+	/**
+	 * 本设备签名公钥（base64 SPKI，**始终**返回，不随登记清空；0.20）：
+	 * 采纳配对包信任锚时把自己加进信任集合，本设备之后发布的 checkpoint 才能被自己验证。
+	 */
+	deviceSigningPublicKey?: () => string;
 	log(msg: string): void;
 	/** durationMs=0 表示常驻通知（移动端没有状态栏，重要提示 8 秒会被错过）。 */
 	/** 弹通知；返回句柄可用于在状态恢复时主动撤下常驻（duration 0）的那条。 */

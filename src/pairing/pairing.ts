@@ -45,6 +45,26 @@ export interface PairingConfig {
 		/** deviceId → base64 SPKI 签名公钥 */
 		devicePublicKeys: Record<string, string>;
 	};
+	// ---- 0.20 指定仓库配对（ADR-014）：以下字段只用于展示与核对，授权以服务端 grant 为准 ----
+	/** 发行时选定的仓库：vaultId 是选择器，vaultIdentity 是加密绑定身份（= v1 info.vaultId） */
+	selectedVault?: { vaultId: string; vaultIdentity?: string; displayName?: string };
+	/** 发行者账号的展示名（不是授权依据） */
+	accountLabel?: string;
+	/** 发行端的同步协议版本 */
+	protocolVersion?: number;
+	/** 导入端必须认识的能力；出现不认识的 → 拒绝导入并提示升级 */
+	requiredCapabilities?: string[];
+	/** 信任方式：verified_transfer 只在发行端持有已验证并保存的锚时才会出现 */
+	trust?: PairingTrust;
+}
+
+/** 配对包里的信任方式（契约 §5.2）。 */
+export interface PairingTrust {
+	mode: "new_vault_genesis" | "first_trust" | "verified_transfer";
+	repoEpoch?: string;
+	checkpointHash?: string;
+	headSequence?: number;
+	devicePublicKeys?: Record<string, string>;
 }
 
 const PAIRING_AAD = "litesync/v1/pairing";

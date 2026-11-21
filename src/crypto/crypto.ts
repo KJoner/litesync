@@ -342,6 +342,41 @@ export async function createVaultKeyDoc(
 	};
 }
 
+/**
+ * 用新密码重新包装**已有的** VMK（v0.20 / ADR-013 分支 b：忘记密码时的受控重包装）。
+ *
+ * 与 {@link createVaultKeyDoc} 唯一的区别是 VMK 不重新生成：盐与 IV 全新、
+ * 迭代次数取当前常量、AAD 不变，其余字段（version / enabled / createdAt）沿用 base。
+ * 生成新随机 VMK 覆盖旧文档会让服务器上已有的全部密文永久不可读——那正是
+ * 这个函数存在要防止的事。调用方负责在上传后用新密码试解、确认得到同一把 VMK，
+ * 并在用完后清零 vmkRaw。
+ */
+export async function wrapVmkIntoKeyDoc(
+	password: string,
+	vmkRaw: Uint8Array,
+	base: VaultKeyDoc,
+): Promise<VaultKeyDoc> {
+	if (vmkRaw.length !== 32) throw new Error("VMK 必须是 32 字节");
+	const salt = randomBytes(16);
+	const iv = randomBytes(IV_LEN);
+	const kek = await deriveKek(password, salt, KDF_ITERATIONS);
+	const wrapped = new Uint8Array(
+		await crypto.subtle.encrypt(
+			{ name: "AES-GCM", iv: iv as BufferSource, additionalData: VMK_AAD as BufferSource },
+			kek,
+			vmkRaw as BufferSource,
+		),
+	);
+	return {
+		...base,
+		kdf: "pbkdf2-sha256",
+		iterations: KDF_ITERATIONS,
+		salt: b64encode(salt),
+		iv: b64encode(iv),
+		wrappedKey: b64encode(wrapped),
+	};
+}
+
 /** 用密码解锁 VMK；密码错误或数据被篡改（GCM 认证失败）返回 null。 */
 export async function unlockVaultKey(doc: VaultKeyDoc, password: string): Promise<CryptoKey | null> {
 	try {
