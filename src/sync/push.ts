@@ -385,6 +385,22 @@ type Outcome = "pushed" | "skipped" | "conflict";
 const MOBILE_LARGE_FILE_WARNING_BYTES = 50 << 20;
 const warnedLargeFiles = new Set<string>();
 
+/**
+ * 服务端 0.20 的账号存储配额用完（413 QUOTA_EXCEEDED，retryable=false）。
+ * 这不是「文件太大」：一轮里每个待上传的文件都会撞上同一堵墙，所以提示做节流（10 分钟一次），
+ * 文件照常留在本地与队列里，额度恢复后自动继续。
+ */
+let lastQuotaNoticeAt = 0;
+function notifyQuotaExceeded(ctx: SyncContext, path: string): void {
+	const now = Date.now();
+	if (now - lastQuotaNoticeAt < 10 * 60_000) return;
+	lastQuotaNoticeAt = now;
+	ctx.notify(
+		`服务器上的账号存储配额已用完：「${path}」等修改暂时没有上传（本地文件不受影响）。` +
+			`删除不需要的文件或清理历史版本后会自动继续；也可以联系管理员调整配额。`,
+	);
+}
+
 async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 	// 文件处于 unresolved conflict：不继续自动 Push（计划书 Pending Conflict 规则）
 	if (ctx.store.getConflict(path)) return "skipped";
@@ -507,6 +523,10 @@ async function pushUpsert(ctx: SyncContext, path: string): Promise<Outcome> {
 			return kept === null ? "skipped" : "conflict";
 		}
 		if (e instanceof ApiError && e.status === 413) {
+			if (e.is("QUOTA_EXCEEDED")) {
+				notifyQuotaExceeded(ctx, path);
+				return "skipped";
+			}
 			ctx.notify(`Skipped large file（超过服务器大小限制）: ${path}`);
 			return "skipped";
 		}

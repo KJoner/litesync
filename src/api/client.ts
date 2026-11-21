@@ -273,6 +273,9 @@ export type ServerErrorCode =
 	| "CONFLICT"
 	| "NOT_FOUND"
 	| "TOO_LARGE"
+	// 服务端 0.20：永久性配额超限（存储 413 / 仓库数 409，retryable=false）与临时限流（429）
+	| "QUOTA_EXCEEDED"
+	| "RATE_LIMITED"
 	| "INTERNAL";
 
 export class ApiError extends Error {

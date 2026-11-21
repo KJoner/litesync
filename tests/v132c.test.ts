@@ -305,6 +305,28 @@ for (const [label, error] of [
 	});
 }
 
+// 服务端 0.20 配额（INV-03）：413 QUOTA_EXCEEDED 不是「文件太大」——提示说清楚是账号配额，
+// 文件跳过但留在本地与队列里（不丢、不覆盖任何东西）；一轮里多个文件撞上只提示一次。
+test("0.20: 存储配额用完（413 QUOTA_EXCEEDED）→ 跳过并提示配额，不当作文件过大，不刷屏", async () => {
+	const { ctx, vault, queue } = await movePushCtx(new ApiError(400, "bad", "INVALID_BODY"));
+	const notices: string[] = [];
+	(ctx as unknown as { notify: (m: string) => void }).notify = (m: string) => void notices.push(m);
+	(ctx.client as unknown as { upload: unknown }).upload = async () => {
+		throw new ApiError(413, "storage quota exceeded", "QUOTA_EXCEEDED", false);
+	};
+	vault.files.set("q1.md", bytes("一"));
+	vault.files.set("q2.md", bytes("二"));
+	const { pushPendingChanges } = await import("../src/sync/push");
+	queue.stage("q1.md", { action: "upsert" });
+	queue.stage("q2.md", { action: "upsert" });
+	await pushPendingChanges(ctx);
+
+	assert.equal(notices.length, 1, `同一轮只提示一次：${notices.join(" | ")}`);
+	assert.match(notices[0], /配额/);
+	assert.doesNotMatch(notices[0], /大小限制/, "配额用完不能说成文件过大");
+	assert.ok(vault.files.has("q1.md") && vault.files.has("q2.md"), "本地文件必须原样保留");
+});
+
 test("§6.10: 退化时新内容上传失败 → 完全不碰旧对象", async () => {
 	const { ctx, calls, queue } = await movePushCtx(new ApiError(400, "bad", "INVALID_BODY"));
 	(ctx.client as unknown as { upload: unknown }).upload = async () => {
