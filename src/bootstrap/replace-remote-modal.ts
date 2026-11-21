@@ -4,12 +4,14 @@ import {
 	abandonReplaceJob,
 	buildReverseJob,
 	confirmPhrase,
-	confirmReplaceJob,
+	confirmReplaceJobChecked,
 	jobUnfinished,
+	openReplacePermit,
 	planReplaceRemote,
 	recoveryDir,
 	refreshReverseWatermark,
 	replaceCapabilities,
+	ReplaceJobError,
 	ReplaceProgress,
 	runReplaceJob,
 	saveRecoveryPoint,
@@ -30,6 +32,8 @@ export interface ReplaceModalOptions {
 	vaultChoice: string;
 	/** 计划前的准备（已接入设备：先等同步收敛、待推送队列排空） */
 	beforePlan?: () => Promise<void>;
+	/** 执行 / 续跑前的准备（已接入设备：完成一次权威绑定校验，重启后 gate 是 unbound） */
+	beforeResume?: () => Promise<void>;
 	/** 执行期间冻结普通同步（已接入设备） */
 	holdSync: () => void;
 	releaseSync: () => void;
@@ -188,7 +192,8 @@ export class ReplaceRemoteModal extends Modal {
 		});
 		footer.createEl("button", { text: "取消" }).onclick = () => this.close();
 		btn.onclick = () => {
-			const ok = confirmReplaceJob(job, input.value, Date.now());
+			// 确认前复核执行许可（PL-03）：预览之后才出现的停机（完整性、凭据、换连接……）在这里挡住
+			const ok = confirmReplaceJobChecked(this.ctx, job, input.value, Date.now());
 			if (!ok.ok) {
 				status.setText(ok.reason);
 				return;
@@ -261,8 +266,11 @@ export class ReplaceRemoteModal extends Modal {
 			status.setText(p.total ? `${what} ${p.done}/${p.total}${p.current ? `：${p.current}` : ""}` : `${what}…`);
 		};
 		try {
-			if (!job.snapshotComplete) await saveRecoveryPoint(this.ctx, job, show);
-			const r = await runReplaceJob(this.ctx, job, show);
+			await this.opts.beforeResume?.();
+			// 执行许可（PL-03）：签发时核对一遍门；之后每个破坏性动作前再核对它没有被收回
+			const permit = openReplacePermit(this.ctx, job);
+			if (!job.snapshotComplete) await saveRecoveryPoint(this.ctx, job, show, permit);
+			const r = await runReplaceJob(this.ctx, job, show, permit);
 			if (r.state === "completed") {
 				this.opts.releaseSync();
 				await this.opts.onCompleted?.(job);
@@ -273,8 +281,12 @@ export class ReplaceRemoteModal extends Modal {
 			this.opts.releaseSync();
 			this.renderStale(job, r.reason ?? "");
 		} catch (e) {
-			// interrupted：普通同步保持暂停，直到用户继续或放弃
-			status.setText(`执行中断（可稍后继续，已完成的不会重复）：${e instanceof Error ? e.message : String(e)}`);
+			// interrupted / 被执行许可挡下：普通同步保持暂停，直到用户继续、放弃或回滚
+			if (e instanceof ReplaceJobError && e.code === "blocked") {
+				status.setText(`${e.message}。处理好之后可以继续（已完成的不会重复，恢复点完好）。`);
+			} else {
+				status.setText(`执行中断（可稍后继续，已完成的不会重复）：${e instanceof Error ? e.message : String(e)}`);
+			}
 			btn.disabled = false;
 			btn.setText("继续执行");
 		} finally {

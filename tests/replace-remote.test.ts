@@ -1,7 +1,8 @@
 // v0.20「用本地完整替换远端」高级恢复作业（ADR-016，验收 SY-03 / SY-04）。
 //
-// 内存服务端按真实协议建模：revision CAS、墓碑挡住普通上传（必须显式 restore）、
-// operationId 幂等（同一键返回首次结果）、LSE3 generation 单调、变更流 sequence。
+// 内存服务端按真实协议建模（tests/fakes/replace-server.ts，0.20.1 起共用）：revision CAS、墓碑挡住普通上传
+// （必须显式 restore）、operationId 幂等（同一键返回首次结果）、LSE3 generation 单调、变更流 sequence、
+// 元数据加密态的建档 metadata 要求（service.go:508–519）。
 //
 // 覆盖：
 //   计划只读：dry-run 不产生任何远端写入；新建/覆盖/删除/不变/范围外 计数与实际动作一致
@@ -19,14 +20,6 @@ import { test } from "node:test";
 
 (globalThis as unknown as { window: unknown }).window = globalThis;
 
-import {
-	ConflictError,
-	DownloadResult,
-	NotFoundError,
-	RemoteChange,
-	SnapshotFile,
-	UploadOk,
-} from "../src/api/client";
 import { bootstrapMerge } from "../src/bootstrap/bootstrap-manager";
 import {
 	buildReverseJob,
@@ -39,258 +32,10 @@ import {
 	runReplaceJob,
 	saveRecoveryPoint,
 } from "../src/bootstrap/replace-remote";
-import { createVaultKeyDoc, newFileId, parseLse3Header } from "../src/crypto/crypto";
+import { createVaultKeyDoc, parseLse3Header } from "../src/crypto/crypto";
 import { Keyring } from "../src/crypto/keyring";
-import { StateStore } from "../src/state/store";
-import type { SyncContext } from "../src/sync/context";
-import { SyncGate } from "../src/sync/gate";
-import { PendingQueue } from "../src/sync/queue";
 import { sha256Hex } from "../src/utils/hash";
-
-const enc = (s: string): ArrayBuffer => new TextEncoder().encode(s).buffer as ArrayBuffer;
-const dec = (b: ArrayBuffer): string => new TextDecoder().decode(b);
-
-interface Head {
-	fileId: string;
-	revision: number;
-	hash: string;
-	data: ArrayBuffer;
-	deleted: boolean;
-	generation: number;
-	priorHash?: string;
-}
-
-/** 按真实语义建模的内存服务端（只实现作业用到的接口）。 */
-class FakeServer {
-	heads = new Map<string, Head>();
-	seq = 0;
-	changes: RemoteChange[] = [];
-	ops = new Map<string, UploadOk>();
-	writes = 0;
-	/** 故障注入：第 n 次写入在**提交之后**抛网络错误（模拟响应丢失） */
-	loseResponseOnWrite = -1;
-	vaultId = "a".repeat(32);
-	repoEpoch = "epoch-1";
-
-	seed(path: string, content: string): void {
-		const data = enc(content);
-		this.seq++;
-		const fileId = newFileId();
-		void sha256Hex(data).then((hash) => {
-			this.heads.set(path, { fileId, revision: 1, hash, data, deleted: false, generation: 0 });
-		});
-		this.changes.push({ sequence: this.seq, path, fileId, action: "upsert", revision: 1 });
-	}
-
-	async seedAsync(path: string, content: string): Promise<Head> {
-		const data = enc(content);
-		this.seq++;
-		const h: Head = { fileId: newFileId(), revision: 1, hash: await sha256Hex(data), data, deleted: false, generation: 0 };
-		this.heads.set(path, h);
-		this.changes.push({ sequence: this.seq, path, fileId: h.fileId, action: "upsert", revision: 1 });
-		return h;
-	}
-
-	private record(path: string, h: Head, action: RemoteChange["action"]): number {
-		this.seq++;
-		this.changes.push({ sequence: this.seq, path, fileId: h.fileId, action, revision: h.revision, hash: h.hash });
-		return this.seq;
-	}
-
-	private maybeLose(): void {
-		this.writes++;
-		if (this.writes === this.loseResponseOnWrite) throw new Error("network: response lost");
-	}
-
-	client() {
-		const srv = this;
-		return {
-			async info() {
-				return {
-					version: "fake",
-					latestSequence: srv.seq,
-					headSequence: srv.seq,
-					serverTime: 0,
-					vaultId: srv.vaultId,
-					repoEpoch: srv.repoEpoch,
-					keyEpoch: 1,
-					formatEpoch: 1,
-					protocolVersion: 6,
-					minProtocolVersion: 6,
-				};
-			},
-			async snapshot(): Promise<{ sequence: number; files: SnapshotFile[]; repoEpoch: string }> {
-				const files: SnapshotFile[] = [];
-				for (const [path, h] of srv.heads) {
-					if (h.deleted) continue;
-					files.push({ path, revision: h.revision, hash: h.hash, size: h.data.byteLength, mtime: 1, fileId: h.fileId });
-				}
-				return { sequence: srv.seq, files, repoEpoch: srv.repoEpoch };
-			},
-			async download(path: string): Promise<DownloadResult> {
-				const h = srv.heads.get(path);
-				if (!h || h.deleted) throw new NotFoundError(h?.deleted ?? false, h?.revision ?? 0);
-				return { data: h.data.slice(0), revision: h.revision, hash: h.hash, size: h.data.byteLength, mtime: 1, fileId: h.fileId };
-			},
-			async upload(
-				path: string,
-				base: number,
-				hash: string,
-				data: ArrayBuffer,
-				_mtime: number,
-				_action: string,
-				fileId?: string,
-				_meta?: unknown,
-				operationId?: string,
-			): Promise<UploadOk> {
-				const cur = srv.heads.get(path);
-				if (cur && !cur.deleted && operationId) {
-					const prev = srv.ops.get(`${cur.fileId}:${operationId}`);
-					if (prev) return prev; // 幂等 ②：同一 operationId 返回首次结果
-				}
-				if (cur && !cur.deleted && cur.hash === hash) {
-					return { path, revision: cur.revision, hash: cur.hash, size: data.byteLength, sequence: srv.seq, fileId: cur.fileId };
-				}
-				// 与服务端一致：只有带 LSE3 信封头的载荷才做 generation 单调检查（hasGen）
-				const header = parseLse3Header(data);
-				const gen = header?.generation ?? 0;
-				if (!cur || cur.deleted) {
-					if (cur?.deleted) {
-						throw new ConflictError({
-							path,
-							revision: cur.revision,
-							hash: "",
-							deleted: true,
-							priorHash: cur.priorHash,
-							fileId: cur.fileId,
-							contentGeneration: cur.generation,
-						});
-					}
-					if (base !== 0) throw new ConflictError({ path, revision: 0, hash: "", deleted: false });
-					const h: Head = { fileId: fileId ?? newFileId(), revision: 1, hash, data, deleted: false, generation: gen };
-					srv.heads.set(path, h);
-					const sequence = srv.record(path, h, "upsert");
-					const ok = { path, revision: 1, hash, size: data.byteLength, sequence, fileId: h.fileId, contentGeneration: gen };
-					if (operationId) srv.ops.set(`${h.fileId}:${operationId}`, ok);
-					srv.maybeLose();
-					return ok;
-				}
-				if (base !== cur.revision) {
-					throw new ConflictError({ path, revision: cur.revision, hash: cur.hash, deleted: false, fileId: cur.fileId });
-				}
-				if (header && cur.generation > 0 && gen <= cur.generation) {
-					throw new ConflictError({ path, revision: cur.revision, hash: cur.hash, deleted: false, fileId: cur.fileId });
-				}
-				cur.revision++;
-				cur.hash = hash;
-				cur.data = data;
-				if (gen) cur.generation = gen;
-				const sequence = srv.record(path, cur, "upsert");
-				const ok = { path, revision: cur.revision, hash, size: data.byteLength, sequence, fileId: cur.fileId, contentGeneration: cur.generation };
-				if (operationId) srv.ops.set(`${cur.fileId}:${operationId}`, ok);
-				srv.maybeLose();
-				return ok;
-			},
-			async remove(path: string, base: number) {
-				const cur = srv.heads.get(path);
-				if (!cur) throw new NotFoundError();
-				if (cur.deleted) throw new ConflictError({ path, revision: cur.revision, hash: "", deleted: true, fileId: cur.fileId });
-				if (base !== cur.revision) {
-					throw new ConflictError({ path, revision: cur.revision, hash: cur.hash, deleted: false, fileId: cur.fileId });
-				}
-				cur.revision++;
-				cur.deleted = true;
-				cur.priorHash = cur.hash;
-				const sequence = srv.record(path, cur, "delete");
-				srv.maybeLose();
-				return { revision: cur.revision, sequence };
-			},
-			async restore(fileId: string, params: { expectedTombstoneRevision: number; contentGeneration: number; pseudonym: string }) {
-				for (const [path, h] of srv.heads) {
-					if (h.fileId !== fileId) continue;
-					if (!h.deleted || h.revision !== params.expectedTombstoneRevision) throw new Error("restore precondition failed");
-					h.deleted = false;
-					h.revision++;
-					h.generation = Math.max(h.generation, params.contentGeneration);
-					const sequence = srv.record(path, h, "restore");
-					return { fileId, path: params.pseudonym, revision: h.revision, sequence };
-				}
-				throw new Error("restore: unknown fileId");
-			},
-			async changes(since: number) {
-				const list = srv.changes.filter((c) => c.sequence > since);
-				return { latestSequence: srv.seq, hasMore: false, changes: list };
-			},
-		};
-	}
-}
-
-/** 内存 Vault：用户文件 + 插件目录（恢复点写在这里）。 */
-class MemVault {
-	files = new Map<string, ArrayBuffer>();
-	dirs = new Set<string>();
-	adapter = {
-		stat: async (p: string) => (this.files.has(p) ? { type: "file", mtime: 1000, size: this.files.get(p)!.byteLength } : null),
-		readBinary: async (p: string) => {
-			const d = this.files.get(p);
-			if (!d) throw new Error(`no such file ${p}`);
-			return d.slice(0);
-		},
-		writeBinary: async (p: string, d: ArrayBuffer) => void this.files.set(p, d.slice(0)),
-		write: async (p: string, d: string) => void this.files.set(p, enc(d)),
-		exists: async (p: string) => this.files.has(p) || this.dirs.has(p),
-		mkdir: async (p: string) => void this.dirs.add(p),
-		read: async (p: string) => dec(this.files.get(p)!),
-	};
-	put(path: string, content: string): void {
-		this.files.set(path, enc(content));
-	}
-	userFiles(): { path: string }[] {
-		return [...this.files.keys()].filter((p) => !p.startsWith(".obsidian/")).map((path) => ({ path }));
-	}
-}
-
-async function makeCtx(server: FakeServer, vault: MemVault, keyring = new Keyring()): Promise<SyncContext> {
-	const store = new StateStore(
-		{
-			exists: async (p: string) => vault.files.has(`state:${p}`),
-			read: async (p: string) => dec(vault.files.get(`state:${p}`)!),
-			write: async (p: string, d: string) => void vault.files.set(`state:${p}`, enc(d)),
-		} as unknown as ConstructorParameters<typeof StateStore>[0],
-		"state.json",
-	);
-	await store.load();
-	store.state.bootstrap = {
-		status: "ready",
-		mode: "merge",
-		remoteVaultId: server.vaultId,
-		repoEpoch: server.repoEpoch,
-		keyEpoch: 1,
-		formatEpoch: 1,
-		minimumEnvelopeVersion: 3,
-		metaState: "plain",
-		completedAt: 0,
-	};
-	return {
-		app: { vault: { adapter: vault.adapter, configDir: ".obsidian", getFiles: () => vault.userFiles() } },
-		client: server.client(),
-		store,
-		queue: new PendingQueue(),
-		gate: new SyncGate(),
-		e2ee: keyring,
-		ignores: (p: string) => p.startsWith(".trash/") || p.startsWith(".obsidian/") || p.startsWith("state:"),
-		padsSize: () => false,
-		reportedMtime: (ms: number) => ms,
-		pluginDir: () => ".obsidian/plugins/litesync",
-		log: () => {},
-		notify: () => {},
-		onConflictsChanged: () => {},
-		syncObsidian: () => false,
-		deviceName: () => "test",
-		credentials: () => ({ serverUrl: "https://s", apiToken: "t" }),
-		refreshE2ee: async () => {},
-	} as unknown as SyncContext;
-}
+import { dec, enc, FakeServer, makeCtx, MemVault } from "./fakes/replace-server";
 
 /** 典型场景：a 一致、b 不同、c 只在远端、d 只在本地、.trash 下的远端文件不在同步范围。 */
 async function scenario() {
@@ -328,8 +73,9 @@ test("SY-04：dry-run 只读——计数与条目一一对应，范围外文件�
 	assert.equal(job.state, "planned");
 	assert.equal(job.plannedHeadSequence, server.seq);
 	assert.ok(job.items.every((it) => /^[0-9a-f]{24}$/.test(it.operationId)), "幂等键在计划阶段固定");
-	// 执行顺序：覆盖 → 删除 → 新建（删除先腾出仅大小写不同的名字）
-	assert.deepEqual(job.items.filter((i) => i.action !== "keep").map((i) => i.action), ["update", "delete", "create"]);
+	// 执行顺序（0.20.1）：覆盖 → 新建 → 删除——新建失败时远端还没少任何东西；
+	// 只有要占用被删对象名字（仅大小写不同）的新建排在删除之后
+	assert.deepEqual(job.items.filter((i) => i.action !== "keep").map((i) => i.action), ["update", "create", "delete"]);
 });
 
 test("SY-03：远端在同步范围内为空 → 拒绝，引导使用「用本地初始化空仓库」", async () => {
@@ -404,7 +150,7 @@ test("中断续跑：提交后响应丢失 → interrupted；续跑用同一 ope
 
 test("删除的响应丢失：续跑撞上自己的墓碑 → 按结果判定已完成", async () => {
 	const { server, job, ctx } = await prepared();
-	server.loseResponseOnWrite = 2; // 第二个写入是 c.md 的删除
+	server.loseResponseOnWrite = 3; // 第三个写入是 c.md 的删除（覆盖 b.md → 新建 d.md → 删除 c.md）
 	await assert.rejects(runReplaceJob(ctx, job), /response lost/);
 	const r = await runReplaceJob(ctx, job);
 	assert.equal(r.state, "completed");

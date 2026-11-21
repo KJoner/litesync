@@ -44,6 +44,12 @@ export class SyncGate {
 	private repoEpoch: string | null = null;
 	/** 迁移进行中（元数据加密 / 信封升级 / E2EE 启用）：串行化并阻断其他写入 */
 	private migration: string | null = null;
+	/**
+	 * 迁移锁的所有者（0.20.1 / 复审 PL-03）：只有持有者自己的执行许可可以豁免这把锁。
+	 * 「用本地完整替换远端」作业冻结普通同步用的就是迁移锁——它的许可只豁免自己这一把，
+	 * 别的迁移（路径加密、信封升级、启用 E2EE）照样挡住它。
+	 */
+	private migrationOwner: string | null = null;
 	/** 不可自动恢复的完整性错误（如服务器换掉了 fileId）：需要人工处理 */
 	private integrity: string | null = null;
 	/**
@@ -91,27 +97,44 @@ export class SyncGate {
 		this.integrity = null;
 	}
 
-	beginMigration(what: string): void {
+	beginMigration(what: string, owner?: string): void {
 		this.migration = what;
+		this.migrationOwner = owner ?? null;
 	}
 
 	endMigration(): void {
 		this.migration = null;
+		this.migrationOwner = null;
 	}
 
-	/** 仅返回会话级阻断项；仓库/密钥状态由 {@link syncGateBlock} 合并判断。 */
-	sessionBlock(): GateBlock | null {
+	/** 当前迁移锁的所有者（未上锁或匿名锁为 null）。 */
+	get migrationLockOwner(): string | null {
+		return this.migrationOwner;
+	}
+
+	/**
+	 * 仅返回会话级阻断项；仓库/密钥状态由 {@link syncGateBlock} 合并判断。
+	 *
+	 * opts（0.20.1 / PL-03，只给有所有权的执行许可用）：
+	 * - exemptMigrationOwner：只豁免**由这个所有者持有**的迁移锁；
+	 * - exemptUnbound：接入向导里（bootstrap 仍 pending）的作业还没有正式绑定，权威校验由作业自己的
+	 *   /info 身份核对 + 连接上下文代次承担。完整性、协议、凭据、repoEpoch 一律不豁免。
+	 */
+	sessionBlock(opts: { exemptMigrationOwner?: string; exemptUnbound?: boolean } = {}): GateBlock | null {
 		if (this.integrity !== null) return { reason: "integrity-error", message: this.integrity };
 		if (this.protocol !== null) return { reason: "protocol-mismatch", message: this.protocol };
 		if (this.credential !== null) return { reason: "credential-rejected", message: this.credential };
 		if (this.repoEpoch !== null) return { reason: "repo-epoch-mismatch", message: this.repoEpoch };
-		if (this.unbound !== null) {
+		if (this.unbound !== null && opts.exemptUnbound !== true) {
 			return {
 				reason: "unbound",
 				message: `本设备尚未与当前服务器完成绑定校验（${this.unbound}）；请先执行一次「立即同步」完成校验`,
 			};
 		}
-		if (this.migration !== null) {
+		if (
+			this.migration !== null &&
+			!(opts.exemptMigrationOwner !== undefined && this.migrationOwner === opts.exemptMigrationOwner)
+		) {
 			return { reason: "migration-active", message: `正在执行${this.migration}，请等待完成后再操作` };
 		}
 		return null;

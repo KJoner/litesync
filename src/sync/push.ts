@@ -11,6 +11,7 @@ import { FileState } from "../state/store";
 import {
 	downloadPlain,
 	e2eeBinding,
+	EnvelopeBindingMissingError,
 	metaEncrypted,
 	removeRemote,
 	serverPathOf,
@@ -325,6 +326,74 @@ async function renameMetadata(
  * 恢复请求必须原样带回前两者（防复活锚点），并提交严格更新的内容世代（抗回退）。
  * 服务器没给 fileId（旧版本）时返回 null，调用方放弃而不是盲目重建。
  */
+/** 一次显式恢复请求的参数（全部由调用方决定，重试时原样重发）。 */
+export interface RestoreRequest {
+	/** 本地真实路径（meta 模式下只进 LSM1 密文与 canonical HMAC，绝不进请求明文） */
+	path: string;
+	/** 被恢复对象的身份（墓碑的 fileId） */
+	fileId: string;
+	/** 防复活锚点：墓碑的删除 revision */
+	expectedTombstoneRevision: number;
+	/** 恢复写入的内容世代（必须严格大于删除时的世代） */
+	contentGeneration: number;
+	/** meta 模式：LSM1 信封里写的元数据世代（恢复后服务器上是墓碑的值 + 1） */
+	metaGeneration?: number;
+	operationId?: string;
+}
+
+export interface RestoreResponse {
+	fileId: string;
+	/** 服务器寻址名（meta 模式为伪名 = fileId） */
+	path: string;
+	revision: number;
+	sequence: number;
+	metaGeneration?: number;
+}
+
+/**
+ * 发出一次显式恢复请求，**不碰本地 FileState**（0.20.1 / 复审 PL-02、PL-05）。
+ *
+ * meta 模式下恢复请求必带 LSM1 元数据与 canonical HMAC（服务端 Restore 的前置条件），
+ * 寻址名必须等于 fileId。完整替换作业自己持久化每一步的结果，所以需要一个没有副作用的版本；
+ * 普通 push / 接入合并走下面的 restoreObject（顺带记账）。
+ */
+export async function requestRestore(ctx: SyncContext, req: RestoreRequest): Promise<RestoreResponse> {
+	let meta: { metaEnc: string; canonicalHash: string } | undefined;
+	let pseudonym = req.path;
+	if (metaEncrypted(ctx)) {
+		const bind = e2eeBinding(ctx);
+		if (!bind) throw new EnvelopeBindingMissingError(req.path);
+		const keys = await ctx.e2ee.metaKeys();
+		pseudonym = req.fileId;
+		meta = {
+			metaEnc: await encryptMeta(
+				keys,
+				{ vaultId: bind.vaultId, keyEpoch: bind.keyEpoch, fileId: req.fileId, metaGeneration: req.metaGeneration ?? 1 },
+				{ path: req.path },
+			),
+			canonicalHash: await canonicalPathHmac(keys, req.path),
+		};
+	}
+	const out = await ctx.client.restore(
+		req.fileId,
+		{
+			expectedTombstoneRevision: req.expectedTombstoneRevision,
+			contentGeneration: req.contentGeneration,
+			pseudonym,
+			metaEnc: meta?.metaEnc,
+			canonicalHash: meta?.canonicalHash,
+		},
+		req.operationId,
+	);
+	return {
+		fileId: out.fileId,
+		path: out.path,
+		revision: out.revision,
+		sequence: out.sequence ?? 0,
+		metaGeneration: out.metaGeneration,
+	};
+}
+
 export async function restoreObject(
 	ctx: SyncContext,
 	path: string,
@@ -335,34 +404,15 @@ export async function restoreObject(
 	if (!server.fileId) return null;
 	const tracked = ctx.store.get(path);
 	const nextGen = Math.max(server.contentGeneration ?? 0, tracked?.generation ?? 0) + 1;
-
-	let meta: { metaEnc: string; canonicalHash: string } | undefined;
-	let pseudonym = path;
-	if (metaEncrypted(ctx)) {
-		const bind = e2eeBinding(ctx);
-		if (!bind) return null;
-		const keys = await ctx.e2ee.metaKeys();
-		pseudonym = server.fileId;
-		meta = {
-			metaEnc: await encryptMeta(
-				keys,
-				{ vaultId: bind.vaultId, keyEpoch: bind.keyEpoch, fileId: server.fileId, metaGeneration: 1 },
-				{ path },
-			),
-			canonicalHash: await canonicalPathHmac(keys, path),
-		};
-	}
-	const out = await ctx.client.restore(
-		server.fileId,
-		{
-			expectedTombstoneRevision: server.revision,
-			contentGeneration: nextGen,
-			pseudonym,
-			metaEnc: meta?.metaEnc,
-			canonicalHash: meta?.canonicalHash,
-		},
+	if (metaEncrypted(ctx) && !e2eeBinding(ctx)) return null;
+	const out = await requestRestore(ctx, {
+		path,
+		fileId: server.fileId,
+		expectedTombstoneRevision: server.revision,
+		contentGeneration: nextGen,
+		metaGeneration: 1,
 		operationId,
-	);
+	});
 	// generation 必须记账：restore 已把服务器上该对象的 contentGeneration 推到
 	// nextGen——紧接着的内容上传要在它**之上**（nextGen+1）。漏记的话上传会从
 	// tracked（空 → 0）推导出 generation 1 ≤ nextGen，被服务器按回退拒绝（409），
@@ -376,7 +426,7 @@ export async function restoreObject(
 		...(metaEncrypted(ctx) ? { metaGeneration: 1 } : { metaGeneration: out.metaGeneration }),
 		serverPseudonym: metaEncrypted(ctx) ? out.path : undefined,
 	});
-	return { fileId: out.fileId, revision: out.revision, sequence: out.sequence ?? 0 };
+	return { fileId: out.fileId, revision: out.revision, sequence: out.sequence };
 }
 
 type Outcome = "pushed" | "skipped" | "conflict";

@@ -1026,6 +1026,33 @@ export class ApiClient {
 
 	// ---------- 元数据加密（协议 v6，ADR-003） ----------
 
+	/**
+	 * 回收站（服务端 0.20：GET /api/v1/trash）：本仓库仍保留的删除记录。
+	 *
+	 * 0.20.1（复审 PL-02）：路径加密仓库显式恢复时，LSM1 信封里的元数据世代要与服务器恢复后的值
+	 * （墓碑的值 + 1）一致，否则之后的改名会因 CAS 世代对不上而失败。只读；旧服务器 404。
+	 */
+	async trash(): Promise<
+		Array<{ fileId: string; path: string; deletionRevision: number; contentGeneration: number; metaGeneration: number; restorable: boolean }>
+	> {
+		const res = await requestUrl({
+			url: `${this.base()}/api/v1/trash`,
+			method: "GET",
+			headers: this.headers(),
+			throw: false,
+		});
+		if (res.status !== 200) throw apiError(res.status, "trash failed", res.text);
+		const body = res.json as { items?: Array<Record<string, unknown>> };
+		return (body.items ?? []).map((t) => ({
+			fileId: typeof t.fileId === "string" ? t.fileId : "",
+			path: typeof t.path === "string" ? t.path : "",
+			deletionRevision: Number(t.deletionRevision ?? 0),
+			contentGeneration: Number(t.contentGeneration ?? 0),
+			metaGeneration: Number(t.metaGeneration ?? 0),
+			restorable: t.restorable === true,
+		}));
+	}
+
 	/** 轻量获取文件元数据（改名变更无需下载内容）。 */
 	async getFileMeta(
 		path: string,

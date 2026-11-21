@@ -35,7 +35,7 @@ import { PasteLinkModal, registerImportHandler, resumePendingRedeem } from "./pa
 import { consumePairing, PairingConfig } from "./pairing/pairing";
 import { PairingTransport } from "./pairing/pairing-v2";
 import { OpenWebsiteModal, websiteUrl } from "./onboarding";
-import { jobUnfinished } from "./bootstrap/replace-remote";
+import { jobUnfinished, REPLACE_LOCK_OWNER } from "./bootstrap/replace-remote";
 import { ReplaceRemoteModal } from "./bootstrap/replace-remote-modal";
 import { AddDeviceModal } from "./pairing/pairing-modal";
 import { DEFAULT_SETTINGS, PluginSettings, SyncSettingTab } from "./settings";
@@ -631,7 +631,10 @@ export default class PrivateSyncPlugin extends Plugin {
 
 	private holdReplaceGate(): void {
 		if (this.replaceGateHeld) return;
-		this.gate.beginMigration("「用本地完整替换远端」作业");
+		// 别的迁移（路径加密、信封升级、启用 E2EE）正持有迁移锁：不抢它的锁（PL-03）——
+		// 作业的执行许可会因为这把不属于自己的锁而挡停，等那个迁移结束再继续
+		if (this.gate.isMigrationActive && this.gate.migrationLockOwner !== REPLACE_LOCK_OWNER) return;
+		this.gate.beginMigration("「用本地完整替换远端」作业", REPLACE_LOCK_OWNER);
 		this.replaceGateHeld = true;
 	}
 
@@ -680,6 +683,10 @@ export default class PrivateSyncPlugin extends Plugin {
 				// 先等同步收敛：待推送队列里的本地修改若不先推完，作业的预览与真实状态不一致
 				beforePlan: async () => {
 					await this.manager!.fullSync("pre-replace");
+				},
+				// 续跑前先完成一次权威绑定校验（重启后 gate 处于 unbound；作业冻结期间同步轮只做校验、不推拉）
+				beforeResume: async () => {
+					await this.manager!.sync("replace-resume");
 				},
 				holdSync: () => this.holdReplaceGate(),
 				releaseSync: () => this.releaseReplaceGate(),

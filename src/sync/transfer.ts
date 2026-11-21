@@ -461,6 +461,23 @@ export interface UploadOptions {
 	 * 未提供时不发送（保持旧行为）。
 	 */
 	operationId?: string;
+	/**
+	 * 调用方自己掌握的对象身份（0.20.1 / 复审 PL-02），不经 FileState 推断。
+	 *
+	 * 「本地有 FileState」曾被当成「远端已有这个对象」：完整替换作业为了固定新对象的 fileId
+	 * 先写了 FileState，路径加密仓库的建档请求于是不带 LSM1 元数据，被服务器 META_REQUIRED 拒绝。
+	 * 两件事必须分开：
+	 * - `reserved`：只是预留了身份，远端还没有这个对象 → 建档（meta 模式必带 LSM1 + canonical HMAC）；
+	 * - `established`：远端确有这个对象（覆盖 / 已显式恢复的墓碑）→ 普通更新，不重发元数据。
+	 */
+	identity?: {
+		fileId: string;
+		remote: "reserved" | "established";
+		/** 已知（经认证）的内容世代：本次写入取它与 generationFloor 的较大者 + 1 */
+		generation?: number;
+		/** established 对象当前的元数据世代（记账用；不随内容上传发送） */
+		metaGeneration?: number;
+	};
 }
 
 /** 上传明文内容（E2EE 启用时自动加密，默认 LSE3；meta 模式自动伪名 + 挂元数据）。 */
@@ -490,14 +507,24 @@ export async function uploadFromPlain(
 		}
 		{
 			const tracked = ctx.store.get(path);
+			const explicit = opts?.identity;
 			// 新文件：id 必须在加密前确定 → 客户端预生成，随上传头交给服务器。
 			// 已跟踪文件沿用原身份，但先校验一遍——被改坏的 fileId 会让这份
 			// 密文的 AAD 与将来重建的 AAD 不一致，永久无法解密（LS-121-C03）
 			const fileId =
-				tracked?.fileId === undefined
-					? await reserveFileId(ctx, path)
-					: requireFileId(tracked.fileId, `upload(${path}).fileId`);
-			const knownGen = tracked?.fileId === fileId ? (tracked?.generation ?? 0) : 0;
+				explicit !== undefined
+					? requireFileId(explicit.fileId, `upload(${path}).identity.fileId`)
+					: tracked?.fileId === undefined
+						? await reserveFileId(ctx, path)
+						: requireFileId(tracked.fileId, `upload(${path}).fileId`);
+			// 远端是否已有这个对象：显式身份以调用方为准；否则沿用「有 FileState = 已建档」的旧判定
+			const established = explicit !== undefined ? explicit.remote === "established" : tracked !== undefined;
+			const knownGen =
+				explicit !== undefined
+					? (explicit.generation ?? 0)
+					: tracked?.fileId === fileId
+						? (tracked?.generation ?? 0)
+						: 0;
 			generation = Math.max(knownGen, opts?.generationFloor ?? 0) + 1;
 			const binding3 = { vaultId: bind.vaultId, keyEpoch: bind.keyEpoch, fileId, generation };
 			// 大小混淆（§11.1）：开启时用 LSE4 并把明文填充到桶边界。
@@ -511,7 +538,7 @@ export async function uploadFromPlain(
 			// 元数据加密模式（v9.3 三期）：服务器只见伪名；建档随带 LSM1 元数据
 			if (metaEncrypted(ctx)) {
 				serverPath = fileId;
-				if (!tracked) {
+				if (!established) {
 					const keys = await ctx.e2ee.metaKeys();
 					metaGeneration = 1;
 					meta = {
@@ -523,7 +550,7 @@ export async function uploadFromPlain(
 						canonicalHash: await canonicalPathHmac(keys, path),
 					};
 				} else {
-					metaGeneration = tracked.metaGeneration;
+					metaGeneration = explicit !== undefined ? explicit.metaGeneration : tracked?.metaGeneration;
 				}
 			}
 		}

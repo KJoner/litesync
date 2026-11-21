@@ -103,4 +103,10 @@ export const FP = {
 	bootstrapBeforeComplete: "bootstrap.before-complete",
 	/** 迁移即将 complete */
 	migrationBeforeComplete: "migration.before-complete",
+	/** 完整替换作业：restore 意图已落盘、请求尚未发出（0.20.1 / PL-05） */
+	replaceBeforeRestore: "replace.before-restore-request",
+	/** 完整替换作业：restore 的服务器结果已收到、尚未落盘 */
+	replaceBeforeRestorePersist: "replace.before-restore-persist",
+	/** 完整替换作业：条目的最终上传响应已收到、条目结果尚未落盘 */
+	replaceAfterUpload: "replace.after-upload-before-persist",
 } as const;
