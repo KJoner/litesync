@@ -38,8 +38,13 @@ export interface MigrationProgress {
 	current: string;
 }
 
-/** 步骤 1（enableE2ee 与空仓启用共用）：获取或创建 vault key 并采纳（支持中断后重新执行）。 */
-async function acquireVaultKey(ctx: SyncContext, password: string): Promise<CryptoKey> {
+/**
+ * 步骤 1（enableE2ee 与空仓启用共用）：获取或创建 vault key 并采纳（支持中断后重新执行）。
+ *
+ * context：流程开始时的连接上下文代次（0.20.1 / PL-01）。取文档、生成、上传之间换了服务器、
+ * 凭据或仓库，就不能把旧连接上的文档与钥匙装进密钥环（adopt 会拒绝）。
+ */
+async function acquireVaultKey(ctx: SyncContext, password: string, context: number): Promise<CryptoKey> {
 	let doc = await ctx.client.getVaultKey();
 	let vmk: CryptoKey;
 	if (doc) {
@@ -53,23 +58,23 @@ async function acquireVaultKey(ctx: SyncContext, password: string): Promise<Cryp
 		vmk = created.vmk;
 		await ctx.client.putVaultKey(doc, false);
 	}
-	ctx.e2ee.adopt(doc, vmk);
+	ctx.e2ee.adopt(doc, vmk, context);
 	ctx.store.state.e2ee = doc;
 	await ctx.store.save();
 	return vmk;
 }
 
 /** 最后一步（同上共用）：把 key 文档标记 enabled（CAS，绝不盲目覆盖并发写入）。 */
-async function finalizeVaultKeyEnabled(ctx: SyncContext, vmk: CryptoKey): Promise<void> {
+async function finalizeVaultKeyEnabled(ctx: SyncContext, vmk: CryptoKey, context: number): Promise<void> {
 	const cur = await ctx.client.getVaultKeyWithFingerprint();
 	if (!cur) throw new Error("vault key 文档丢失，请重新启用");
 	if (!cur.doc.enabled) {
 		const finalDoc: VaultKeyDoc = { ...cur.doc, enabled: true };
 		await ctx.client.putVaultKey(finalDoc, true, cur.fingerprint);
-		ctx.e2ee.adopt(finalDoc, vmk);
+		ctx.e2ee.adopt(finalDoc, vmk, context);
 		ctx.store.state.e2ee = finalDoc;
 	} else {
-		ctx.e2ee.adopt(cur.doc, vmk);
+		ctx.e2ee.adopt(cur.doc, vmk, context);
 		ctx.store.state.e2ee = cur.doc;
 	}
 	await ctx.store.save();
@@ -83,9 +88,10 @@ export async function enableE2ee(
 ): Promise<number> {
 	requireSyncSafe(ctx, "启用端到端加密");
 	if (password.length < 8) throw new Error("密码至少 8 个字符");
+	const context = ctx.e2ee.contextGeneration;
 
 	// 1. 获取或创建 vault key（支持中断后重新执行）
-	const vmk = await acquireVaultKey(ctx, password);
+	const vmk = await acquireVaultKey(ctx, password, context);
 
 	// 2. 迁移前必须同步干净：fullSync 等待当前轮 + 所有续轮 + 队列排空（LS-121-C06），
 	//    绝不在「只是设置了 runAgain」的状态下开始不可逆迁移
@@ -96,7 +102,7 @@ export async function enableE2ee(
 
 	ctx.gate.beginMigration("端到端加密迁移");
 	try {
-		return await runE2eeMigration(ctx, vmk, onProgress);
+		return await runE2eeMigration(ctx, vmk, onProgress, context);
 	} finally {
 		ctx.gate.endMigration();
 	}
@@ -107,6 +113,7 @@ async function runE2eeMigration(
 	ctx: SyncContext,
 	vmk: CryptoKey,
 	onProgress: (p: MigrationProgress) => void,
+	context: number,
 ): Promise<number> {
 	const info = await ctx.client.info();
 	const serverState = info.encryptionState ?? "plaintext";
@@ -144,7 +151,7 @@ async function runE2eeMigration(
 	}
 
 	// 7. 标记 key 文档 enabled（CAS：携带当前指纹，绝不盲目覆盖并发写入的文档）
-	await finalizeVaultKeyEnabled(ctx, vmk);
+	await finalizeVaultKeyEnabled(ctx, vmk, context);
 	ctx.log(`e2ee: migration complete, ${done} files encrypted`);
 	return done;
 }
@@ -165,7 +172,8 @@ export async function enableE2eeOnEmptyRemote(ctx: SyncContext, password: string
 	if ((info.latestSequence ?? 0) > 0 || (info.encryptionState ?? "plaintext") !== "plaintext") {
 		throw new Error("远端仓库已不是未初始化状态，请改用接入向导");
 	}
-	const vmk = await acquireVaultKey(ctx, password);
+	const context = ctx.e2ee.contextGeneration;
+	const vmk = await acquireVaultKey(ctx, password, context);
 	const state = await ctx.client.e2eeTransition("begin");
 	ctx.store.state.bootstrap.keyEpoch = requireKeyEpoch(state.keyEpoch, "e2ee/begin.keyEpoch");
 	if (!ctx.store.state.bootstrap.remoteVaultId && info.vaultId) {
@@ -174,7 +182,7 @@ export async function enableE2eeOnEmptyRemote(ctx: SyncContext, password: string
 	await ctx.store.save();
 	// 快照为空：服务器对 0 个 HEAD 的验证直接放行
 	await ctx.client.e2eeTransition("complete");
-	await finalizeVaultKeyEnabled(ctx, vmk);
+	await finalizeVaultKeyEnabled(ctx, vmk, context);
 	ctx.log("e2ee: enabled on empty remote (no migration needed)");
 }
 

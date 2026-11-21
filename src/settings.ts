@@ -610,7 +610,8 @@ export class SyncSettingTab extends PluginSettingTab {
 				settings[key] = url;
 				// 换服务器 = 本地状态未必还属于对面那个仓库（LS-121-C02）：
 				// 立即切 unbound，重新完成权威校验前禁止任何写操作
-				if (changed) this.plugin.invalidateBinding("Server URL 已变化");
+				// 0.20.1（PL-01）：换服务器同时锁定密钥环，作废旧连接上进行中的解锁与取回
+				if (changed) this.plugin.onServerUrlChanged();
 				// 即时提示（v9.2）：非本机的 http:// 会在同步时被硬性拒绝（Token 明文暴露）
 				if (/^http:\/\//i.test(url) && !isLoopbackUrl(url)) {
 					new Notice("注意：非本机地址必须使用 https://，当前 http:// 配置将无法同步", 8000);

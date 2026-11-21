@@ -117,13 +117,32 @@ export async function persistTrustedDevice(
 	existingDeviceKeyB64: string,
 	keyring: Keyring,
 ): Promise<string | null> {
-	if (!keyring.doc || !keyring.unlocked) return null;
+	return persistTrustMaterial(app.secretStorage, existingDeviceKeyB64, keyring);
+}
+
+/**
+ * persistTrustedDevice 的纯逻辑部分（可测）。
+ *
+ * 0.20.1（复审 PL-01）：钥匙与文档在**开始时**一次取齐，并记下密钥会话代次；
+ * 导出与包装是异步的，期间锁定或切库了，就不写——否则可能把 A 仓库的 VMK
+ * 包装成 B 文档的 keyId 存下来，下次启动在 B 上自动装进一把错钥匙。
+ */
+export async function persistTrustMaterial(
+	secrets: SecretStore,
+	existingDeviceKeyB64: string,
+	keyring: Keyring,
+): Promise<string | null> {
+	const doc = keyring.doc;
+	if (!doc || !keyring.unlocked) return null;
+	const session = keyring.generation;
+	const key = keyring.requireKey();
 
 	const deviceKey = existingDeviceKeyB64 ? b64decode(existingDeviceKeyB64) : randomBytes(32);
-	const vmkRaw = await exportVmkRaw(keyring.requireKey());
+	const vmkRaw = await exportVmkRaw(key);
 	try {
-		const blob = await wrapVmkForDevice(deviceKey, vmkRaw, keyIdOf(keyring.doc));
-		app.secretStorage.setSecret(VAULT_KEY_SECRET_ID, blob);
+		const blob = await wrapVmkForDevice(deviceKey, vmkRaw, keyIdOf(doc));
+		if (keyring.generation !== session || keyring.isDisposed) return null;
+		secrets.setSecret(VAULT_KEY_SECRET_ID, blob);
 	} finally {
 		vmkRaw.fill(0);
 	}

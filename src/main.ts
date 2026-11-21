@@ -20,6 +20,7 @@ import {
 } from "./crypto/device-trust";
 import { EnableE2eeModal, UnlockModal } from "./crypto/e2ee-modals";
 import { Keyring } from "./crypto/keyring";
+import { runUnlockFlow } from "./crypto/unlock-flow";
 import { ConfirmMetaEncryptionModal } from "./crypto/meta-modals";
 import {
 	abortMetadataMigration,
@@ -205,6 +206,8 @@ export default class PrivateSyncPlugin extends Plugin {
 	}
 
 	onunload(): void {
+		// 插件卸载（PL-01）：锁定并作废一切进行中的解锁与派生——晚到的结果不得在卸载后装上
+		this.keyring.dispose();
 		this.manager?.dispose();
 		if (this.debounceTimer !== null) window.clearTimeout(this.debounceTimer);
 		if (this.foregroundTimer !== null) window.clearTimeout(this.foregroundTimer);
@@ -247,14 +250,17 @@ export default class PrivateSyncPlugin extends Plugin {
 			if (this.settings.trustDevice && this.settings.deviceKeyB64 && this.keyring.doc) {
 				const raw = await loadTrustedVmk(this.app, this.settings.deviceKeyB64, this.keyring.doc);
 				if (raw) {
-					await this.keyring.unlockWithRaw(raw);
-					raw.fill(0);
+					try {
+						await this.keyring.unlockWithRaw(raw);
+					} finally {
+						raw.fill(0);
+					}
 				}
 			}
 			// ② v3.1 迁移：旧版明文密码只用来解锁**本次运行**，随即从磁盘抹除。
 			// 0.20 起不再顺手把它转成设备信任——那会凭空制造出可自动解锁的材料
 			if (this.keyring.needsUnlock && this.legacyE2eePassword) {
-				if (await this.keyring.unlock(this.legacyE2eePassword)) {
+				if ((await this.keyring.unlock(this.legacyE2eePassword)) === "unlocked") {
 					new Notice("已从磁盘移除旧版本保存的明文仓库密码。本次运行已解锁，下次启动需要重新输入。");
 				}
 			}
@@ -334,7 +340,13 @@ export default class PrivateSyncPlugin extends Plugin {
 			}),
 			refreshE2ee: async () => {
 				const before = this.keyring.doc;
+				// 取回的文档属于发起请求时的连接（PL-01）：期间换了服务器 / 凭据 / 仓库就作废，
+				// 本轮同步失败、下一轮按新连接重取——绝不把旧仓库的文档装进新连接的密钥环
+				const context = this.keyring.contextGeneration;
 				const doc = await this.client!.getVaultKey();
+				if (context !== this.keyring.contextGeneration) {
+					throw new Error("取回密钥文档期间连接发生了变化（换了服务器、凭据或仓库），本轮作废，稍后按新连接重试");
+				}
 				this.keyring.setDoc(doc);
 				if (this.store) this.store.state.e2ee = doc;
 				// vault key 文档被替换（密钥轮换 / 换库）→ 本地绑定作废（LS-121-C02）
@@ -416,6 +428,8 @@ export default class PrivateSyncPlugin extends Plugin {
 
 	/** 迁移逻辑的 I/O 组装（ADR-013）。 */
 	trustDeps(): TrustMigrationDeps {
+		// 迁移窗口打开期间换了连接（PL-01）：重包装后的新文档不再装进密钥环
+		const context = this.keyring.contextGeneration;
 		return {
 			settings: this.settings,
 			saveSettings: () => this.saveSettings(),
@@ -432,7 +446,7 @@ export default class PrivateSyncPlugin extends Plugin {
 			onKeyDocReplaced: async (doc, vmkRaw) => {
 				// 同一把 VMK、新的包装：密钥环保持解锁（setDoc 会因 wrappedKey 变化而锁定），
 				// 本地缓存换成新文档；vault key 材料变了 → 绑定必须重新校验（LS-121-C02）
-				this.keyring.adopt(doc, await importVmk(vmkRaw));
+				this.keyring.adopt(doc, await importVmk(vmkRaw), context);
 				if (this.store) {
 					this.store.state.e2ee = doc;
 					await this.store.save();
@@ -582,6 +596,9 @@ export default class PrivateSyncPlugin extends Plugin {
 		if (/^http:\/\//i.test(url) && !isLoopbackUrl(url)) {
 			throw new Error("连接配置中的服务器地址是非本机的 http://，已拒绝导入（凭据会被明文暴露）");
 		}
+		// 换连接 = 可能换了服务器、账号与仓库（PL-01）：立即锁定并丢弃旧密钥文档，
+		// 进行中的解锁一并作废；新仓库的文档由接入向导的 preflight 重新取
+		this.keyring.switchContext({ lock: true });
 		this.settings.serverUrl = url;
 		if (typeof config.syncIntervalSeconds === "number") this.settings.syncIntervalSeconds = config.syncIntervalSeconds;
 		if (typeof config.syncObsidian === "boolean") this.settings.syncObsidian = config.syncObsidian;
@@ -1057,7 +1074,13 @@ export default class PrivateSyncPlugin extends Plugin {
 		const changed = this.apiTokenValue !== value;
 		this.apiTokenValue = value;
 		this.app.secretStorage.setSecret(API_TOKEN_SECRET_ID, value);
-		if (changed) this.invalidateBinding("API Token 已变化");
+		if (changed) {
+			// 凭据变了（PL-01）：进行中的解锁与密钥文档请求作废；已装好的钥匙保留——
+			// v0.18 重置 Token 的恢复路径（填新 Token → 测试连接 → 继续同步）靠它。
+			// 真换了账号 / 仓库时，vaultId 对账与密钥文档刷新会锁定
+			this.keyring.switchContext({ lock: false });
+			this.invalidateBinding("API Token 已变化");
+		}
 		if (this.settings.apiToken !== "") {
 			this.settings.apiToken = "";
 			await this.saveSettings();
@@ -1076,9 +1099,19 @@ export default class PrivateSyncPlugin extends Plugin {
 	 */
 	async setVaultChoice(vaultId: string): Promise<void> {
 		if (this.settings.vaultChoice === vaultId) return;
+		// 切库立即锁定（复审 PL-01）：旧仓库的钥匙与密钥文档绝不跟到新仓库，
+		// 进行中的解锁、派生与密钥文档请求一并作废；新仓库的文档由向导 preflight 重新取
+		this.keyring.switchContext({ lock: true });
+		if (this.store) this.store.state.e2ee = null;
 		this.settings.vaultChoice = vaultId;
 		await this.saveSettings();
 		this.invalidateBinding("目标仓库已切换");
+	}
+
+	/** 设置页改了 Server URL：换服务器 = 换账号与仓库（PL-01），锁定并作废旧连接上的一切进行中任务。 */
+	onServerUrlChanged(): void {
+		this.keyring.switchContext({ lock: true });
+		this.invalidateBinding("Server URL 已变化");
 	}
 
 	invalidateBinding(reason: string): void {
@@ -1356,24 +1389,27 @@ export default class PrivateSyncPlugin extends Plugin {
 	 * 把选仓库和接入方式各走两遍）。
 	 */
 	openUnlockModal(onUnlocked?: () => void): void {
-		new UnlockModal(this.app, this.unlockNote(), async (password) => {
-			// 新设备可能还没有缓存 vault key 文档，先从服务器获取
-			if (!this.keyring.doc) {
-				if (!this.client) return "插件尚未初始化完成";
-				try {
-					const doc = await this.client.getVaultKey();
-					if (!doc) return "服务器未启用端到端加密";
-					this.keyring.setDoc(doc);
-					if (this.store) {
-						this.store.state.e2ee = doc;
-						await this.store.save();
-					}
-				} catch (e) {
-					return `无法连接服务器：${e instanceof Error ? e.message : String(e)}`;
-				}
-			}
-			if (!(await this.keyring.unlock(password))) return "密码错误";
-			await this.maybePersistTrust();
+		new UnlockModal(this.app, this.unlockNote(), async (password, isCancelled) => {
+			if (!this.client) return "插件尚未初始化完成";
+			const client = this.client;
+			// 每段异步完成后核对会话（PL-01）：关窗口、锁定、切库、换连接、卸载 → 整体作废
+			const r = await runUnlockFlow(
+				{
+					keyring: this.keyring,
+					// 新设备可能还没有缓存 vault key 文档，先从服务器获取
+					fetchKeyDoc: () => client.getVaultKey(),
+					storeKeyDoc: async (doc) => {
+						if (this.store) {
+							this.store.state.e2ee = doc;
+							await this.store.save();
+						}
+					},
+					afterUnlocked: () => this.maybePersistTrust(),
+				},
+				password,
+				isCancelled,
+			);
+			if (!r.ok) return r.message;
 			new Notice("仓库已解锁 ✓");
 			this.updateStatus("idle");
 			this.refreshSettingsTab();

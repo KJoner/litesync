@@ -7,16 +7,25 @@ import { MigrationProgress } from "./migration";
  * 0.20（ADR-013）起不再有「信任此设备」勾选框：新安装默认严格会话解锁，
  * 「可恢复密钥持久化」只能在高级设置里**显式**开启。keyNote 由调用方按当前策略
  * 生成，告诉用户这次解锁会不会在本设备留下可自动还原密钥的材料。
+ *
+ * 0.20.1（复审 PL-01）：关闭弹窗 = 取消这次解锁。onSubmit 拿到 isCancelled，
+ * 进行中的 PBKDF2 晚到时据此作废，钥匙不会在用户已经放弃之后被悄悄装上。
  */
 export class UnlockModal extends Modal {
 	private busy = false;
+	private cancelled = false;
 
 	constructor(
 		app: App,
 		private keyNote: string,
-		private onSubmit: (password: string) => Promise<string | null>,
+		private onSubmit: (password: string, isCancelled: () => boolean) => Promise<string | null>,
 	) {
 		super(app);
+	}
+
+	onClose(): void {
+		this.cancelled = true;
+		this.contentEl.empty();
 	}
 
 	onOpen(): void {
@@ -37,7 +46,8 @@ export class UnlockModal extends Modal {
 			btn.setText("解锁中…");
 			btn.disabled = true;
 			try {
-				const err = await this.onSubmit(input.value);
+				const err = await this.onSubmit(input.value, () => this.cancelled);
+				if (this.cancelled) return; // 窗口已关闭：结果已被作废，不再更新界面
 				if (err === null) {
 					this.close();
 					return;

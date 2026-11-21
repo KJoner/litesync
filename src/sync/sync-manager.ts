@@ -448,8 +448,14 @@ export class SyncManager {
 	/** 补登记重置凭证：失败只记日志（下个会话再试），绝不打扰用户。 */
 	private async registerResetAuthOnce(): Promise<void> {
 		try {
+			const context = this.ctx.e2ee.contextGeneration;
 			const resetAuth = await this.ctx.e2ee.resetAuth();
-			if (!resetAuth) return; // 未启用或未解锁 E2EE：无凭证可登记
+			if (!resetAuth) return; // 未启用或未解锁 E2EE（或派生期间会话变了）：无凭证可登记
+			// 派生期间换了连接（PL-01）：这份凭证属于旧仓库，绝不能登记到新连接上
+			if (context !== this.ctx.e2ee.contextGeneration) {
+				this.resetAuthChecked = false;
+				return;
+			}
 			await this.ctx.client.registerResetAuth(resetAuth);
 			this.ctx.log("reset-auth registered");
 		} catch (e) {
@@ -471,6 +477,8 @@ export class SyncManager {
 			// 后的扫描空转——本地文件永远不会被推到新仓库，而状态栏显示 synced
 			this.ctx.store.resetForNewRepository();
 			this.ctx.store.clearBinding();
+			// 仓库换了（PL-01）：旧仓库的钥匙与密钥文档立即作废，绝不带进新仓库
+			this.ctx.e2ee.switchContext({ lock: true });
 			await this.ctx.store.save();
 			const msg =
 				"服务器上的同步仓库已更换（vaultId 变化），已暂停同步并作废旧仓库的同步记录；\n" +

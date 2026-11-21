@@ -9,6 +9,9 @@
 //     文档已被他人更换 / CAS 冲突 / 试解失败 —— 不清理，且本设备安全网（自动解锁材料）不断
 //   先证明后清理：证明之前的任何清理调用都被拒；clearing 中途崩溃重入幂等
 //   严格模式终态：data.json 与 SecretStorage 中不再有可自动还原 VMK 的材料
+//   0.20.1（复审 PL-01 / RB-1）重启恢复：服务端已收下新 keyDoc 但响应丢失、SecretStorage 写失败、
+//     data.json 落盘在任一步中断——重启后都能沿用同一把 VMK 继续完成证明；证明之前任何时刻
+//     都至少有一条可恢复同一 VMK 的路径（旧材料或「服务端文档 + 已知密码」），绝不靠删材料让测试变绿
 //
 // INV: INV-11（迁移可恢复、可重复、幂等）/ INV-09（状态不健康不清理）
 import assert from "node:assert/strict";
@@ -398,4 +401,128 @@ test("常量时间比较：长度不同直接不等；内容逐字节比较", ()
 	assert.equal(bytesEqualConstantTime(new Uint8Array([1, 2]), new Uint8Array([1, 2])), true);
 	assert.equal(bytesEqualConstantTime(new Uint8Array([1, 2]), new Uint8Array([1, 3])), false);
 	assert.equal(bytesEqualConstantTime(new Uint8Array([1]), new Uint8Array([1, 2])), false);
+});
+
+// ---------- 0.20.1：重启恢复（服务端已收新文档但响应丢失 / SecretStorage 失败 / 落盘中断） ----------
+
+/** 「服务端文档 + 这个密码」能否解出原始 VMK（严格模式下的恢复路径）。 */
+async function serverDocRestores(fx: Fixture, password: string): Promise<boolean> {
+	const key = fx.server.doc ? await unlockVaultKey(fx.server.doc, password) : null;
+	return key !== null && bytesEqualConstantTime(await exportVmkRaw(key), fx.vmkRaw);
+}
+
+/** 旧材料按 blob 自己记录的 keyId 还能不能解出原始 VMK（迁移自己用的就是这个判定）。 */
+async function blobRestores(fx: Fixture): Promise<boolean> {
+	const blob = fx.secrets.getSecret(VAULT_KEY_SECRET_ID);
+	if (!blob || !fx.settings.deviceKeyB64) return false;
+	const keyId = (JSON.parse(blob) as { keyId: string }).keyId;
+	const raw = await unwrapVmkForDevice(Uint8Array.from(atob(fx.settings.deviceKeyB64), (c) => c.charCodeAt(0)), blob, keyId);
+	return raw !== null && bytesEqualConstantTime(raw, fx.vmkRaw);
+}
+
+test("重启恢复：服务端已收下新 keyDoc 但响应丢失 → 不卡在 doc-changed，重来（同一个或另一个新密码）沿用同一把 VMK", async () => {
+	for (const retryPassword of ["a brand new password", "another new password"]) {
+		const fx = await legacyFixture();
+		const NEW = "a brand new password";
+		let lose = true;
+		fx.deps.replaceKeyDoc = async (d, fp) => {
+			await fx.server.replace(d, fp); // 服务器提交了
+			if (lose) {
+				lose = false;
+				throw new Error("network: response lost"); // 响应丢了
+			}
+		};
+		assert.deepEqual(await proveByRewrap(fx.deps, NEW), { ok: false, error: "offline" });
+		assert.equal(fx.server.replaced, 1, "服务器上已经是新包装的文档");
+		assert.equal(fx.settings.trustMigration?.state, "legacy_trust_found", "没有证明就没有任何清理");
+		assert.ok(await blobRestores(fx), "旧材料原样保留，仍能解出同一把 VMK");
+		assert.ok(await serverDocRestores(fx, NEW), "服务器上的新文档包着的也是同一把 VMK");
+		assert.ok(fx.settings.trustMigration?.pendingRewrapKeyId, "上传前已落盘「这次要写哪一份」");
+
+		// 重来：服务器上的文档已不是旧材料绑定的那份，但正是自己上次写的那份 → 在它之上 CAS 重包装
+		const r = await proveByRewrap(fx.deps, retryPassword);
+		assert.deepEqual(r, { ok: true, state: "recovery_proven" }, `重来用「${retryPassword}」`);
+		assert.equal(fx.settings.trustMigration?.pendingRewrapKeyId, undefined, "证明完成后清除标记");
+		assert.ok(await serverDocRestores(fx, retryPassword), "最终文档用最后一次的密码解出同一把 VMK");
+		const key = await unlockVaultKey(fx.server.doc!, retryPassword);
+		const b = fx.sample.binding;
+		const plain = await decryptFileV3(key!, fx.sample.cipher, b.vaultId, b.fileId, b.keyEpoch);
+		assert.equal(new TextDecoder().decode(plain!.plain), "hello", "迁移之前的密文照常可解");
+		assert.deepEqual(await advanceAfterProof(fx.deps), { ok: true, state: "strict_mode" });
+	}
+});
+
+test("重启恢复：别的设备在我们之后又换了文档 → 依然是 doc-changed（标记只认自己写的那一份）", async () => {
+	const fx = await legacyFixture();
+	let lose = true;
+	fx.deps.replaceKeyDoc = async (d, fp) => {
+		await fx.server.replace(d, fp);
+		if (lose) {
+			lose = false;
+			throw new Error("network: response lost");
+		}
+	};
+	await proveByRewrap(fx.deps, "a brand new password");
+	fx.server.doc = (await createVaultKeyDoc("someone else rotated")).doc;
+	assert.deepEqual(await proveByRewrap(fx.deps, "x".repeat(10)), { ok: false, error: "doc-changed" });
+	assert.ok(await blobRestores(fx), "本设备的旧材料依然完好");
+});
+
+test("重启恢复：重绑时 SecretStorage 写失败 → secret-store-failed，什么都不清理；重启后重来完成证明", async () => {
+	const fx = await legacyFixture();
+	const NEW = "a brand new password";
+	let persisted = JSON.stringify(fx.settings);
+	fx.deps.saveSettings = async () => {
+		persisted = JSON.stringify(fx.settings);
+	};
+	const realSet = fx.secrets.setSecret.bind(fx.secrets);
+	let failSet = true;
+	fx.secrets.setSecret = (id: string, v: string) => {
+		if (failSet) {
+			failSet = false;
+			throw new Error("SecretStorage unavailable");
+		}
+		realSet(id, v);
+	};
+	assert.deepEqual(await proveByRewrap(fx.deps, NEW), { ok: false, error: "secret-store-failed" });
+	assert.equal(fx.settings.trustMigration?.state, "legacy_trust_found");
+	assert.ok(await blobRestores(fx), "旧 blob 原样保留");
+	assert.ok(await serverDocRestores(fx, NEW), "服务器上的新文档包着同一把 VMK");
+
+	// 「重启」：设置从磁盘重新读，SecretStorage 照旧（它独立于 data.json）
+	const reloaded = JSON.parse(persisted) as TrustSettings;
+	const deps2: TrustMigrationDeps = { ...fx.deps, settings: reloaded, saveSettings: async () => {} };
+	assert.equal(reloaded.trustMigration?.state, "legacy_trust_found");
+	assert.deepEqual(await proveByRewrap(deps2, NEW), { ok: true, state: "recovery_proven" });
+	assert.ok(await serverDocRestores(fx, NEW));
+});
+
+test("重启恢复：重包装途中 data.json 在任一次落盘处中断 → 重启后重来完成证明；中断前后始终留有恢复同一 VMK 的路径", async () => {
+	const NEW = "a brand new password";
+	const RETRY = "retry password!!";
+	for (let crashAt = 1; crashAt <= 3; crashAt++) {
+		const fx = await legacyFixture();
+		let persisted = JSON.stringify(fx.settings);
+		let n = 0;
+		fx.deps.saveSettings = async () => {
+			n++;
+			if (n === crashAt) throw new Error("crash: process killed while saving data.json");
+			persisted = JSON.stringify(fx.settings);
+		};
+		await assert.rejects(proveByRewrap(fx.deps, NEW), /crash/, `第 ${crashAt} 次落盘处中断`);
+
+		const reloaded = JSON.parse(persisted) as TrustSettings;
+		assert.notEqual(reloaded.trustMigration?.state, "strict_mode");
+		assert.ok(reloaded.deviceKeyB64, "证明之前绝不清理");
+		// 恢复路径：旧材料（按 blob 自己的 keyId）始终能解出同一把 VMK
+		const fxReloaded = { ...fx, settings: reloaded };
+		assert.ok(await blobRestores(fxReloaded), `中断点 ${crashAt}：本设备材料仍可恢复 VMK`);
+
+		const deps2: TrustMigrationDeps = { ...fx.deps, settings: reloaded, saveSettings: async () => {} };
+		const r = await proveByRewrap(deps2, RETRY);
+		assert.deepEqual(r, { ok: true, state: "recovery_proven" }, `中断点 ${crashAt}：重启后重来成功`);
+		assert.ok(await serverDocRestores(fx, RETRY), `中断点 ${crashAt}：最终文档解出同一把 VMK`);
+		assert.deepEqual(await advanceAfterProof(deps2), { ok: true, state: "strict_mode" });
+		assert.equal(await blobRestores({ ...fx, settings: reloaded }), false, "证明之后才清理");
+	}
 });

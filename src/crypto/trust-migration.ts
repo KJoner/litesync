@@ -60,6 +60,7 @@ export type TrustMigrationError =
 	| "offline"
 	| "pending-writes"
 	| "state-unhealthy"
+	| "secret-store-failed"
 	| "invalid-state";
 
 export interface TrustMigrationRecord {
@@ -77,6 +78,15 @@ export interface TrustMigrationRecord {
 	lastError?: TrustMigrationError;
 	/** 一次性说明是否已展示 */
 	noticeShown?: boolean;
+	/**
+	 * 进行中的重包装（0.20.1 / 复审 PL-01）：上传新 keyDoc **之前**先落盘它的 keyId。
+	 *
+	 * 服务器已经收下、但响应丢失（或上传后进程被杀、SecretStorage 写失败）时，重来一次看到的
+	 * 服务端文档就不再是旧材料绑定的那一份——没有这条记录，只能当成「别人换了文档」停在
+	 * doc-changed，用户被卡住。有了它就能认出那正是本设备自己写的、包着同一把 VMK 的文档，
+	 * 在它之上（CAS）安全地重来。证明完成后清除。
+	 */
+	pendingRewrapKeyId?: string;
 }
 
 /** 与密钥策略相关的设置字段（PluginSettings 的子集）。 */
@@ -277,9 +287,16 @@ export async function proveByRewrap(deps: TrustMigrationDeps, newPassword: strin
 		}
 		if (current === null) return fail(deps, "no-key-doc");
 		const blobKeyId = trustBlobKeyId(deps.secrets.getSecret(VAULT_KEY_SECRET_ID)) ?? r.keyId;
-		if (keyIdOf(current.doc) !== blobKeyId) return fail(deps, "doc-changed");
+		const currentKeyId = keyIdOf(current.doc);
+		// 服务端文档已不是旧材料绑定的那一份：只有当它正是本设备上一次上传（响应丢失 / 上传后崩溃 /
+		// SecretStorage 没写成）的那一份时才继续——那份是我们自己用同一把 VMK 包装的，可以在它之上重来
+		const ownLanded = r.pendingRewrapKeyId !== undefined && currentKeyId === r.pendingRewrapKeyId;
+		if (currentKeyId !== blobKeyId && !ownLanded) return fail(deps, "doc-changed");
 
 		const next = await wrapVmkIntoKeyDoc(newPassword, legacy, current.doc);
+		// 意图先落盘：上传之后无论响应丢失还是进程被杀，重启都能认出服务器上那份是自己写的
+		r.pendingRewrapKeyId = keyIdOf(next);
+		await deps.saveSettings();
 		try {
 			await deps.replaceKeyDoc(next, current.fingerprint);
 		} catch (e) {
@@ -287,12 +304,18 @@ export async function proveByRewrap(deps: TrustMigrationDeps, newPassword: strin
 			if (status === 412 || status === 409) return fail(deps, "cas-conflict");
 			return fail(deps, "offline");
 		}
-		// 服务端文档已换：旧材料按新 keyId 重绑（同一把 VMK、同一个设备密钥），安全网不断
-		const deviceKey = b64decode(deps.settings.deviceKeyB64);
+		// 服务端文档已换：旧材料按新 keyId 重绑（同一把 VMK、同一个设备密钥），安全网不断。
+		// SecretStorage 写失败时旧 blob 原样保留（按它自己记录的 keyId 仍能解出同一把 VMK），
+		// 不进入证明、不清理任何东西；重来时凭 pendingRewrapKeyId 认出服务器上那份
 		try {
-			deps.secrets.setSecret(VAULT_KEY_SECRET_ID, await wrapVmkForDevice(deviceKey, legacy, keyIdOf(next)));
-		} finally {
-			deviceKey.fill(0);
+			const deviceKey = b64decode(deps.settings.deviceKeyB64);
+			try {
+				deps.secrets.setSecret(VAULT_KEY_SECRET_ID, await wrapVmkForDevice(deviceKey, legacy, keyIdOf(next)));
+			} finally {
+				deviceKey.fill(0);
+			}
+		} catch {
+			return fail(deps, "secret-store-failed");
 		}
 		r.keyId = keyIdOf(next);
 		await deps.onKeyDocReplaced(next, legacy);
@@ -318,6 +341,7 @@ export async function proveByRewrap(deps: TrustMigrationDeps, newPassword: strin
 		r.method = "rewrap";
 		r.provenAt = deps.now();
 		r.lastError = undefined;
+		r.pendingRewrapKeyId = undefined;
 		await deps.saveSettings();
 		return { ok: true, state: r.state };
 	} finally {
@@ -419,6 +443,8 @@ export function trustMigrationErrorText(e: TrustMigrationError): string {
 			return "还有未确认保存的待同步修改，暂不清理旧材料。请先同步一次。";
 		case "state-unhealthy":
 			return "清理旧材料后校验失败（SecretStorage 中仍有数据），请重启 Obsidian 后重试。";
+		case "secret-store-failed":
+			return "新密钥文档已上传，但本设备的安全存储（SecretStorage）写入失败。旧材料保持原样、仍可用，什么都没有清理；请重启 Obsidian 后重试——会认出服务器上的新文档并沿用同一把密钥。";
 		case "invalid-state":
 			return "迁移状态不允许这一步，请重新打开迁移窗口。";
 	}
