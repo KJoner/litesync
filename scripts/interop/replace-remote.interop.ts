@@ -43,8 +43,17 @@ import {
 	saveRecoveryPoint,
 } from "../../src/bootstrap/replace-remote";
 import type { ReplaceJob } from "../../src/bootstrap/replace-types";
-import { decryptFileV3, decryptMeta, newFileId } from "../../src/crypto/crypto";
+import { b64encode, decryptFileV3, decryptMeta, exportVmkRaw, newFileId, unlockVaultKey } from "../../src/crypto/crypto";
+import { keyIdOf, SecretStore, unwrapVmkForDevice, VAULT_KEY_SECRET_ID, wrapVmkForDevice } from "../../src/crypto/device-trust";
 import { Keyring } from "../../src/crypto/keyring";
+import {
+	advanceAfterProof,
+	applyKeyPolicy,
+	bytesEqualConstantTime,
+	proveByRewrap,
+	TrustMigrationDeps,
+	TrustSettings,
+} from "../../src/crypto/trust-migration";
 import { enableE2eeOnEmptyRemote, encryptMetadata, upgradeEnvelopes } from "../../src/crypto/migration";
 import { StateStore } from "../../src/state/store";
 import type { SyncContext } from "../../src/sync/context";
@@ -603,6 +612,9 @@ async function runTarget(t: Target): Promise<ModeReport> {
 		check(`[${t.mode}] B：被删的 keep.md 按原身份恢复`, afterV2.get("keep.md")?.fileId === S.get("keep.md")?.fileId);
 		check(`[${t.mode}] B：所有故障都确实触发过`, report.faults.every((f) => f.hits === 1), report.faults.filter((f) => f.hits !== 1).map((f) => f.label).join("、"));
 
+		// ---------- 旧 trust 迁移的重包装：服务器已收下新 keyDoc 但响应丢失（复审 RB-1，只在内容加密目标上跑） ----------
+		if (t.mode === "content-e2ee") await runTrustRewrap(t, seeder, vmk, check, addFaults, settleFaults);
+
 		// ---------- 隐私：路径加密仓库全程没有真实路径进入请求 ----------
 		const mine = g.log.slice(logStart);
 		if (t.mode === "path-e2ee") {
@@ -620,6 +632,81 @@ async function runTarget(t: Target): Promise<ModeReport> {
 		check(`[${t.mode}] 场景未抛出异常`, false, e instanceof Error ? e.message : String(e));
 	}
 	return report;
+}
+
+/**
+ * 旧「信任此设备」迁移的分支 b（忘记密码 → 同一把 VMK 以新密码重包装 → CAS 上传 → 重新下载试解），
+ * 对真实服务端的 vault-key CAS 演练「服务器已收下新文档、响应丢失」：
+ * 第一次 offline 停住、旧材料原样可用；重来时凭 pendingRewrapKeyId 认出服务器上那份是自己写的，在它之上
+ * CAS 重包装（真实的 X-Expected-Fingerprint）；最终文档用最后一次的密码解出**同一把** VMK，之前的密文照常可解。
+ */
+async function runTrustRewrap(
+	t: Target,
+	verifier: Device,
+	vmk: CryptoKey,
+	check: (n: string, ok: boolean, d?: string) => void,
+	addFaults: (phase: string, f: InteropFault[]) => void,
+	settleFaults: () => void,
+): Promise<void> {
+	const client = verifier.client;
+	const cur = await client.getVaultKeyWithFingerprint();
+	if (!cur) throw new Error("服务器上没有 vault key 文档");
+	const vmkRaw = await exportVmkRaw(vmk);
+	const deviceKey = new Uint8Array(randomBytes(32));
+	const secrets = new Map<string, string>();
+	const store: SecretStore = { getSecret: (k) => secrets.get(k) ?? null, setSecret: (k, v) => void secrets.set(k, v) };
+	store.setSecret(VAULT_KEY_SECRET_ID, await wrapVmkForDevice(deviceKey, vmkRaw, keyIdOf(cur.doc)));
+	const settings: TrustSettings = { trustDevice: true, deviceKeyB64: b64encode(deviceKey) };
+	applyKeyPolicy(settings, store, { vaultIdentity: verifier.store.state.bootstrap.remoteVaultId ?? "", now: Date.now() });
+	let persisted = JSON.stringify(settings);
+	const deps: TrustMigrationDeps = {
+		settings,
+		saveSettings: async () => {
+			persisted = JSON.stringify(settings);
+		},
+		secrets: store,
+		fetchKeyDoc: () => client.getVaultKeyWithFingerprint(),
+		replaceKeyDoc: (doc, fp) => client.putVaultKey(doc, true, fp),
+		cachedKeyDoc: () => cur.doc,
+		onKeyDocReplaced: async () => {},
+		pendingWrites: async () => ({ count: 0, durable: true }),
+		now: () => Date.now(),
+	};
+	const materialOk = async (): Promise<boolean> => {
+		const blob = store.getSecret(VAULT_KEY_SECRET_ID);
+		if (!blob) return false;
+		const raw = await unwrapVmkForDevice(deviceKey, blob, (JSON.parse(blob) as { keyId: string }).keyId);
+		return raw !== null && bytesEqualConstantTime(raw, vmkRaw);
+	};
+	const serverOpens = async (pw: string): Promise<boolean> => {
+		const d = await client.getVaultKey();
+		const k = d ? await unlockVaultKey(d, pw) : null;
+		return k !== null && bytesEqualConstantTime(await exportVmkRaw(k), vmkRaw);
+	};
+	check(`[${t.mode}] trust 迁移：旧材料完整 → legacy_trust_found`, settings.trustMigration?.state === "legacy_trust_found");
+	const NEW1 = "忘记密码后设的新密码 · 1";
+	const NEW2 = "重来时设的新密码 · 2";
+	addFaults("trust", [
+		{ label: "trust：第 1 次上传新 keyDoc 响应丢失", kind: "drop-response", match: nth("PUT", "/api/v1/vault-key", 1), remaining: 1, hits: 0 },
+	]);
+	const first = await proveByRewrap(deps, NEW1);
+	settleFaults();
+	check(`[${t.mode}] trust 迁移：服务器已收下新文档但响应丢失 → offline，停在原状态`, !first.ok && first.error === "offline" && settings.trustMigration?.state === "legacy_trust_found", JSON.stringify(first));
+	check(`[${t.mode}] trust 迁移：真实服务器上已是新包装（新密码解出同一把 VMK），本设备旧材料原样可用`, (await serverOpens(NEW1)) && (await materialOk()) && !(await serverOpens(PASSWORD)));
+	// 「重启」：设置从磁盘重新读
+	const reloaded = JSON.parse(persisted) as TrustSettings;
+	const deps2: TrustMigrationDeps = { ...deps, settings: reloaded };
+	const second = await proveByRewrap(deps2, NEW2);
+	check(`[${t.mode}] trust 迁移：重启后重来——认出自己写的文档，在其上 CAS 重包装并重新下载试解`, second.ok && second.state === "recovery_proven", JSON.stringify(second));
+	check(`[${t.mode}] trust 迁移：最终文档用最后一次的密码解出同一把 VMK；前一个新密码失效`, (await serverOpens(NEW2)) && !(await serverOpens(NEW1)));
+	const done = await advanceAfterProof(deps2);
+	check(`[${t.mode}] trust 迁移：证明之后才清理 → strict_mode，本设备不再有可自动还原 VMK 的材料`, done.ok && done.state === "strict_mode" && !store.getSecret(VAULT_KEY_SECRET_ID) && reloaded.deviceKeyB64 === "");
+	const doc = await client.getVaultKey();
+	const key = doc ? await unlockVaultKey(doc, NEW2) : null;
+	const any = (await client.snapshot()).files[0];
+	const dl = any ? await client.download(any.path) : null;
+	const dec = key && dl && any ? await decryptFileV3(key, dl.data, verifier.store.state.bootstrap.remoteVaultId ?? "", any.fileId ?? "", 1) : null;
+	check(`[${t.mode}] trust 迁移：迁移之前写下的密文用新密码解锁后照常可解`, dec !== null);
 }
 
 async function main(): Promise<void> {
