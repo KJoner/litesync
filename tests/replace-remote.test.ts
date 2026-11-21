@@ -34,6 +34,7 @@ import {
 	planReplaceRemote,
 	recoveryDir,
 	refreshReverseWatermark,
+	replaceCapabilities,
 	ReplaceJobError,
 	runReplaceJob,
 	saveRecoveryPoint,
@@ -541,4 +542,31 @@ test("E2EE：新建条目的 fileId 在计划里固定；响应丢失后重试�
 	assert.equal(h.fileId, item.fileId, "服务器上的对象就是计划时的身份");
 	assert.equal(h.revision, 1, "没有第二个对象、没有第二个 revision");
 	assert.ok(parseLse3Header(h.data), "上传的是 LSE3 密文");
+});
+
+// ---------- 0.20.1 阶段保护 ----------
+
+test("阶段保护：执行入口关闭时只读预览照常、正向执行不可用；未完成作业仍可放弃、已完成部分仍可回滚", async () => {
+	const off = replaceCapabilities(null, false);
+	assert.deepEqual(off, { preview: true, executeForward: false, resume: false, abandon: false, reverse: false });
+	assert.equal(replaceCapabilities(null, true).executeForward, true);
+
+	const { job, ctx } = await prepared();
+	// 中断的正向作业：关闭时不能续跑，但能放弃；有已完成条目时能回滚
+	job.state = "interrupted";
+	job.items[0].status = "done";
+	const caps = replaceCapabilities(job, false);
+	assert.equal(caps.resume, false, "续跑正向作业需要显式开启");
+	assert.equal(caps.abandon, true, "放弃不受开关限制");
+	assert.equal(caps.reverse, true, "回滚（恢复方向）不受开关限制");
+	assert.equal(replaceCapabilities(job, true).resume, true);
+
+	// 未完成的反向作业：恢复方向，开关关闭也能续跑
+	job.items.forEach((i) => (i.status = "done"));
+	job.state = "completed";
+	const rev = buildReverseJob(job, 5);
+	rev.state = "interrupted";
+	assert.equal(replaceCapabilities(rev, false).resume, true);
+	assert.equal(replaceCapabilities(rev, false).reverse, false, "反向作业自己不再生成反向");
+	void ctx;
 });

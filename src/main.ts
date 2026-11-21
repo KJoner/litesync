@@ -372,7 +372,7 @@ export default class PrivateSyncPlugin extends Plugin {
 			this.holdReplaceGate();
 			new Notice(
 				"LiteSync：有一个未完成的「用本地完整替换远端」作业，普通同步已暂停。\n" +
-					"打开 设置 → LiteSync → 高级 → 用本地完整替换远端，继续或放弃。",
+					"打开 设置 → LiteSync → 高级 → 高级恢复，查看进度后继续、放弃或回滚。",
 				15000,
 			);
 		}
@@ -500,6 +500,7 @@ export default class PrivateSyncPlugin extends Plugin {
 			setVaultChoice: (id) => this.setVaultChoice(id),
 			vaultChoice: () => this.settings.vaultChoice,
 			keyNote: () => this.unlockNote(),
+			replaceRemoteEnabled: () => this.settings.replaceRemoteEnabled,
 			afterKeyAvailable: () => this.maybePersistTrust(),
 			setApiToken: (t) => this.setApiToken(t),
 			openUnlock: (onUnlocked) => this.openUnlockModal(onUnlocked),
@@ -623,6 +624,17 @@ export default class PrivateSyncPlugin extends Plugin {
 		this.replaceGateHeld = false;
 	}
 
+	/**
+	 * 是否有需要用户处理的替换作业（设置页据此在执行入口关闭时仍显示「诊断、放弃或回滚」）：
+	 * 未完成的作业，或已部分/全部完成、可以生成反向作业的正向作业。
+	 */
+	replaceJobNeedsAttention(): boolean {
+		const j = this.store?.state.replaceJob ?? null;
+		if (j === null || j.bootstrapContext) return false;
+		if (jobUnfinished(j)) return true;
+		return j.kind === "local-replace-remote" && j.items.some((i) => i.status === "done");
+	}
+
 	/** 设置页 → 高级 → 高级恢复（已接入的设备）。 */
 	openReplaceRemote(): void {
 		if (!this.ctx || !this.manager || !this.client || !this.bootstrapReady) {
@@ -644,6 +656,8 @@ export default class PrivateSyncPlugin extends Plugin {
 			}
 			new ReplaceRemoteModal(this.app, this.ctx!, {
 				bootstrapContext: false,
+				// 阶段保护（0.20.1）：关闭时只读预览 + 诊断/放弃/回滚，正向执行不可用
+				executionEnabled: this.settings.replaceRemoteEnabled,
 				vaultName: name,
 				vaultChoice: this.settings.vaultChoice,
 				// 先等同步收敛：待推送队列里的本地修改若不先推完，作业的预览与真实状态不一致

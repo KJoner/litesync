@@ -5,6 +5,8 @@
 //   四节结构：连接与仓库 / 同步 / 加密与设备 / 高级（子页面）
 //   新手入口：未连接时显示「粘贴连接链接」「打开网页注册或登录」；手工 Server URL / API Token 只在高级里
 //   密钥持久化开关只在高级里；实验功能折叠为高级下的子页面
+//   0.20.1 阶段保护：「用本地完整替换远端」执行入口默认关闭（高级区显式开关、注明验收阶段）；
+//     关闭时只读预览与未完成作业的诊断 / 放弃 / 回滚入口照常可见，不是静默失效
 //
 // 真实 Obsidian 宿主中的渲染、主题、移动端无横向溢出须真机检查（手册 T5.25），这里只钉结构。
 // INV: INV-10（凭据入口集中在高级区的手动连接里，改动即触发重新绑定的路径不变）
@@ -22,7 +24,7 @@ import { test } from "node:test";
 	return node;
 };
 
-import { SyncSettingTab } from "../src/settings";
+import { DEFAULT_SETTINGS, SyncSettingTab } from "../src/settings";
 import { primaryAction, StatusInput, summarizeStatus } from "../src/status-summary";
 
 function input(over: Partial<StatusInput> = {}): StatusInput {
@@ -84,11 +86,18 @@ interface Def {
 	cls?: string;
 }
 
-function fakePlugin(configured: boolean) {
+function fakePlugin(configured: boolean, opts: { replaceEnabled?: boolean; jobAttention?: boolean } = {}) {
 	return {
 		configured,
 		bootstrapReady: configured,
-		settings: { padObjectSizes: false, experimentalMetaEncryption: false, timingBatchSeconds: 60, mtimeGranularitySeconds: 0 },
+		settings: {
+			padObjectSizes: false,
+			experimentalMetaEncryption: false,
+			timingBatchSeconds: 60,
+			mtimeGranularitySeconds: 0,
+			replaceRemoteEnabled: opts.replaceEnabled ?? false,
+		},
+		replaceJobNeedsAttention: () => opts.jobAttention ?? false,
 		statusInput: () => input({ configured, bootstrapReady: configured }),
 		e2eeStatusText: () => ({ desc: "", action: "" }),
 		keyPolicyText: () => "严格会话解锁",
@@ -98,8 +107,8 @@ function fakePlugin(configured: boolean) {
 	};
 }
 
-function defs(configured: boolean): Def[] {
-	const tab = new SyncSettingTab({} as never, fakePlugin(configured) as never);
+function defs(configured: boolean, opts: { replaceEnabled?: boolean; jobAttention?: boolean } = {}): Def[] {
+	const tab = new SyncSettingTab({} as never, fakePlugin(configured, opts) as never);
 	return tab.getSettingDefinitions() as unknown as Def[];
 }
 
@@ -150,4 +159,32 @@ test("新手入口：未连接时首屏显示粘贴连接链接与打开网页�
 	assert.ok(bound.includes("添加新设备"));
 	assert.ok(bound.includes("密钥保存方式"));
 	assert.ok(bound.includes("本地文件说明"), "如实说明 Obsidian 本地文件仍是明文");
+});
+
+// ---------- 0.20.1 阶段保护：用本地完整替换远端 ----------
+
+test("阶段保护：完整替换远端的执行入口默认关闭，开关只在高级区，文案注明处于验收阶段", () => {
+	assert.equal(DEFAULT_SETTINGS.replaceRemoteEnabled, false, "新安装与升级后都默认关闭");
+	const items = all(defs(true));
+	const toggle = items.find((i) => i.control?.key === "replaceRemoteEnabled");
+	assert.ok(toggle, "有一个显式开关");
+	assert.equal(toggle?.inPage, true, "开关在「高级」子页面里");
+	assert.match(toggle?.name ?? "", /验收阶段/);
+	const visibleNames = items.filter((i) => visible(i)).map((i) => i.name);
+	assert.ok(!visibleNames.includes("用本地完整替换远端"), "默认看不到执行入口");
+	assert.ok(visibleNames.includes("预览本地与远端的差异（只读）"), "只读预览保留");
+	assert.ok(!visibleNames.includes("替换作业：诊断、放弃或回滚"), "没有作业时不出现恢复入口");
+});
+
+test("阶段保护：关闭时未完成/部分完成的作业仍有诊断、放弃、回滚入口；开启后才出现执行入口", () => {
+	const attention = all(defs(true, { jobAttention: true })).filter((i) => visible(i)).map((i) => i.name);
+	assert.ok(attention.includes("替换作业：诊断、放弃或回滚"), "关闭开关不能把半途的作业变成无人可管");
+	assert.ok(!attention.includes("用本地完整替换远端"));
+
+	const enabled = all(defs(true, { replaceEnabled: true })).filter((i) => visible(i)).map((i) => i.name);
+	assert.ok(enabled.includes("用本地完整替换远端"), "显式开启后出现执行入口");
+	assert.ok(!enabled.includes("预览本地与远端的差异（只读）"));
+
+	const fresh = all(defs(false)).filter((i) => visible(i)).map((i) => i.name);
+	assert.ok(!fresh.includes("预览本地与远端的差异（只读）"), "未接入的设备不显示");
 });

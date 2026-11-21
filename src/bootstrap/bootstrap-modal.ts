@@ -32,6 +32,8 @@ export interface BootstrapWizardHooks {
 	vaultChoice?: () => string;
 	/** 解锁/启用弹窗里的密钥策略提示（0.20：严格会话解锁 / 显式持久化 / 待迁移） */
 	keyNote?: () => string;
+	/** 「用本地完整替换远端」的正向执行入口是否开启（0.20.1 阶段保护，默认关闭） */
+	replaceRemoteEnabled?: () => boolean;
 	/** 拿到密钥之后的回调（用户显式开启了可恢复密钥持久化时写入本设备材料） */
 	afterKeyAvailable?: () => Promise<void>;
 	/**
@@ -286,6 +288,7 @@ export class BootstrapWizardModal extends Modal {
 		}
 		new ReplaceRemoteModal(this.app, this.ctx, {
 			bootstrapContext: true,
+			executionEnabled: this.hooks.replaceRemoteEnabled?.() ?? false,
 			vaultName: name,
 			vaultChoice: this.hooks.vaultChoice?.() ?? "",
 			// 接入向导期间 bootstrap 仍是 pending，普通同步本来就被拦住
@@ -457,20 +460,28 @@ export class BootstrapWizardModal extends Modal {
 						new Notice("已从远端恢复此设备 ✓（被替换的本地内容在回收站）");
 					});
 
-				// ③ 本地替换远端：高级恢复作业（ADR-016），与「初始化空仓库」分开命名
+				// ③ 本地替换远端：高级恢复作业（ADR-016），与「初始化空仓库」分开命名。
+				// 0.20.1 阶段保护：执行入口默认关闭——关闭时这里只给只读预览；
+				// 本向导里留下的未完成作业照常可以诊断、放弃或回滚
 				const optC = contentEl.createDiv({ cls: "litesync-hunk" });
 				const unfinished = this.ctx.store.state.replaceJob;
-				optC.createDiv({ cls: "litesync-hunk-label", text: "用本地完整替换远端（高级恢复，高风险）" });
+				const pendingJob =
+					unfinished !== null && unfinished.bootstrapContext && unfinished.state !== "completed" && unfinished.state !== "abandoned";
+				const enabled = this.hooks.replaceRemoteEnabled?.() ?? false;
+				optC.createDiv({
+					cls: "litesync-hunk-label",
+					text: enabled ? "用本地完整替换远端（高级恢复，高风险）" : "用本地完整替换远端（验收阶段，默认关闭）",
+				});
 				optC.createDiv({
 					cls: "litesync-history-meta",
-					text:
-						"远端变成本设备的样子：不同的被本地覆盖、远端多出来的被删除（留有删除记录）。会先生成完整差异预览、" +
-						"保存远端原始版本作为恢复点，并要求输入仓库名确认；其他设备下次同步会收到这些变化。",
+					text: enabled
+						? "远端变成本设备的样子：不同的被本地覆盖、远端多出来的被删除（留有删除记录）。会先生成完整差异预览、" +
+							"保存远端原始版本作为恢复点，并要求输入仓库名确认；其他设备下次同步会收到这些变化。"
+						: "这个破坏性操作仍在验收中，执行入口默认关闭（设置 → 高级 → 高级恢复 可开启）。现在可以先看一份只读差异预览，" +
+							"不保存、不写入任何东西。",
 				});
 				const btnC = optC.createEl("button", {
-					text: unfinished && unfinished.bootstrapContext && unfinished.state !== "completed" && unfinished.state !== "abandoned"
-						? "继续未完成的替换作业…"
-						: "预览本地替换远端…",
+					text: pendingJob ? "查看未完成的替换作业…" : enabled ? "预览本地替换远端…" : "只读预览差异…",
 				});
 				btnC.onclick = () => void this.openReplace();
 				break;

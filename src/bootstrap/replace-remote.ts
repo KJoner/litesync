@@ -658,6 +658,40 @@ export function jobUnfinished(job: ReplaceJob | null): boolean {
 	return job !== null && (job.state === "confirmed" || job.state === "running" || job.state === "interrupted");
 }
 
+/** 阶段保护下界面可以提供的操作（0.20.1；见 settings.replaceRemoteEnabled）。 */
+export interface ReplaceCapabilities {
+	/** 生成差异预览：只读，任何时候都可用 */
+	preview: true;
+	/** 确认并执行一个新的正向作业（把本地推上去） */
+	executeForward: boolean;
+	/** 续跑当前未完成的作业 */
+	resume: boolean;
+	/** 放弃当前未完成的作业 */
+	abandon: boolean;
+	/** 为已完成部分生成并执行反向作业（回滚到替换之前） */
+	reverse: boolean;
+}
+
+/**
+ * 阶段保护（0.20.1）：执行入口关闭 ≠ 功能静默失效。
+ *
+ * - 只读预览始终可用；
+ * - 已经开始的作业始终可以诊断、放弃，已完成的部分始终可以回滚——反向作业是恢复方向，
+ *   把它也关掉等于让用户卡在半途；
+ * - 只有正向执行（确认新作业、续跑正向作业）需要用户在高级区显式开启。
+ */
+export function replaceCapabilities(job: ReplaceJob | null, executionEnabled: boolean): ReplaceCapabilities {
+	if (job === null) return { preview: true, executeForward: executionEnabled, resume: false, abandon: false, reverse: false };
+	const unfinished = jobUnfinished(job);
+	return {
+		preview: true,
+		executeForward: executionEnabled,
+		resume: unfinished && (job.kind === "reverse" || executionEnabled),
+		abandon: unfinished,
+		reverse: job.kind === "local-replace-remote" && job.items.some((i) => i.status === "done"),
+	};
+}
+
 /** 放弃作业：不回滚已完成条目（给出反向作业入口），只是不再继续。 */
 export async function abandonReplaceJob(ctx: SyncContext, job: ReplaceJob): Promise<void> {
 	job.state = "abandoned";

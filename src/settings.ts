@@ -50,6 +50,15 @@ export interface PluginSettings {
 	 */
 	experimentalMetaEncryption: boolean;
 	/**
+	 * 「用本地完整替换远端」的执行入口（0.20.1 阶段保护，复审 PL-02～PL-05）。
+	 *
+	 * 默认**关闭**：这个破坏性作业仍处于验收阶段。关闭时只读差异预览照常可用，
+	 * 已经开始的作业照常可以诊断、放弃、回滚（反向作业是恢复方向，不受开关限制）；
+	 * 只有「确认执行新作业 / 续跑正向作业」需要用户在高级区显式开启。
+	 * 是否恢复默认开放由真实服务端联调与真机验收的结论决定，不在代码里擅自打开。
+	 */
+	replaceRemoteEnabled: boolean;
+	/**
 	 * 开发开关：允许执行不可逆的明文路径抹除（meta complete）。
 	 *
 	 * 默认 **关闭**：迁移停在「已伪名化但未抹除」的可回退状态。
@@ -105,6 +114,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	trustDevice: false,
 	deviceKeyB64: "",
 	experimentalMetaEncryption: false,
+	// 0.20.1 阶段保护：完整替换远端的执行入口默认关闭（验收阶段）
+	replaceRemoteEnabled: false,
 	allowIrreversibleMetaErase: false,
 	padObjectSizes: false,
 	padPathPrefixes: "",
@@ -435,13 +446,39 @@ export class SyncSettingTab extends PluginSettingTab {
 						heading: "高级恢复",
 						items: [
 							{
+								name: "启用「用本地完整替换远端」（验收阶段）",
+								aliases: ["覆盖远端", "本地为准", "完整替换"],
+								desc:
+									"这个破坏性的高级恢复操作仍处于验收阶段，默认关闭。关闭时只能生成只读差异预览，不能执行；" +
+									"已经开始的替换作业仍可在下面诊断、放弃或回滚。开启前请先完整备份本地笔记，并确认其他设备此刻不在同步。",
+								control: { type: "toggle", key: "replaceRemoteEnabled" },
+							},
+							{
 								name: "用本地完整替换远端",
 								aliases: ["覆盖远端", "本地为准", "恢复"],
 								desc:
 									"高风险：以本设备的同步范围为准，覆盖远端的不同文件、删除远端多出来的文件（删除留有记录，可从历史恢复）。" +
 									"执行前会生成完整的差异预览、保存远端原始版本作为恢复点，并要求输入仓库名确认。" +
 									"只想把空仓库初始化成本地内容时，请用接入向导里的「用本地初始化空仓库」。",
-								visible: ready,
+								visible: () => ready() && plugin.settings.replaceRemoteEnabled,
+								action: () => plugin.openReplaceRemote(),
+							},
+							{
+								name: "预览本地与远端的差异（只读）",
+								aliases: ["覆盖远端", "差异预览", "完整替换"],
+								desc:
+									"按「用本地完整替换远端」的规则生成差异预览：哪些远端文件会被覆盖、删除、新建。只读，不保存、不写入任何东西；" +
+									"执行入口处于验收阶段，需要先打开上面的开关。",
+								visible: () => ready() && !plugin.settings.replaceRemoteEnabled,
+								action: () => plugin.openReplaceRemote(),
+							},
+							{
+								name: "替换作业：诊断、放弃或回滚",
+								aliases: ["替换作业", "回滚", "反向作业", "放弃作业"],
+								desc:
+									"本设备有一个未完成、或已部分完成的「用本地完整替换远端」作业：可以查看进度与暂停原因、放弃它，" +
+									"或按恢复点把远端回滚到替换之前——这些恢复操作不受上面开关的限制。",
+								visible: () => ready() && !plugin.settings.replaceRemoteEnabled && plugin.replaceJobNeedsAttention(),
 								action: () => plugin.openReplaceRemote(),
 							},
 						],
