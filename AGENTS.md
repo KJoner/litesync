@@ -121,6 +121,11 @@ src/
   v0.18 新增认证类：`UNAUTHORIZED` / `TOKEN_REVOKED`（凭据曾有效、已被
   重置或撤销——客户端据此给「填新 Token → 测试连接」指引）/
   `RESET_AUTH_MISMATCH`（重置凭证不符）。
+  0.20.1 新增 `IDENTITY_UNAVAILABLE`（503 + `Retry-After`，retryable）：账号中心暂时无法确认账号状态且超过宽限，
+  对**所有**设备请求统一生效。`client.ts` 的 `request()` 包装在一处把它变成带 code / `retryAfterSeconds` 的 ApiError
+  （只看状态码的端点也能识别）；同步按可重试处理——保留队列与游标、重试不早于 Retry-After、**不进**「需要重新连接」，
+  状态文案「账号中心暂时无法确认你的登录状态，稍后自动重试；本地修改已保留」。凭据被撤销仍是 401 `TOKEN_REVOKED`
+  （置 credential-rejected、常驻提示、不排重试、不换凭据提交）。
 - **API Token 重置（v0.18）**：服务端 Token 已落库（哈希），网页/CLI 可
   轮换并连带撤销该用户全部设备。设备端恢复路径 = 填新 Token → 测试连接
   （`main.ts` 的 `testConnection` 会在凭据停机时自动触发同步闭环）。
@@ -183,7 +188,7 @@ src/
 
 ## 7. 测试组织
 
-`tests/` 目录自动发现，当前 443 条（0.20.1 复审修复 + Windows 真机验收回归后；0.20.0 时 361）。分类：
+`tests/` 目录自动发现，当前 450 条（0.20.1 复审修复 + Windows 真机验收回归 + IDENTITY_UNAVAILABLE 后；0.20.0 时 361）。分类：
 
 - `unit` / `merge` / `smart-merge` / `crypto` / `store` / `device-trust`：基础单元；
 - `crashpoint.test.ts`：**崩溃点注入**（`utils/failpoint.ts` 在关键步骤间强制中断）；

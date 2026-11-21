@@ -1,8 +1,10 @@
 import { Notice, Platform, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
 import {
 	ApiClient,
+	ApiError,
 	enrollDevice,
 	fetchPairingEnvelope,
+	IDENTITY_UNAVAILABLE_TEXT,
 	isLoopbackUrl,
 	protocolError,
 	redeemDeviceEnrollment,
@@ -1341,6 +1343,11 @@ export default class PrivateSyncPlugin extends Plugin {
 			migrationPending: migrationPending(this.settings),
 			keyPolicyText: keyPolicyLabel(this.settings),
 			syncing: this.manager?.isSyncing ?? false,
+			// 账号中心暂时无法确认登录状态（503 IDENTITY_UNAVAILABLE）：状态卡如实告知，主按钮不变、不提示重新连接
+			retryNotice: (() => {
+				const err = this.manager?.lastSyncError;
+				return err instanceof ApiError && err.is("IDENTITY_UNAVAILABLE") ? IDENTITY_UNAVAILABLE_TEXT : null;
+			})(),
 			now: Date.now(),
 		};
 	}

@@ -25,6 +25,11 @@ export interface StatusInput {
 	keyPolicyText: string;
 	syncing: boolean;
 	now: number;
+	/**
+	 * 可自动恢复的同步暂停说明（例如 503 IDENTITY_UNAVAILABLE：账号中心暂时无法确认登录状态）。
+	 * 只是告知——不改主按钮、不进「重新连接」；null / 未提供 = 没有
+	 */
+	retryNotice?: string | null;
 }
 
 export interface StatusLine {
@@ -95,8 +100,12 @@ export function summarizeStatus(s: StatusInput): StatusSummary {
 
 	lines.push({
 		label: "最近同步",
-		value: s.lastSyncAt > 0 ? relativeTime(s.lastSyncAt, s.now) : "本次运行尚未同步",
-		tone: "muted",
+		value: s.retryNotice
+			? s.retryNotice + (s.lastSyncAt > 0 ? `（上次成功：${relativeTime(s.lastSyncAt, s.now)}）` : "")
+			: s.lastSyncAt > 0
+				? relativeTime(s.lastSyncAt, s.now)
+				: "本次运行尚未同步",
+		tone: s.retryNotice ? "warn" : "muted",
 	});
 
 	lines.push({

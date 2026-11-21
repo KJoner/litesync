@@ -1,4 +1,5 @@
 import { Platform, requestUrl } from "obsidian";
+import type { RequestUrlParam, RequestUrlResponse } from "obsidian";
 import { canonicalCheckpoint, SignedCheckpoint } from "../crypto/checkpoint";
 import { VaultKeyDoc } from "../crypto/crypto";
 
@@ -276,7 +277,13 @@ export type ServerErrorCode =
 	// 服务端 0.20：永久性配额超限（存储 413 / 仓库数 409，retryable=false）与临时限流（429）
 	| "QUOTA_EXCEEDED"
 	| "RATE_LIMITED"
+	// 服务端 0.20.1（ADR-019）：账号中心暂时无法确认账号状态且已超过宽限，对设备请求统一返回
+	// 503 + Retry-After（retryable=true）。不是凭据问题：保留队列、按 Retry-After 再试，不进「需要重新连接」
+	| "IDENTITY_UNAVAILABLE"
 	| "INTERNAL";
+
+/** 503 IDENTITY_UNAVAILABLE 的用户文案（状态栏 / 手动同步 / 测试连接共用）。 */
+export const IDENTITY_UNAVAILABLE_TEXT = "账号中心暂时无法确认你的登录状态，稍后自动重试；本地修改已保留";
 
 export class ApiError extends Error {
 	constructor(
@@ -297,9 +304,42 @@ export class ApiError extends Error {
 		this.name = "ApiError";
 	}
 
+	/** 服务器给的 Retry-After（秒）：重试不得早于它（目前只有 IDENTITY_UNAVAILABLE 会带上） */
+	retryAfterSeconds?: number;
+
 	is(code: ServerErrorCode): boolean {
 		return this.code === code;
 	}
+}
+
+/** 解析 Retry-After：整数秒或 HTTP 日期；解析不了返回 undefined，上限 1 小时（防止服务器给出离谱值把同步冻住）。 */
+export function parseRetryAfter(value: string | undefined, now = Date.now()): number | undefined {
+	if (value === undefined) return undefined;
+	const v = value.trim();
+	if (v === "") return undefined;
+	let seconds: number;
+	if (/^\d+$/.test(v)) seconds = Number(v);
+	else {
+		const at = Date.parse(v);
+		if (Number.isNaN(at)) return undefined;
+		seconds = Math.ceil((at - now) / 1000);
+	}
+	return Math.min(Math.max(seconds, 0), 3600);
+}
+
+/**
+ * 所有请求都经过这里。服务端的「账号中心暂时无法确认」（503 IDENTITY_UNAVAILABLE）是对**所有设备请求**统一生效的门，
+ * 任何端点都可能返回——在这里统一变成带 code 与 Retry-After 的 ApiError，不依赖各端点自己是否解析了响应体
+ *（changes / snapshot / download 等端点只看状态码）。其余响应原样交还调用方。
+ */
+async function request(p: RequestUrlParam): Promise<RequestUrlResponse> {
+	const res = await requestUrl(p);
+	if (res.status === 503 && tryJson(res.text)?.code === "IDENTITY_UNAVAILABLE") {
+		const err = new ApiError(503, IDENTITY_UNAVAILABLE_TEXT, "IDENTITY_UNAVAILABLE", true);
+		err.retryAfterSeconds = parseRetryAfter(header(res.headers ?? {}, "retry-after"));
+		throw err;
+	}
+	return res;
 }
 
 /** 迁移状态与 journal 进度（GET /api/v1/meta/status）。 */
@@ -431,7 +471,7 @@ export class ApiClient {
 	}
 
 	async info(): Promise<ServerInfo> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/info`,
 			method: "GET",
 			headers: this.headers(),
@@ -444,7 +484,7 @@ export class ApiClient {
 	}
 
 	async changes(since: number, limit = 500): Promise<ChangesResponse> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/changes?since=${since}&limit=${limit}`,
 			method: "GET",
 			headers: this.headers(),
@@ -456,7 +496,7 @@ export class ApiClient {
 
 	/** 当前所有未删除文件的元数据（changes 被裁剪后的全量对账）。 */
 	async snapshot(): Promise<{ sequence: number; files: SnapshotFile[]; repoEpoch?: string }> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/snapshot`,
 			method: "GET",
 			headers: this.headers(),
@@ -467,7 +507,7 @@ export class ApiClient {
 	}
 
 	async download(path: string): Promise<DownloadResult> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/file?path=${encodeURIComponent(path)}`,
 			method: "GET",
 			headers: this.headers(),
@@ -501,7 +541,7 @@ export class ApiClient {
 		meta?: { metaEnc: string; canonicalHash: string },
 		operationId?: string,
 	): Promise<UploadOk> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/file`,
 			method: "PUT",
 			headers: this.headers({
@@ -536,7 +576,7 @@ export class ApiClient {
 
 	/** 获取文件的历史版本列表（revision 降序）。 */
 	async history(path: string): Promise<VersionEntry[]> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/history?path=${encodeURIComponent(path)}`,
 			method: "GET",
 			headers: this.headers(),
@@ -549,7 +589,7 @@ export class ApiClient {
 
 	/** 下载某历史版本的内容。版本不存在或已被 GC 时抛 NotFoundError。 */
 	async version(path: string, revision: number): Promise<DownloadResult> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/version?path=${encodeURIComponent(path)}&revision=${revision}`,
 			method: "GET",
 			headers: this.headers(),
@@ -576,7 +616,7 @@ export class ApiClient {
 	 * Header，等于让「用户分享了哪个文件」出现在服务端日志与数据库里。
 	 */
 	async createShare(expiresAt: number, payload: ArrayBuffer): Promise<{ id: string }> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/share`,
 			method: "POST",
 			headers: this.headers({
@@ -603,7 +643,7 @@ export class ApiClient {
 		signingKeys: Record<string, string>;
 		revokedDevices: string[];
 	}> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/checkpoints?since=${since}`,
 			method: "GET",
 			headers: this.headers(),
@@ -628,7 +668,7 @@ export class ApiClient {
 
 	/** 发布本设备签名的 checkpoint。 */
 	async publishCheckpoint(cp: SignedCheckpoint): Promise<void> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/checkpoint`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -647,7 +687,7 @@ export class ApiClient {
 
 	/** 名下仓库列表（v0.19 多仓库；设备凭据也可调——只列自己主人的）。 */
 	async listVaults(): Promise<RemoteVault[]> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/vaults`,
 			method: "GET",
 			headers: this.headers(),
@@ -659,7 +699,7 @@ export class ApiClient {
 
 	/** 新建仓库（v0.19；用户级 Token 专属，设备凭据会被拒）。 */
 	async createVault(name: string): Promise<string> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/vaults`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -672,7 +712,7 @@ export class ApiClient {
 
 	/** 重命名仓库（v0.19.x；用户级 Token 专属，只动展示名——身份/密钥/账本不受影响）。 */
 	async renameVault(id: string, name: string): Promise<void> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/vaults/${encodeURIComponent(id)}`,
 			method: "PATCH",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -689,7 +729,7 @@ export class ApiClient {
 	 * 调用方按 code 分支决定是否提示。
 	 */
 	async registerResetAuth(resetAuth: string): Promise<void> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/vault/reset-auth`,
 			method: "PUT",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -701,7 +741,7 @@ export class ApiClient {
 
 	/** 登记本设备的 checkpoint 签名公钥（首次接入时一次）。 */
 	async registerSigningKey(publicKeyB64: string): Promise<void> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/device/signing-key`,
 			method: "PUT",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -712,7 +752,7 @@ export class ApiClient {
 	}
 
 	async listShares(): Promise<ShareEntry[]> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/shares`,
 			method: "GET",
 			headers: this.headers(),
@@ -723,7 +763,7 @@ export class ApiClient {
 	}
 
 	async revokeShare(id: string): Promise<void> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/share?id=${encodeURIComponent(id)}`,
 			method: "DELETE",
 			headers: this.headers(),
@@ -737,7 +777,7 @@ export class ApiClient {
 
 	/** 当前凭据身份：root（.env 根 Token）或 device（设备凭据）。 */
 	async whoami(): Promise<{ tokenType: "root" | "device"; deviceId?: string; scopes?: string }> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/whoami`,
 			method: "GET",
 			headers: this.headers(),
@@ -749,7 +789,7 @@ export class ApiClient {
 
 	/** 根 Token 直接创建设备凭据（首台设备自注册；token 明文只返回一次）。 */
 	async createDevice(name: string): Promise<{ deviceId: string; deviceToken: string }> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/devices`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -763,7 +803,7 @@ export class ApiClient {
 
 	/** 生成一次性注册凭据（配对包 v2 携带；secret 只返回一次）。 */
 	async createEnrollment(ttlSeconds = 900): Promise<{ id: string; secret: string; expiresAt: number }> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/enrollments`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -779,7 +819,7 @@ export class ApiClient {
 	async listDevices(): Promise<
 		Array<{ id: string; name: string; scopes: string; createdAt: number; lastSeenAt: number; revoked: boolean; current: boolean }>
 	> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/devices`,
 			method: "GET",
 			headers: this.headers(),
@@ -791,7 +831,7 @@ export class ApiClient {
 
 	/** 创建一次性加密配对包（v8「添加新设备」；服务器只存密文）。 */
 	async createPairing(ciphertextB64: string, ttlSeconds = 300): Promise<{ id: string; expiresAt: number }> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/pairing`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -809,7 +849,7 @@ export class ApiClient {
 	 * 设备凭据只能为自己绑定的仓库申请（路径里的 id 不符 → 404）。
 	 */
 	async createPairingGrant(vaultId: string): Promise<PairingGrant> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v2/vaults/${encodeURIComponent(vaultId)}/pairing-grants`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -836,7 +876,7 @@ export class ApiClient {
 
 	/** 上传本机加密后的配对包，绑定到 grant（TTL 与 grant 相同）。 */
 	async createPairingV2(grantId: string, ciphertextB64: string): Promise<{ pairId: string; expiresAt: number }> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v2/pairings`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -852,7 +892,7 @@ export class ApiClient {
 
 	/** 发行者撤销：同时撤销密文与尚未兑换的 grant（不存在视为成功）。 */
 	async deletePairingV2(pairId: string): Promise<void> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v2/pairings/${encodeURIComponent(pairId)}`,
 			method: "DELETE",
 			headers: this.headers(),
@@ -865,7 +905,7 @@ export class ApiClient {
 
 	/** 撤销配对包（配对窗口关闭时调用；已消费/不存在也视为成功）。 */
 	async deletePairing(id: string): Promise<void> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/pairing/${encodeURIComponent(id)}`,
 			method: "DELETE",
 			headers: this.headers(),
@@ -881,7 +921,7 @@ export class ApiClient {
 
 	/** 获取 vault key 文档及其 CAS 指纹（replace 时必须原样传回，0.9.0+）。 */
 	async getVaultKeyWithFingerprint(): Promise<{ doc: VaultKeyDoc; fingerprint: string } | null> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/vault-key`,
 			method: "GET",
 			headers: this.headers(),
@@ -901,7 +941,7 @@ export class ApiClient {
 	 * 防止并发迁移把别的设备刚写入的 key 文档无条件覆盖掉。
 	 */
 	async putVaultKey(doc: VaultKeyDoc, replace: boolean, expectedFingerprint = ""): Promise<void> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/vault-key${replace ? "?replace=true" : ""}`,
 			method: "PUT",
 			headers: this.headers({
@@ -917,7 +957,7 @@ export class ApiClient {
 
 	/** E2EE 状态机（0.9.0+）：begin 冻结明文写 / complete 全量验证后启用 / abort 回退。 */
 	async e2eeTransition(action: "begin" | "complete" | "abort"): Promise<{ encryptionState: string; keyEpoch: number }> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/e2ee/${action}`,
 			method: "POST",
 			headers: this.headers(),
@@ -930,7 +970,7 @@ export class ApiClient {
 
 	/** 清理某路径 beforeRevision 之前的历史版本（E2EE 迁移：密文验证后清明文）。 */
 	async purgeHistory(path: string, beforeRevision: number): Promise<number> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/history?path=${encodeURIComponent(path)}&beforeRevision=${beforeRevision}`,
 			method: "DELETE",
 			headers: this.headers(),
@@ -957,7 +997,7 @@ export class ApiClient {
 		meta?: { metaEnc: string; canonicalHash: string },
 		operationId?: string,
 	): Promise<{ fileId: string; toPath: string; revision: number; metaGeneration: number; sequence: number }> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/file/rename`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json", ...this.opHeader(operationId) }),
@@ -994,7 +1034,7 @@ export class ApiClient {
 		},
 		operationId?: string,
 	): Promise<{ fileId: string; path: string; revision: number; metaGeneration?: number; sequence: number }> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/files/${encodeURIComponent(fileId)}/restore`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json", ...this.opHeader(operationId) }),
@@ -1013,7 +1053,7 @@ export class ApiClient {
 
 	/** 信封升级完成：服务器验证全部 HEAD 为 LSE3 后把仓库下限提升到 3（ADR-006）。 */
 	async completeEnvelopeUpgrade(): Promise<{ minimumEnvelopeVersion: number }> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/envelope/complete`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -1035,7 +1075,7 @@ export class ApiClient {
 	async trash(): Promise<
 		Array<{ fileId: string; path: string; deletionRevision: number; contentGeneration: number; metaGeneration: number; restorable: boolean }>
 	> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/trash`,
 			method: "GET",
 			headers: this.headers(),
@@ -1057,7 +1097,7 @@ export class ApiClient {
 	async getFileMeta(
 		path: string,
 	): Promise<{ path: string; fileId: string; revision: number; metaEnc: string; metaGeneration: number }> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/file/meta?path=${encodeURIComponent(path)}`,
 			method: "GET",
 			headers: this.headers(),
@@ -1070,7 +1110,7 @@ export class ApiClient {
 
 	/** 续租迁移（计划书 §5.4）：owner 在长迁移中周期调用。 */
 	async renewMigrationLease(): Promise<MigrationStatus> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/meta/renew`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -1083,7 +1123,7 @@ export class ApiClient {
 
 	/** 显式接管租约已过期的迁移（绝不自动发生，计划书 §5.4）。 */
 	async takeoverMigration(migrationId: string): Promise<MigrationStatus> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/meta/takeover`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -1096,7 +1136,7 @@ export class ApiClient {
 
 	/** 迁移进度与状态（journal 汇总）。 */
 	async metaStatus(): Promise<MigrationStatus> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/meta/status`,
 			method: "GET",
 			headers: this.headers(),
@@ -1112,7 +1152,7 @@ export class ApiClient {
 		metaEnc: string,
 		canonicalHash: string,
 	): Promise<{ fileId: string; fromPath: string; toPath: string; revision: number; metaGeneration: number }> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/meta/migrate`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -1125,7 +1165,7 @@ export class ApiClient {
 
 	/** 列出仍带明文寻址名的删除记录（迁移 owner 专用）。 */
 	async listPlaintextTombstones(): Promise<PlaintextTombstone[]> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/meta/tombstones`,
 			method: "GET",
 			headers: this.headers(),
@@ -1141,7 +1181,7 @@ export class ApiClient {
 	 * 这正是 v0.12.0「删掉 tombstone 抹明文」造成静默复活的正解。
 	 */
 	async migrateTombstone(fileId: string, canonicalHash: string): Promise<void> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/meta/migrate-tombstone`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -1153,7 +1193,7 @@ export class ApiClient {
 
 	/** 预检：只跑服务端验证器，不改状态。 */
 	async validateMetaMigration(): Promise<{ ok: boolean; failures: ValidationFailure[] }> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/meta/validate`,
 			method: "GET",
 			headers: this.headers(),
@@ -1179,7 +1219,7 @@ export class ApiClient {
 		confirmErase?: boolean,
 		migrationId?: string,
 	): Promise<MigrationStatus> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/meta/${action}`,
 			method: "POST",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -1199,7 +1239,7 @@ export class ApiClient {
 	 * 旧调用方忽略返回值即可）。
 	 */
 	async remove(path: string, baseRevision: number): Promise<{ revision: number; sequence: number }> {
-		const res = await requestUrl({
+		const res = await request({
 			url: `${this.base()}/api/v1/file`,
 			method: "DELETE",
 			headers: this.headers({ "Content-Type": "application/json" }),
@@ -1265,7 +1305,7 @@ export async function enrollDevice(
 	secret: string,
 	name: string,
 ): Promise<{ deviceId: string; deviceToken: string }> {
-	const res = await requestUrl({
+	const res = await request({
 		url: `${serverUrl.replace(/\/+$/, "")}/enroll`,
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
@@ -1308,7 +1348,7 @@ function trimServer(serverUrl: string): string {
  * 新服务器把它登记为公开路由（200/404/410），旧服务器对任何 /api/* 都要求认证（401）。
  */
 export async function fetchPairingEnvelope(serverUrl: string, pairId: string): Promise<PairingEnvelopeResult> {
-	const res = await requestUrl({
+	const res = await request({
 		url: `${trimServer(serverUrl)}/api/v2/pairings/${encodeURIComponent(pairId)}/envelope`,
 		method: "GET",
 		throw: false,
@@ -1354,7 +1394,7 @@ export type RedeemResult =
 export async function redeemDeviceEnrollment(serverUrl: string, req: RedeemRequest): Promise<RedeemResult> {
 	let res;
 	try {
-		res = await requestUrl({
+		res = await request({
 			url: `${trimServer(serverUrl)}/api/v2/device-enrollments/redeem`,
 			method: "POST",
 			headers: { "Content-Type": "application/json" },

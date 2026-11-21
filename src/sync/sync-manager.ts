@@ -1,4 +1,4 @@
-import { ApiError, protocolError, ServerInfo } from "../api/client";
+import { ApiError, IDENTITY_UNAVAILABLE_TEXT, protocolError, ServerInfo } from "../api/client";
 import { E2eeLockedError } from "../crypto/keyring";
 import { BindingFingerprint, computeBinding } from "../state/store";
 import { isKeyEpoch } from "../utils/validate";
@@ -349,6 +349,12 @@ export class SyncManager {
 					if (handle) this.credentialNotice = handle;
 				}
 				this.onStatus("offline", msg);
+			} else if (e instanceof ApiError && e.is("IDENTITY_UNAVAILABLE")) {
+				// 账号中心暂时无法确认登录状态（服务端超过宽限，0.20.1 / ADR-019）：可重试，不是凭据问题——
+				// 不进「需要重新连接」（不置 credential-rejected、不弹常驻通知），队列与游标原样保留，
+				// 重试不早于服务器给的 Retry-After
+				this.onStatus("offline", IDENTITY_UNAVAILABLE_TEXT);
+				this.scheduleRetry(e.retryAfterSeconds);
 			} else {
 				this.onStatus("offline", failure.message);
 				this.scheduleRetry();
@@ -622,8 +628,9 @@ export class SyncManager {
 		}
 	}
 
-	private scheduleRetry(): void {
-		const delay = RETRY_DELAYS[Math.min(this.retryIndex, RETRY_DELAYS.length - 1)];
+	/** 退避重试；minSeconds = 服务器要求的最早重试时间（Retry-After），只会拉长、不会缩短退避 */
+	private scheduleRetry(minSeconds?: number): void {
+		const delay = Math.max(RETRY_DELAYS[Math.min(this.retryIndex, RETRY_DELAYS.length - 1)], minSeconds ?? 0);
 		this.retryIndex++;
 		this.ctx.log(`retry in ${delay}s`);
 		this.retryTimer = window.setTimeout(() => {

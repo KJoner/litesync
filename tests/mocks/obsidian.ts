@@ -11,7 +11,16 @@ export const Platform = {
 	isDesktopApp: true,
 };
 
-export function requestUrl(): never {
+type RequestHandler = (p: { url: string; method?: string; headers?: Record<string, string>; body?: unknown }) => Promise<unknown>;
+let requestHandler: RequestHandler | null = null;
+
+/** 测试注入：设置后 requestUrl 交给它处理；不设置时保持「单测里不可用」（0.20.1：IDENTITY_UNAVAILABLE 回归用）。 */
+export function __setRequestUrl(h: RequestHandler | null): void {
+	requestHandler = h;
+}
+
+export function requestUrl(p: Parameters<RequestHandler>[0]): Promise<unknown> {
+	if (requestHandler) return requestHandler(p);
 	throw new Error("requestUrl is not available in unit tests");
 }
 
