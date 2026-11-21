@@ -3,6 +3,9 @@
 //   缺陷 1（替换弹窗）：执行中断后，同一个窗口里的按钮显示「继续执行」，点下去却仍走确认流程——作业已是
 //     interrupted，只得到「作业状态不允许确认」、原地卡死；用户只能关掉窗口重开才能从诊断页续跑。
 //     修复：已确认过的作业在同一窗口里点「继续执行」按续跑处理（与诊断页一致；执行许可照样逐项复核）。
+//   缺陷 3（接入向导里的作业被强杀后续跑）：作业在接入完成前就为完成的条目写下跟踪状态，却没有确立账本归属；
+//     重启后向导重新 preflight，把这些记录当成「归属未知的旧账」整本作废，作业完成后的第一轮同步把这些文件当成
+//     「本地未跟踪、远端已有」，试图以新身份重新上传（真机实测服务端 422 拒绝）。修复：作业开始写之前确立账本归属。
 //   缺陷 2（替换之后的第一轮普通同步）：仅大小写不同的改名项（删 Case.md → 在 case.md 上恢复同一对象 → 上传）
 //     完成后，普通拉取按顺序重放这三条自己写出的变更。在大小写不敏感的文件系统上，重放「删除 Case.md」时
 //     stat 命中已经改名成 case.md 的同一个文件，被当成「远端删了、本地改了」另存成新文件重新上传，随后把原对象
@@ -17,6 +20,7 @@ import { afterEach, test } from "node:test";
 
 (globalThis as unknown as { window: unknown }).window = globalThis;
 
+import { completeBootstrap, preflight } from "../src/bootstrap/bootstrap-manager";
 import { confirmReplaceJob, planReplaceRemote, runReplaceJob, saveRecoveryPoint } from "../src/bootstrap/replace-remote";
 import { ReplaceRemoteModal } from "../src/bootstrap/replace-remote-modal";
 import type { ReplaceJob } from "../src/bootstrap/replace-types";
@@ -24,6 +28,7 @@ import { createVaultKeyDoc, MetaKeys } from "../src/crypto/crypto";
 import { Keyring } from "../src/crypto/keyring";
 import type { SyncContext } from "../src/sync/context";
 import { pullRemoteChanges } from "../src/sync/pull";
+import { pushPendingChanges, scanLocalChanges } from "../src/sync/push";
 import { resetFailpoints } from "../src/utils/failpoint";
 import { dec, FakeServer, Head, makeCtx, MemVault } from "./fakes/replace-server";
 
@@ -290,4 +295,78 @@ test("拉取：删除命中的是另一个已跟踪文件的大小写别名（�
 	assert.deepEqual(w.ctx.queue.entries(), []);
 	assert.deepEqual(w.vault.userFiles().map((f) => f.path), ["case.md"]);
 	assert.equal(w.ctx.store.get("case.md")?.fileId, head.fileId);
+});
+
+// ---------- 缺陷 3：接入向导里的作业做了一半被强杀，重启后向导重新 preflight ----------
+
+test("WIN-11 缺陷 3（接入向导上下文，路径加密）：作业做了一半时 Obsidian 被强杀，重启后向导重新 preflight——作业已写下的跟踪状态不能被当成「归属未知的旧账」作废；完成接入后的第一轮同步零写入", async () => {
+	const server = new FakeServer();
+	server.metaState = "encrypted";
+	const vault = new MemVault();
+	const made = await createVaultKeyDoc("test-password");
+	made.doc.enabled = true;
+	const keyring = (): Keyring => {
+		const k = new Keyring();
+		k.adopt(made.doc, made.vmk);
+		return k;
+	};
+	const kr = keyring();
+	const keys = await kr.metaKeys();
+	await server.seedE2ee("keep.md", "same", made.vmk, keys);
+	await server.seedE2ee("edit.md", "remote v1", made.vmk, keys);
+	await server.seedE2ee("gone.md", "remote only", made.vmk, keys);
+	vault.put("keep.md", "same");
+	vault.put("edit.md", "local v2");
+	vault.put("new.md", "local only");
+	// 向导：接入尚未完成（bootstrap pending），先 preflight 再出选项
+	const ctx = await makeCtx(server, vault, kr, { metaState: "encrypted", bootstrap: "pending" });
+	await preflight(ctx);
+	const job = await planReplaceRemote(ctx, { vaultName: "v", vaultChoice: "", bootstrapContext: true });
+	assert.deepEqual(confirmReplaceJob(job, "v", 1), { ok: true });
+	await saveRecoveryPoint(ctx, job);
+	// 前两个写入完成，第三个之前「进程被杀」（请求没到服务器）
+	server.failBeforeWrite = server.writes + 3;
+	await assert.rejects(runReplaceJob(ctx, job));
+	const doneBeforeKill = job.items.filter((i) => i.status === "done" && i.action !== "keep").map((i) => i.path);
+	assert.ok(doneBeforeKill.length >= 2, `前提：强杀前已完成 ${doneBeforeKill.join("、")}`);
+	const trackedBefore = Object.fromEntries(doneBeforeKill.filter((p) => ctx.store.get(p)).map((p) => [p, ctx.store.get(p)!.fileId]));
+	assert.ok(Object.keys(trackedBefore).length >= 1, "前提：作业为已完成的条目写下了跟踪状态");
+
+	// 重启：从磁盘重新加载状态；启动时向导重新打开、重新 preflight
+	const ctx2 = await makeCtx(server, vault, keyring(), { loadOnly: true, metaState: "encrypted" });
+	const pre2 = await preflight(ctx2);
+	for (const [p, fid] of Object.entries(trackedBefore)) {
+		assert.equal(ctx2.store.get(p)?.fileId, fid, `重启后的 preflight 保留了作业写下的跟踪状态（${p}）`);
+	}
+	const job2 = ctx2.store.state.replaceJob!;
+	const r = await runReplaceJob(ctx2, job2);
+	assert.equal(r.state, "completed", r.reason);
+	completeBootstrap(ctx2, { ...pre2, info: await ctx2.client.info(), snapshotSequence: job2.plannedHeadSequence, remoteFiles: [], localPaths: [], commonCount: 0 }, "local-replace");
+	ctx2.gate.markBound();
+	const c2 = ctx2 as unknown as {
+		committer: unknown;
+		notify: (m: string) => void;
+		app: { vault: { getFiles: () => unknown[] } };
+	};
+	const notes: string[] = [];
+	c2.notify = (m: string) => void notes.push(m);
+	// 宿主的 TFile 带 stat（扫描按 mtime / size 判断有没有改动）；内存库的 mtime 恒为 1000
+	c2.app.vault.getFiles = () =>
+		vault.userFiles().map((f) => ({ path: f.path, stat: { mtime: 1000, size: vault.files.get(f.path)!.byteLength } }));
+	c2.committer = {
+		commitRemoteChange: async (req: { realPath: string; incoming: ArrayBuffer }) => {
+			await vault.adapter.writeBinary(req.realPath, req.incoming);
+			return { status: "committed" };
+		},
+	};
+
+	const writesBefore = server.writeRequests().length;
+	const pulled = await pullRemoteChanges(ctx2);
+	await scanLocalChanges(ctx2);
+	await pushPendingChanges(ctx2);
+	assert.equal(pulled.conflicts, 0, "没有把作业自己写的内容当成冲突");
+	assert.deepEqual(notes.filter((n) => /冲突|已保留本地|两个版本/.test(n)), []);
+	assert.equal(server.writeRequests().length, writesBefore, "完成接入后的第一轮同步零写入（不会以新身份重新上传已替换的文件）");
+	const live = [...server.heads.values()].filter((h) => !h.deleted);
+	assert.equal(live.length, 3, "远端只有 keep / edit / new 三个对象，没有多出来的副本");
 });

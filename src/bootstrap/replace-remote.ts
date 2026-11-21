@@ -614,6 +614,14 @@ export async function runReplaceJob(
 		await persistJob(ctx, job);
 		return { state: job.state, done: 0, stale: 0, reason: job.staleReason };
 	}
+	// 接入向导里的作业在接入完成之前就会写跟踪状态（每完成一项记一条）。账本归属必须同时确立：
+	// 否则重启后向导重新 preflight，会把这些记录当成「归属未知的旧账」整本作废，作业完成后的第一轮
+	// 同步再把这些文件当成「本地未跟踪、远端已有」，试图以新身份重新上传（WIN-11 真机实测：服务端 422 拒绝）。
+	// 走到这里时 preflight 已经把别的仓库的旧账清掉了，剩下的只可能是本作业对这个仓库写的
+	if (job.bootstrapContext && job.vaultIdentity !== "" && ctx.store.state.ledgerVaultId === undefined) {
+		ctx.store.state.ledgerVaultId = job.vaultIdentity;
+		await ctx.store.save();
+	}
 
 	const pending = job.items.filter((it) => it.status === "pending");
 	// 本地前置条件预检（PL-04）：任何远端写入之前，先确认预览时的本地条件一个都没变——
