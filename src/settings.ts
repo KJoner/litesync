@@ -1,4 +1,5 @@
 import { App, debounce, Modal, Notice, Platform, PluginSettingTab, SettingDefinitionItem } from "obsidian";
+import type { Setting } from "obsidian";
 import { ApiError, isLoopbackUrl } from "./api/client";
 import { TokenPromptModal } from "./token-prompt-modal";
 import type PrivateSyncPlugin from "./main";
@@ -130,6 +131,14 @@ export const DEFAULT_SETTINGS: PluginSettings = {
  * API Token 走 SecretStorage，trustDevice 走 setTrustDevice，其余进 data.json。
  */
 export class SyncSettingTab extends PluginSettingTab {
+	/** 状态卡这一项（每次渲染时记下）：插件状态变化时就地重绘它，不碰页面上的其他控件。 */
+	private statusCard: Setting | null = null;
+	/** 最近一次取设置定义时的页面结构签名（见 shape()）；变了就要整页重绘。 */
+	private renderedShape: string | null = null;
+	/** 用户正在设置页的输入框里输入时推迟的整页重绘：焦点离开输入框后补上。 */
+	private rebuildDeferred = false;
+	private stateChangeScheduled = false;
+
 	constructor(
 		app: App,
 		private plugin: PrivateSyncPlugin,
@@ -142,10 +151,126 @@ export class SyncSettingTab extends PluginSettingTab {
 		this.update();
 	}
 
+	/**
+	 * 插件状态变了（同步轮次、连接 / 改连、接入完成、锁定 / 解锁、凭据被拒…）：让打开着的设置页立刻反映。
+	 *
+	 * 以前只有少数弹窗的成功回调会刷新设置页，「粘贴连接链接 → 兑换 → 接入向导」这条路径一次都没刷新：
+	 * 连接早已成功，设置页还显示「尚未连接」，离开再进来才变（iPhone 真机验收反馈）。
+	 * 现在 plugin.updateStatus 每次都调用这里——状态变化只有这一个出口，新加的流程不会再漏。
+	 *
+	 * - 页面结构没变：只就地重绘状态卡，不碰其他控件（正在输入也不受影响）；
+	 * - 结构变了（未连接 ↔ 已连接、接入完成、加密状态变化…）：整页重绘；但用户正在设置页的输入框里
+	 *   输入时推迟到焦点离开——整页重绘会销毁那个输入框，打断软键盘与中文输入法。
+	 * 合并到下一个事件循环再做：同一操作里的连续状态变化只重绘一次，也让调用方先把字段写完。
+	 */
+	stateChanged(): void {
+		if (this.stateChangeScheduled) return;
+		this.stateChangeScheduled = true;
+		window.setTimeout(() => {
+			this.stateChangeScheduled = false;
+			this.applyStateChange();
+		}, 0);
+	}
+
+	private applyStateChange(): void {
+		if (this.shape() !== this.renderedShape) {
+			if (this.editingInSettings()) {
+				this.deferRebuild();
+				return;
+			}
+			// 重新取定义；Obsidian 只在本页正显示时重绘当前页（含「高级」子页面），并保留滚动位置
+			this.update();
+			return;
+		}
+		this.refreshStatusCard();
+	}
+
+	/**
+	 * 决定页面结构的那些状态：哪些设置项可见、各 render 项显示什么。
+	 * 只是同步时间、冲突数、同步中这类变化不改结构，状态卡就地重绘就够了。
+	 */
+	private shape(): string {
+		const p = this.plugin;
+		return JSON.stringify([
+			p.configured,
+			p.bootstrapReady,
+			p.e2eeStatusText().action,
+			p.keyPolicyText(),
+			p.trustMigrationPending(),
+			p.hasTrustedDevice(),
+			p.metaMigrationActive(),
+			p.replaceJobNeedsAttention(),
+		]);
+	}
+
+	/** 焦点是否在设置窗口（含「高级」子页面）的可编辑控件里；向导、解锁窗口里的输入不受设置页重绘影响。 */
+	private editingInSettings(): boolean {
+		const el = this.containerEl.ownerDocument?.activeElement as HTMLElement | null | undefined;
+		if (!el) return false;
+		const tag = el.tagName;
+		const editable = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable === true;
+		if (!editable) return false;
+		if (this.containerEl.contains(el) || el.closest?.(".mod-settings") != null) return true;
+		// 子页面（「高级」）不一定挂在本标签页的容器里：同一个设置窗口里的输入框都算
+		const settingsWindow = this.containerEl.closest?.(".modal");
+		return settingsWindow != null && settingsWindow.contains(el);
+	}
+
+	private deferRebuild(): void {
+		if (this.rebuildDeferred) return;
+		this.rebuildDeferred = true;
+		const doc = this.containerEl.ownerDocument;
+		const onFocusOut = (): void => {
+			// focusout 时新焦点还没落定：下一轮再看；移到了另一个输入框就继续等
+			window.setTimeout(() => {
+				if (!this.rebuildDeferred || this.editingInSettings()) return;
+				doc.removeEventListener("focusout", onFocusOut, true);
+				this.rebuildDeferred = false;
+				this.stateChanged();
+			}, 0);
+		};
+		doc.addEventListener("focusout", onFocusOut, true);
+	}
+
+	/** 就地重绘状态卡；设置页没显示（或在子页面）时它不在文档里，下次渲染自然是新的。 */
+	private refreshStatusCard(): void {
+		const card = this.statusCard;
+		if (!card || !card.settingEl.isConnected) return;
+		card.clear(); // 清掉按钮；说明由 setDesc 整体替换
+		this.renderStatusCard(card);
+	}
+
+	private renderStatusCard(setting: Setting): void {
+		const plugin = this.plugin;
+		this.statusCard = setting;
+		const summary = summarizeStatus(plugin.statusInput());
+		setting.setDesc(
+			createFragment((frag) => {
+				for (const line of summary.lines) {
+					const row = frag.createDiv({ cls: `litesync-status-line is-${line.tone}` });
+					row.createSpan({ cls: "litesync-status-label", text: `${line.label}：` });
+					row.createSpan({ text: line.value });
+				}
+			}),
+		);
+		for (const s of summary.secondary) {
+			setting.addButton((btn) => btn.setButtonText(s.label).onClick(() => plugin.runSecondaryAction(s.kind)));
+		}
+		setting.addButton((btn) =>
+			btn
+				.setButtonText(summary.primary.label)
+				.setCta()
+				.setDisabled(summary.primary.label === "同步中…")
+				.onClick(() => plugin.runPrimaryAction(summary.primary.kind)),
+		);
+	}
+
 	getSettingDefinitions(): SettingDefinitionItem[] {
 		const plugin = this.plugin;
 		const configured = (): boolean => plugin.configured;
 		const ready = (): boolean => plugin.configured && plugin.bootstrapReady;
+		// 这份定义（与随后的渲染）对应的结构；状态变化时与它比较，决定整页重绘还是只重绘状态卡
+		this.renderedShape = this.shape();
 		return [
 			// ── 首屏状态卡（UI 规格 D06）：已连接仓库 / 设备授权 / 仓库解锁 / 最近同步 / 冲突 + 唯一主按钮 ──
 			{
@@ -155,30 +280,7 @@ export class SyncSettingTab extends PluginSettingTab {
 					{
 						name: "LiteSync",
 						aliases: ["状态", "status", "连接", "解锁", "同步"],
-						render: (setting) => {
-							const summary = summarizeStatus(plugin.statusInput());
-							setting.setDesc(
-								createFragment((frag) => {
-									for (const line of summary.lines) {
-										const row = frag.createDiv({ cls: `litesync-status-line is-${line.tone}` });
-										row.createSpan({ cls: "litesync-status-label", text: `${line.label}：` });
-										row.createSpan({ text: line.value });
-									}
-								}),
-							);
-							for (const s of summary.secondary) {
-								setting.addButton((btn) =>
-									btn.setButtonText(s.label).onClick(() => plugin.runSecondaryAction(s.kind)),
-								);
-							}
-							setting.addButton((btn) =>
-								btn
-									.setButtonText(summary.primary.label)
-									.setCta()
-									.setDisabled(summary.primary.label === "同步中…")
-									.onClick(() => plugin.runPrimaryAction(summary.primary.kind)),
-							);
-						},
+						render: (setting) => this.renderStatusCard(setting),
 					},
 				],
 			},

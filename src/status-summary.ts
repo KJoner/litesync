@@ -85,15 +85,21 @@ export function summarizeStatus(s: StatusInput): StatusSummary {
 		tone: !s.configured ? "muted" : s.credentialRejected ? "error" : "ok",
 	});
 
+	// 刚连接、还没完成接入时本设备还没取到这个仓库的密钥文档：看不出它加没加密，如实说「接入时确认」。
+	// 以前这里显示「未启用端到端加密（服务器可读取内容）」——对一个加密仓库是错的，也会吓到人（iPhone 真机验收）
+	const e2eeUnknown = !s.bootstrapReady && s.e2ee === "disabled";
 	lines.push({
 		label: "仓库解锁",
-		value:
-			s.e2ee === "disabled"
+		value: e2eeUnknown
+			? s.configured
+				? "完成接入时确认（加密仓库需要输入仓库密码）"
+				: "连接仓库后显示"
+			: s.e2ee === "disabled"
 				? "未启用端到端加密（服务器可读取内容）"
 				: s.e2ee === "locked"
 					? "已锁定 · 同步暂停，待同步的修改保留在本机"
 					: "已解锁",
-		tone: s.e2ee === "unlocked" ? "ok" : "warn",
+		tone: e2eeUnknown ? "muted" : s.e2ee === "unlocked" ? "ok" : "warn",
 	});
 
 	lines.push({ label: "密钥保存", value: s.keyPolicyText, tone: s.migrationPending ? "warn" : "muted" });

@@ -188,7 +188,7 @@ src/
 
 ## 7. 测试组织
 
-`tests/` 目录自动发现，当前 450 条（0.20.1 复审修复 + Windows 真机验收回归 + IDENTITY_UNAVAILABLE 后；0.20.0 时 361）。分类：
+`tests/` 目录自动发现，当前 458 条（0.20.1 复审修复 + Windows 真机验收回归 + IDENTITY_UNAVAILABLE + iPhone 验收的设置页刷新后；0.20.0 时 361）。分类：
 
 - `unit` / `merge` / `smart-merge` / `crypto` / `store` / `device-trust`：基础单元；
 - `crashpoint.test.ts`：**崩溃点注入**（`utils/failpoint.ts` 在关键步骤间强制中断）；
@@ -197,6 +197,9 @@ src/
 - `padding.test.ts` / `timing.test.ts`：隐私增强的成本与承诺；
 - `v6 / v121 / v131 / v132 / rc3-regressions`：按版本归档的回归；
 - `strict-unlock` / `pairing-v2` / `replace-remote` / `settings-layout`：0.20 公开化（严格解锁迁移、连接链接 v2、高级恢复作业、设置页结构）。
+- `settings-refresh`：设置页跟随插件状态刷新（iPhone 真机验收）。`plugin.updateStatus` 是状态变化的唯一出口，每次都调
+  `SyncSettingTab.stateChanged()`：结构没变只就地重绘状态卡，结构变了（未连接 ↔ 已连接、接入完成、加密状态）整页重绘，
+  用户正在设置窗口的输入框里输入时推迟到焦点离开。**新加的流程不要再自己调 refreshSettingsTab 补刷新**——走 updateStatus。
 - `key-session` / `inherited-trust` / `replace-remote-safety` / `review-reproductions` / `restore-meta`：0.20.1 复审修复（PL-01 密钥会话代次、
   PL-06 继承锚核验、PL-02～05 完整替换的许可 / 前置条件 / 子状态机、审查 7 条反例改写为正确行为断言、
   路径加密下显式恢复后的元数据世代与之后的改名 CAS）。

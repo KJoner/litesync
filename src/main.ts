@@ -1294,6 +1294,9 @@ export default class PrivateSyncPlugin extends Plugin {
 
 	private updateStatus(status: SyncStatus, detail?: string): void {
 		if (status === "synced" || status === "conflict") this.lastSyncAt = Date.now();
+		// 打开着的设置页跟着变（状态卡就地重绘；连接、接入完成这类结构变化整页重绘）。
+		// 所有状态变化都经过这里：连接链接兑换、接入向导完成、锁定 / 解锁、凭据被拒、每轮同步
+		this.settingTab?.stateChanged();
 		if (!this.statusEl) return;
 		this.lastStatus = status;
 		const texts: Record<SyncStatus, string> = {
@@ -1354,7 +1357,9 @@ export default class PrivateSyncPlugin extends Plugin {
 
 	/** 记住当前仓库名（设置页查询到后调用；只在内存里）。 */
 	rememberVaultName(name: string): void {
+		if (this.currentVaultName === name) return;
 		this.currentVaultName = name;
+		this.settingTab?.stateChanged(); // 状态卡补上仓库名
 	}
 
 	runPrimaryAction(kind: PrimaryActionKind): void {
@@ -1395,6 +1400,10 @@ export default class PrivateSyncPlugin extends Plugin {
 
 	/** 设置页的 E2EE 状态与按钮文案。 */
 	e2eeStatusText(): { desc: string; action: string } {
+		// 刚连接、还没完成接入：本设备还没取到这个仓库的密钥文档，看不出它加没加密（接入向导会处理）
+		if (!this.keyring.enabled && !this.bootstrapReady) {
+			return { desc: "完成接入时确认这个仓库是否端到端加密（加密仓库需要输入仓库密码）", action: "完成接入…" };
+		}
 		if (!this.keyring.enabled) {
 			return { desc: "未启用：服务器保存明文（仅 HTTPS 传输加密）", action: "启用端到端加密…" };
 		}
@@ -1405,6 +1414,11 @@ export default class PrivateSyncPlugin extends Plugin {
 	}
 
 	async e2eeAction(): Promise<void> {
+		if (!this.keyring.enabled && !this.bootstrapReady) {
+			// 与 e2eeStatusText 一致：没完成接入前不提供「启用端到端加密」（那会被同步许可挡下），交给接入向导
+			this.openBootstrapWizard();
+			return;
+		}
 		if (!this.keyring.enabled) {
 			this.openEnableModal();
 			return;
