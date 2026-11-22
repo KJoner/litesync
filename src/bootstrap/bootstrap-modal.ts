@@ -13,7 +13,7 @@ import {
 	PreflightResult,
 } from "./bootstrap-manager";
 import { ReplaceRemoteModal } from "./replace-remote-modal";
-import { classifyBootstrap, linkedVaultToSkip, vaultPickerVisible } from "./bootstrap-types";
+import { classifyBootstrap, emptyRemoteInit, linkedVaultToSkip, vaultPickerVisible } from "./bootstrap-types";
 
 export interface BootstrapWizardHooks {
 	/**
@@ -249,6 +249,61 @@ export class BootstrapWizardModal extends Modal {
 
 	onClose(): void {
 		this.hooks.onClosed();
+	}
+
+	/**
+	 * 已加密的空远端（预发布实测缺陷，2026-11-22）：用本设备刚解锁的现有密钥接入，不调用 enableE2ee*、不要求新密码。
+	 * 本地也空 → 完成接入，不上传任何东西；本地有文件 → 完成接入后由普通同步以 LSE3 密文上传，作为远端的初始内容。
+	 * 和「设置仓库密码」那条路一样，完成接入前重跑 preflight：completeBootstrap 写进正式 binding 的 keyEpoch
+	 * 必须是解锁之后服务器给的值（用旧值会产出 AAD 错绑的密文）。
+	 */
+	private renderJoinEncryptedEmpty(
+		contentEl: HTMLElement,
+		pre: PreflightResult,
+		init: "join-encrypted" | "blocked",
+		run: (btn: HTMLButtonElement, label: string, fn: () => Promise<void>) => Promise<void>,
+	): void {
+		const footer = (): HTMLElement => contentEl.createDiv({ cls: "litesync-resolver-footer" });
+		if (init === "blocked") {
+			contentEl.createEl("p", {
+				text:
+					"远端仓库的加密状态不完整：服务器报告的加密状态与密钥文档对不上（可能另一台设备启用加密时中断了）。" +
+					"为了不写入无法解密的内容，接入已停止，本地和服务器上都没有做任何改动。" +
+					"请在启用加密的那台设备上完成操作，或请服务器管理员检查后再打开接入向导。",
+			});
+			footer().createEl("button", { text: "稍后再说" }).onclick = () => this.close();
+			return;
+		}
+		const n = pre.localPaths.length;
+		contentEl.createEl("p", {
+			text:
+				n === 0
+					? "远端是一个已加密的空仓库，本地也没有文件。已经用仓库密码解锁，可以直接完成接入；之后新建的笔记都以密文同步。"
+					: `远端是一个已加密的空仓库。已经用仓库密码解锁：完成接入后，本设备的 ${n} 个文件将用这个仓库现有的密钥加密上传，作为远端的初始内容。`,
+		});
+		contentEl.createEl("p", {
+			cls: "litesync-history-meta",
+			text: "不需要再设置新密码：这个仓库的密码就是刚才解锁用的那一个。",
+		});
+		const f = footer();
+		const label = n === 0 ? "完成接入" : "上传本机文件（加密）";
+		const btn = f.createEl("button", { text: label, cls: "mod-cta" });
+		btn.onclick = () =>
+			void run(btn, label, async () => {
+				const fresh = await preflight(this.ctx);
+				const still = emptyRemoteInit({
+					keyDocEnabled: fresh.e2eeEnabled,
+					encryptionState: fresh.info.encryptionState,
+					unlocked: this.ctx.e2ee.unlocked,
+					keyEpoch: fresh.info.keyEpoch,
+				});
+				if (fresh.remoteFiles.length > 0 || still !== "join-encrypted") {
+					throw new Error("远端在这期间有了变化（已有文件，或加密状态不同），没有做任何改动；请点「稍后再说」后重新打开接入向导");
+				}
+				await bootstrapLocalInit(this.ctx, fresh);
+				new Notice(n === 0 ? "已接入这个加密仓库 ✓" : `已接入，正在以密文上传 ${n} 个文件 ✓`);
+			});
+		f.createEl("button", { text: "稍后再说" }).onclick = () => this.close();
 	}
 
 	private renderE2eeNote(contentEl: HTMLElement): void {
@@ -493,6 +548,21 @@ export class BootstrapWizardModal extends Modal {
 		const onProgress = (p: { done: number; total: number; current: string }): void => {
 			progressEl.setText(`处理中 ${p.done}/${p.total}：${p.current}`);
 		};
+
+		// 远端空仓库已经加密（网页「新建仓库 → 创建并加密」，或另一台设备先启用过）：本设备刚用这个仓库的密码解锁，
+		// 直接用现有密钥接入——不能再走「设置仓库密码」（enableE2eeOnEmptyRemote 的前置检查必然拒绝，预发布实测的死路）
+		if (scenario === "both-empty" || scenario === "local-only") {
+			const init = emptyRemoteInit({
+				keyDocEnabled: pre.e2eeEnabled,
+				encryptionState: pre.info.encryptionState,
+				unlocked: this.ctx.e2ee.unlocked,
+				keyEpoch: pre.info.keyEpoch,
+			});
+			if (init !== "set-password") {
+				this.renderJoinEncryptedEmpty(contentEl, pre, init, run);
+				return;
+			}
+		}
 
 		switch (scenario) {
 			case "both-empty": {

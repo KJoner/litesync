@@ -116,3 +116,33 @@ export function linkedVaultToSkip<V extends { id: string; current?: boolean }>(
 	if (!linkVaultId || vaultChoice !== linkVaultId) return null;
 	return vaults.find((v) => v.current === true && v.id === linkVaultId) ?? null;
 }
+
+/** 远端空仓库（0 个文件）的初始化方式，见 {@link emptyRemoteInit}。 */
+export type EmptyRemoteInit = "set-password" | "join-encrypted" | "blocked";
+
+/**
+ * 远端空仓库（0 个文件）怎么初始化（预发布实测缺陷，2026-11-22）。
+ *
+ * - 远端还是明文（未初始化）→ `set-password`：设置仓库密码（enableE2eeOnEmptyRemote），首次上传即密文——
+ *   0.19.x 起新仓库强制 E2EE，这条不变。
+ * - 远端已经加密（网页「新建仓库 → 创建并加密」，或另一台设备先启用过），本设备已用这个仓库的密码解锁、
+ *   服务器给出合法的 keyEpoch → `join-encrypted`：用现有密钥接入，**不再设新密码**；本地有文件时由接入后的
+ *   普通同步以 LSE3 密文（服务器当前的 keyEpoch）上传。
+ * - 其余（加密状态与密钥文档对不上：有文档但 keyEpoch 为 0、服务器说已加密却没有启用的密钥文档；或尚未解锁）
+ *   → `blocked`：停下说明，不写任何东西。
+ *
+ * 以前已加密的空远端也只给「设置仓库密码」，必然撞上 enableE2eeOnEmptyRemote 的前置检查（远端必须未初始化）：
+ * 用户解锁之后还被要求再设一个新密码，提交后报错，向导走不下去。
+ */
+export function emptyRemoteInit(s: {
+	/** 服务器上有已启用的密钥文档（preflight 的 e2eeEnabled） */
+	keyDocEnabled: boolean;
+	/** /info 的 encryptionState（缺省按 plaintext） */
+	encryptionState?: string;
+	unlocked: boolean;
+	keyEpoch?: number;
+}): EmptyRemoteInit {
+	const encrypted = s.keyDocEnabled || (s.encryptionState ?? "plaintext") !== "plaintext";
+	if (!encrypted) return "set-password";
+	return s.keyDocEnabled && s.unlocked && (s.keyEpoch ?? 0) > 0 ? "join-encrypted" : "blocked";
+}
