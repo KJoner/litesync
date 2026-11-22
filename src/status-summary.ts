@@ -30,6 +30,15 @@ export interface StatusInput {
 	 * 只是告知——不改主按钮、不进「重新连接」；null / 未提供 = 没有
 	 */
 	retryNotice?: string | null;
+	/**
+	 * 最近一轮同步没有完成的原因（引擎报 offline 时附带的说明；凭据被拒与账号中心暂不可用另有专门的行）。
+	 * null / 未提供 = 没有（UI 焕新 U5b，P04）
+	 */
+	syncIssue?: string | null;
+	/** 自动同步开关（false = 只在手动「立即同步」时同步）；未提供按开启处理 */
+	autoSync?: boolean;
+	/** 本设备有未完成、需要处理的「用本地完整替换远端」作业 */
+	recoveryPending?: boolean;
 }
 
 export interface StatusLine {
@@ -149,15 +158,29 @@ export function summarizeStatus(s: StatusInput): StatusSummary {
 
 	lines.push({ label: "密钥保存", value: s.keyPolicyText, tone: s.migrationPending ? "warn" : "muted" });
 
+	const lastOk = s.lastSyncAt > 0 ? `（上次成功：${relativeTime(s.lastSyncAt, s.now)}）` : "";
 	lines.push({
 		label: "最近同步",
 		value: s.retryNotice
-			? s.retryNotice + (s.lastSyncAt > 0 ? `（上次成功：${relativeTime(s.lastSyncAt, s.now)}）` : "")
-			: s.lastSyncAt > 0
-				? relativeTime(s.lastSyncAt, s.now)
-				: "本次运行尚未同步",
-		tone: s.retryNotice ? "warn" : "muted",
+			? s.retryNotice + lastOk
+			: s.syncIssue
+				? `未完成：${s.syncIssue}${lastOk}`
+				: s.lastSyncAt > 0
+					? relativeTime(s.lastSyncAt, s.now)
+					: "本次运行尚未同步",
+		tone: s.retryNotice || s.syncIssue ? "warn" : "muted",
 	});
+	// 自动同步关了要说出来：否则「最近同步：2 小时前」看起来像是坏了
+	if (s.autoSync === false) {
+		lines.push({ label: "自动同步", value: "已关闭，只在手动「立即同步」时同步", tone: "muted" });
+	}
+	if (s.recoveryPending) {
+		lines.push({
+			label: "待恢复",
+			value: "有一个未完成的「用本地完整替换远端」作业：在「高级与诊断 › 高级恢复」里继续、放弃或回滚",
+			tone: "warn",
+		});
+	}
 
 	lines.push({
 		label: "冲突",

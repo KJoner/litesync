@@ -7,6 +7,8 @@
 //   锁定的提示如实说明：只暂停本设备的同步与解密，本机笔记仍可阅读
 //   「忘记此设备」改名「清除自动解锁材料并锁定」（它不撤销授权、不断开仓库），旧名留作设置搜索别名；
 //     「添加新设备」改名「连接新设备」，旧名同样可搜
+//   状态卡（P04）：最近一轮同步没完成时如实写原因（凭据被拒、账号中心暂不可用另有专门的行）；
+//     自动同步关闭、待处理的替换作业各有一行；没有这些情况时不多出行
 //   设置首页 = 概览 + 任务子页（P01）：入口上的当前值与提醒按真实状态（需要重新连接、冲突、已锁定）；
 //     安全相关的显式选择（本设备自动解锁、完整替换远端的执行开关）仍只在「高级与诊断」里，别处只有去向说明
 //   连接链接已指定并核对过仓库时跳过选库页（P02）：链接的仓库 = 当前选择 = 服务器的当前仓库，三者一致才跳过
@@ -27,7 +29,7 @@ import { Modal } from "obsidian";
 import { ResolverModal } from "../src/conflict-ui/conflict-view";
 import { linkedVaultToSkip } from "../src/bootstrap/bootstrap-types";
 import { SyncSettingTab, syncSummary } from "../src/settings";
-import { StatusBarInput, statusBarLabel } from "../src/status-summary";
+import { StatusBarInput, statusBarLabel, StatusInput, summarizeStatus } from "../src/status-summary";
 
 const bar = (over: Partial<StatusBarInput>) =>
 	statusBarLabel({ status: "idle", conflicts: 0, credentialRejected: false, online: true, ...over });
@@ -249,4 +251,37 @@ test("跳过选库页：只在链接的仓库 = 当前选择 = 服务器的当�
 	assert.equal(linkedVaultToSkip(vaults, "v-b", ""), null, "当前选择不是链接的仓库：照常显示");
 	assert.equal(linkedVaultToSkip(vaults, "v-a", "v-a"), null, "服务器的当前仓库不是它：照常显示");
 	assert.equal(linkedVaultToSkip([], "v-b", "v-b"), null, "列表里没有：照常显示");
+});
+
+// ---------- 状态卡（P04） ----------
+
+test("状态卡：最近一轮没完成时如实说原因；自动同步关闭、待处理的替换作业各有一行", () => {
+	const base: StatusInput = {
+		configured: true,
+		bootstrapReady: true,
+		credentialRejected: false,
+		e2ee: "unlocked",
+		vaultName: "笔记",
+		lastSyncAt: 0,
+		conflicts: 0,
+		migrationPending: false,
+		keyPolicyText: "严格会话解锁",
+		syncing: false,
+		now: 1_000_000,
+	};
+	assert.deepEqual(
+		summarizeStatus(base).lines.map((l) => l.label),
+		["仓库", "设备授权", "仓库解锁", "密钥保存", "最近同步", "冲突"],
+		"没有这些情况时不多出行",
+	);
+	const issue = summarizeStatus({ ...base, syncIssue: "检测到仓库状态异常，已停止自动同步", lastSyncAt: 1_000_000 - 120_000 });
+	const last = issue.lines.find((l) => l.label === "最近同步")!;
+	assert.match(last.value, /^未完成：检测到仓库状态异常/);
+	assert.match(last.value, /上次成功：2 分钟前/);
+	assert.equal(last.tone, "warn");
+	const off = summarizeStatus({ ...base, autoSync: false });
+	assert.match(off.lines.find((l) => l.label === "自动同步")!.value, /只在手动「立即同步」时同步/);
+	assert.equal(summarizeStatus({ ...base, autoSync: true }).lines.some((l) => l.label === "自动同步"), false);
+	const rec = summarizeStatus({ ...base, recoveryPending: true });
+	assert.equal(rec.lines.find((l) => l.label === "待恢复")!.tone, "warn");
 });

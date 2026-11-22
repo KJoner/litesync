@@ -101,6 +101,8 @@ export default class PrivateSyncPlugin extends Plugin {
 	private foregroundTimer: number | null = null;
 	private intervalId: number | null = null;
 	private lastStatus: SyncStatus = "idle";
+	/** 引擎随最近一次状态附带的说明（offline 时是暂停原因；状态卡「最近同步」据此如实说明） */
+	private lastStatusDetail: string | undefined;
 	/** 本次运行最近一次成功同步的时刻（设置页状态卡；不落盘，避免每轮同步写 data.json） */
 	private lastSyncAt = 0;
 	/** 最近一次查询到的当前仓库名（状态卡；null = 尚未查询） */
@@ -334,7 +336,7 @@ export default class PrivateSyncPlugin extends Plugin {
 				if (this.settings.debug) console.debug(`[litesync] ${msg}`);
 			},
 			notify: (msg, durationMs) => new Notice(msg, durationMs ?? 8000),
-			onConflictsChanged: () => this.updateStatus(this.lastStatus),
+			onConflictsChanged: () => this.updateStatus(this.lastStatus, this.lastStatusDetail),
 			e2ee: this.keyring,
 			credentials: () => ({
 				serverUrl: this.settings.serverUrl,
@@ -1296,11 +1298,13 @@ export default class PrivateSyncPlugin extends Plugin {
 
 	private updateStatus(status: SyncStatus, detail?: string): void {
 		if (status === "synced" || status === "conflict") this.lastSyncAt = Date.now();
+		// 先记下状态与说明：stateChanged 在下一个事件循环里重绘状态卡时读到的是这一次的
+		this.lastStatus = status;
+		this.lastStatusDetail = detail;
 		// 打开着的设置页跟着变（状态卡就地重绘；连接、接入完成这类结构变化整页重绘）。
 		// 所有状态变化都经过这里：连接链接兑换、接入向导完成、锁定 / 解锁、凭据被拒、每轮同步
 		this.settingTab?.stateChanged();
 		if (!this.statusEl) return;
-		this.lastStatus = status;
 		// 有未解决冲突时优先显示计数，点击状态栏打开冲突列表（文字与状态卡同一套词，UI 焕新 U5b）
 		const pending = this.store?.conflictPaths().length ?? 0;
 		const { text, tip } = statusBarLabel({
@@ -1348,6 +1352,17 @@ export default class PrivateSyncPlugin extends Plugin {
 				const err = this.manager?.lastSyncError;
 				return err instanceof ApiError && err.is("IDENTITY_UNAVAILABLE") ? IDENTITY_UNAVAILABLE_TEXT : null;
 			})(),
+			// 最近一轮没有完成的原因（P04）：凭据被拒、账号中心暂不可用各有专门的行，这里不重复
+			syncIssue: (() => {
+				if (this.lastStatus !== "offline") return null;
+				if (this.gate.sessionBlock()?.reason === "credential-rejected") return null;
+				const err = this.manager?.lastSyncError;
+				if (err instanceof ApiError && err.is("IDENTITY_UNAVAILABLE")) return null;
+				if (typeof navigator !== "undefined" && navigator.onLine === false) return "没有网络连接，恢复后自动重试";
+				return this.lastStatusDetail ?? "同步暂停";
+			})(),
+			autoSync: this.settings.autoSync,
+			recoveryPending: this.replaceJobNeedsAttention(),
 			now: Date.now(),
 		};
 	}

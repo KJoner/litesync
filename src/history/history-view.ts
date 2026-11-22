@@ -56,12 +56,17 @@ export class HistoryModal extends Modal {
 		}
 
 		const current = this.ctx.store.get(this.path);
-		const list = this.contentEl.createDiv({ cls: "litesync-history-list" });
+		// 先说清「恢复」做什么（UI 焕新 U5b，UX-08 历史部分）：不删任何版本，旧内容作为一个新版本保存
+		this.contentEl.createDiv({
+			cls: "litesync-history-meta",
+			text: "恢复不会删除任何版本：选中的旧内容会作为一个新版本保存，当前内容仍留在历史里，可以再恢复回来。",
+		});
+		const list = this.contentEl.createDiv({ cls: "litesync-history-list", attr: { role: "list" } });
 		for (const v of versions) {
-			const row = list.createDiv({ cls: "litesync-history-row" });
+			const row = list.createDiv({ cls: "litesync-history-row", attr: { role: "listitem" } });
 			const info = row.createDiv({ cls: "litesync-history-info" });
 			const title = info.createDiv();
-			title.createSpan({ cls: "litesync-rev", text: `Revision ${v.revision}` });
+			title.createSpan({ cls: "litesync-rev", text: `版本 ${v.revision}` });
 			title.createSpan({
 				cls: `litesync-badge litesync-badge-${v.action}`,
 				text: ACTION_LABEL[v.action] ?? v.action,
@@ -73,15 +78,24 @@ export class HistoryModal extends Modal {
 				cls: "litesync-history-meta",
 				text:
 					`${formatTime(v.createdAt)}` +
-					(v.deviceId ? ` · ${v.deviceId.slice(0, 12)}` : "") +
+					(v.deviceId ? ` · 设备 ${v.deviceId.slice(0, 12)}` : "") +
 					(v.action !== "delete" ? ` · ${formatSize(v.size)}` : ""),
 			});
 
 			if (v.action !== "delete") {
 				const btns = row.createDiv({ cls: "litesync-history-actions" });
-				btns.createEl("button", { text: "对比" }).onclick = () => void this.compare(v);
-				btns.createEl("button", { text: "恢复" }).onclick = () => void this.restore(v);
-				btns.createEl("button", { text: "另存副本" }).onclick = () => void this.saveCopy(v);
+				// 读屏听到的是完整动作（「恢复到版本 3」），不是一排看不出对象的「恢复」
+				btns.createEl("button", { text: "对比", attr: { "aria-label": `对比版本 ${v.revision} 与当前内容` } }).onclick = () =>
+					void this.compare(v);
+				btns.createEl("button", {
+					text: "恢复",
+					attr: {
+						"aria-label": `恢复到版本 ${v.revision}`,
+						title: "把这个版本的内容作为一个新版本保存；当前内容仍留在历史里",
+					},
+				}).onclick = () => void this.restore(v);
+				btns.createEl("button", { text: "另存副本", attr: { "aria-label": `把版本 ${v.revision} 另存为一个新文件` } }).onclick = () =>
+					void this.saveCopy(v);
 			}
 		}
 	}
@@ -142,7 +156,7 @@ export class HistoryModal extends Modal {
 			const curHash = cur ? await sha256Hex(await adapter.readBinary(this.path)) : null;
 			if (!(await writeIfLocalUnchanged(this.ctx, this.path, dl.plain, curHash, dl.mtime))) {
 				const copy = await this.writeSideCopy(dl.plain, v.revision);
-				new Notice(`本地文件在恢复期间被修改，已把 Revision ${v.revision} 另存为 ${copy}`);
+				new Notice(`本地文件在恢复期间被修改，已把版本 ${v.revision} 另存为 ${copy}`);
 				this.close();
 				return;
 			}
@@ -161,7 +175,7 @@ export class HistoryModal extends Modal {
 				serverPseudonym: out.serverPseudonym,
 			});
 			await this.ctx.store.save();
-			new Notice(`已恢复 Revision ${v.revision} → 新版本 Revision ${out.revision}`);
+			new Notice(`已恢复到版本 ${v.revision}（保存为新版本 ${out.revision}）`);
 			this.close();
 		} catch (e) {
 			if (e instanceof ConflictError) {
@@ -219,7 +233,7 @@ class DiffModal extends Modal {
 	}
 
 	onOpen(): void {
-		this.titleEl.setText(`Revision ${this.revision} vs 当前 — ${this.path}`);
+		this.titleEl.setText(`版本 ${this.revision} 与当前内容对比 — ${this.path}`);
 		this.contentEl.addClass("litesync-diff");
 		let lines;
 		try {
@@ -228,6 +242,11 @@ class DiffModal extends Modal {
 			this.contentEl.setText("文件差异过大，无法对比");
 			return;
 		}
+		// 图例：「- / +」各指哪一边（以前要靠猜）
+		this.contentEl.createDiv({
+			cls: "litesync-history-meta",
+			text: `「- 」开头的行只在版本 ${this.revision} 里，「+ 」开头的行只在当前内容里。`,
+		});
 		const box = this.contentEl.createEl("pre", { cls: "litesync-diff-box" });
 		let same = 0;
 		for (const line of lines) {
