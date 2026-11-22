@@ -64,7 +64,7 @@ import {
 	TrustMigrationDeps,
 } from "./crypto/trust-migration";
 import { TrustMigrationModal } from "./crypto/trust-migration-modal";
-import { PrimaryActionKind, SecondaryActionKind, StatusInput } from "./status-summary";
+import { PrimaryActionKind, SecondaryActionKind, StatusInput, statusBarLabel } from "./status-summary";
 
 /** vault key 的密钥材料是否发生变化（换库 / 轮换；影响绑定指纹）。 */
 function vaultKeyMaterialChanged(before: VaultKeyDoc | null, after: VaultKeyDoc | null): boolean {
@@ -149,7 +149,7 @@ export default class PrivateSyncPlugin extends Plugin {
 		});
 		this.addCommand({
 			id: "unlock-e2ee",
-			name: "解锁端到端加密 (Unlock E2EE)",
+			name: "解锁仓库 (Unlock E2EE)",
 			callback: () => this.openUnlockModal(),
 		});
 		this.addCommand({
@@ -766,7 +766,7 @@ export default class PrivateSyncPlugin extends Plugin {
 			return;
 		}
 		if (!this.keyring.unlocked) {
-			new Notice("请先解锁端到端加密（Unlock E2EE）");
+			new Notice("请先解锁仓库（命令「解锁仓库」）");
 			return;
 		}
 		if (this.store?.state.bootstrap.metaState === "encrypted") {
@@ -1299,22 +1299,17 @@ export default class PrivateSyncPlugin extends Plugin {
 		this.settingTab?.stateChanged();
 		if (!this.statusEl) return;
 		this.lastStatus = status;
-		const texts: Record<SyncStatus, string> = {
-			idle: "LiteSync",
-			syncing: "↻ Syncing",
-			synced: "✓ Synced",
-			conflict: "! Conflict",
-			offline: "× Offline",
-			locked: "🔒 Locked",
-		};
-		let text = texts[status];
-		// 有未解决冲突时优先显示计数，点击状态栏打开冲突列表
+		// 有未解决冲突时优先显示计数，点击状态栏打开冲突列表（文字与状态卡同一套词，UI 焕新 U5b）
 		const pending = this.store?.conflictPaths().length ?? 0;
-		if (pending > 0 && status !== "syncing" && status !== "locked") {
-			text = `! ${pending} Conflict${pending > 1 ? "s" : ""}`;
-		}
+		const { text, tip } = statusBarLabel({
+			status,
+			conflicts: pending,
+			credentialRejected: this.gate.sessionBlock()?.reason === "credential-rejected",
+			online: typeof navigator === "undefined" || navigator.onLine !== false,
+			detail,
+		});
 		this.statusEl.setText(text);
-		this.statusEl.setAttribute("aria-label", detail ?? text);
+		this.statusEl.setAttribute("aria-label", tip);
 		const clickable = pending > 0 || status === "locked";
 		this.statusEl.toggleClass("litesync-status-clickable", clickable);
 		this.statusEl.onclick = !clickable
@@ -1411,7 +1406,7 @@ export default class PrivateSyncPlugin extends Plugin {
 		if (this.keyring.needsUnlock) {
 			return { desc: "已启用 · 🔒 已锁定（同步暂停，待同步的修改保留在本机）", action: "解锁…" };
 		}
-		return { desc: "已启用 · 🔓 已解锁（本次运行有效）", action: "锁定" };
+		return { desc: "已启用 · 🔓 已解锁（本次运行有效）。锁定只暂停本设备的同步与解密，本机笔记仍可阅读", action: "锁定" };
 	}
 
 	async e2eeAction(): Promise<void> {
@@ -1430,7 +1425,7 @@ export default class PrivateSyncPlugin extends Plugin {
 		}
 		this.keyring.lock();
 		this.updateStatus("locked");
-		new Notice("已锁定，本设备同步暂停");
+		new Notice("已锁定：本设备暂停同步与解密，本机笔记仍可阅读和编辑");
 	}
 
 	/**
@@ -1498,7 +1493,7 @@ export default class PrivateSyncPlugin extends Plugin {
 
 	// ---------- Trusted Device ----------
 
-	/** 是否存在可用的设备信任（用于设置页显示「忘记此设备」）。 */
+	/** 是否存在可用的设备信任（用于设置页显示「清除自动解锁材料并锁定」）。 */
 	hasTrustedDevice(): boolean {
 		return this.settings.trustDevice && this.settings.deviceKeyB64 !== "";
 	}
@@ -1539,7 +1534,7 @@ export default class PrivateSyncPlugin extends Plugin {
 		return true;
 	}
 
-	/** 忘记此设备：删除设备信任并立即锁定（旧材料未证明可恢复时转交迁移向导）。 */
+	/** 清除自动解锁材料并锁定（旧称「忘记此设备」）：删除设备信任并立即锁定（旧材料未证明可恢复时转交迁移向导）。 */
 	async forgetThisDevice(): Promise<void> {
 		if (migrationPending(this.settings)) {
 			this.openTrustMigrationModal();
@@ -1551,7 +1546,7 @@ export default class PrivateSyncPlugin extends Plugin {
 		await this.saveSettings();
 		this.keyring.lock();
 		this.updateStatus("locked");
-		new Notice("已忘记此设备并锁定；下次需要重新输入 E2EE 密码");
+		new Notice("已清除本设备的自动解锁材料并锁定；下次需要重新输入仓库密码");
 	}
 
 	async loadSettings(): Promise<void> {

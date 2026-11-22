@@ -44,6 +44,51 @@ export interface StatusSummary {
 	secondary: Array<{ kind: SecondaryActionKind; label: string }>;
 }
 
+/** 同步引擎报给状态栏的状态（与 sync-manager 的 SyncStatus 相同）。 */
+export type BarStatus = "idle" | "syncing" | "synced" | "conflict" | "offline" | "locked";
+
+export interface StatusBarInput {
+	status: BarStatus;
+	/** 未解决冲突数（有冲突时优先显示计数） */
+	conflicts: number;
+	/** 服务器拒绝了本设备凭据（被撤销 / Token 已重置） */
+	credentialRejected: boolean;
+	/** 浏览器报告的联网状态（navigator.onLine；false 才算确定离线） */
+	online: boolean;
+	/** 同步引擎附带的说明（暂停原因等）；没有就用默认说法 */
+	detail?: string;
+}
+
+/**
+ * 状态栏文字（UI 焕新 U5b，与设置页状态卡同一套词：已同步 / 冲突 / 已锁定 / 需要重新连接）。
+ *
+ * 引擎的 offline 不只表示断网：凭据被拒、协议不符、仓库状态异常、账号中心暂时不可用都走它。
+ * 状态栏只在确定离线时写「离线」，凭据被拒写「需要重新连接」，其余写「同步暂停」——原因在悬停提示里，
+ * 不用一个笼统的「离线」误导用户去查网络。只换说法，不改引擎的状态与重试。
+ */
+export function statusBarLabel(s: StatusBarInput): { text: string; tip: string } {
+	const tip = (fallback: string): string => `LiteSync：${s.detail ?? fallback}`;
+	if (s.conflicts > 0 && s.status !== "syncing" && s.status !== "locked") {
+		return { text: `! ${s.conflicts} 个冲突`, tip: `LiteSync：${s.conflicts} 个冲突待处理，点击查看` };
+	}
+	switch (s.status) {
+		case "syncing":
+			return { text: "↻ 同步中", tip: tip("正在同步") };
+		case "synced":
+			return { text: "✓ 已同步", tip: tip("已同步") };
+		case "conflict":
+			return { text: "! 有冲突", tip: tip("有冲突待处理") };
+		case "locked":
+			return { text: "🔒 已锁定", tip: "LiteSync：仓库已锁定，同步暂停；本机笔记仍可阅读和编辑。点击解锁" };
+		case "offline":
+			if (s.credentialRejected) return { text: "× 需要重新连接", tip: tip("本设备的授权已失效，请重新连接") };
+			if (!s.online) return { text: "× 离线", tip: tip("没有网络连接，恢复后自动重试") };
+			return { text: "× 同步暂停", tip: tip("同步暂停") };
+		default:
+			return { text: "LiteSync", tip: s.detail ? tip("") : "LiteSync" };
+	}
+}
+
 /** 「x 分钟前」式的相对时间（只用于展示）。 */
 export function relativeTime(at: number, now: number): string {
 	const s = Math.max(0, Math.round((now - at) / 1000));

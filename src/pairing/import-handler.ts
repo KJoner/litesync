@@ -319,7 +319,7 @@ export class PasteLinkModal extends Modal {
 		this.titleEl.setText("粘贴连接链接");
 		const { contentEl } = this;
 		contentEl.createEl("p", {
-			text: "粘贴在 LiteSync 网页「连接 Obsidian」或另一台设备「添加新设备」中得到的连接链接：",
+			text: "粘贴在 LiteSync 网页「连接 Obsidian」或另一台设备「连接新设备」中得到的连接链接：",
 		});
 		const input = contentEl.createEl("input", {
 			type: "text",

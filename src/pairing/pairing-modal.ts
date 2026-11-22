@@ -37,7 +37,7 @@ export class AddDeviceModal extends Modal {
 	}
 
 	onOpen(): void {
-		this.titleEl.setText("添加新设备");
+		this.titleEl.setText("连接新设备");
 		this.contentEl.createDiv({ text: "正在生成连接链接…", cls: "litesync-history-meta" });
 		void this.createAndRender();
 	}

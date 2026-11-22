@@ -60,7 +60,7 @@ export class DeviceListModal extends Modal {
 	private renderManage(el: HTMLElement): void {
 		const box = el.createDiv({ cls: "litesync-device-manage" });
 		new Setting(box)
-			.setName("撤销设备在网页里做")
+			.setName("撤销设备授权在网页里做")
 			.setDesc("登录 LiteSync 网页 →「账号与设备」→「已授权的设备」。被撤销的设备下一次联网就失去同步授权；它已经下载的文件不会被远程删除。")
 			.addButton((b) => {
 				b.setButtonText("在网页管理设备").setCta();

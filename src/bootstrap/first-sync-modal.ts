@@ -31,13 +31,13 @@ export class FirstSyncModal extends Modal {
 		contentEl.createEl("p", {
 			cls: "litesync-history-meta",
 			text:
-				"初始化需要先设置端到端加密（E2EE）密码——首次上传就是密文，" +
+				"初始化需要先设置仓库密码（端到端加密）——首次上传就是密文，" +
 				"服务器从头到尾见不到明文。密码丢失数据无法找回，请妥善保管。",
 		});
 
 		const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
 		footer.createEl("button", { text: "关闭" }).onclick = () => this.close();
-		footer.createEl("button", { text: "设置 E2EE 并立即同步", cls: "mod-cta" }).onclick = () => {
+		footer.createEl("button", { text: "设置仓库密码并立即同步", cls: "mod-cta" }).onclick = () => {
 			// 先关自己再开设密码弹窗（项目内 Modal 接力的通用模式）
 			this.close();
 			this.choices.withE2ee();

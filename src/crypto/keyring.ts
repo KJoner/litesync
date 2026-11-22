@@ -3,7 +3,7 @@ import { deriveMetaKeys, deriveResetAuth, exportVmkRaw, importVmk, MetaKeys, unl
 /** 同步遇到密文但密钥未解锁时抛出；同步暂停，本地编辑不受影响。 */
 export class E2eeLockedError extends Error {
 	constructor() {
-		super("端到端加密已启用，请先解锁（Unlock E2EE）");
+		super("仓库已锁定，请先解锁（命令「解锁仓库」）");
 		this.name = "E2eeLockedError";
 	}
 }

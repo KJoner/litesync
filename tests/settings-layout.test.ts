@@ -151,12 +151,12 @@ test("新手入口：未连接时首屏显示粘贴连接链接与打开网页�
 	const fresh = all(defs(false)).filter((i) => !i.inPage && visible(i)).map((i) => i.name);
 	assert.ok(fresh.includes("粘贴连接链接"));
 	assert.ok(fresh.includes("打开网页注册或登录"));
-	assert.ok(!fresh.includes("添加新设备"));
+	assert.ok(!fresh.includes("连接新设备"));
 
 	const bound = all(defs(true)).filter((i) => !i.inPage && visible(i)).map((i) => i.name);
 	assert.ok(!bound.includes("粘贴连接链接"));
 	assert.ok(bound.includes("当前仓库"));
-	assert.ok(bound.includes("添加新设备"));
+	assert.ok(bound.includes("连接新设备"));
 	assert.ok(bound.includes("密钥保存方式"));
 	assert.ok(bound.includes("本地文件说明"), "如实说明 Obsidian 本地文件仍是明文");
 });

@@ -429,7 +429,7 @@ export class BootstrapWizardModal extends Modal {
 		if (pre.e2eeEnabled && this.ctx.e2ee.needsUnlock) {
 			contentEl.createEl("p", { text: "此同步仓库已启用端到端加密，接入前需要先解锁。" });
 			const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
-			footer.createEl("button", { text: "解锁 E2EE…", cls: "mod-cta" }).onclick = () => {
+			footer.createEl("button", { text: "解锁仓库…", cls: "mod-cta" }).onclick = () => {
 				this.hooks.openUnlock(() => {
 					contentEl.empty();
 					contentEl.createDiv({ text: "正在检测远端仓库…", cls: "litesync-history-meta" });

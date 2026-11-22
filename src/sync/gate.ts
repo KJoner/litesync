@@ -160,7 +160,7 @@ export function syncGateBlock(ctx: SyncContext): GateBlock | null {
 	const session = ctx.gate.sessionBlock();
 	if (session !== null) return session;
 	if (ctx.e2ee.needsUnlock) {
-		return { reason: "key-locked", message: "端到端加密已锁定，请先解锁（Unlock E2EE）" };
+		return { reason: "key-locked", message: "仓库已锁定，请先解锁（命令「解锁仓库」）" };
 	}
 	return null;
 }

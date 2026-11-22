@@ -293,7 +293,7 @@ export class SyncSettingTab extends PluginSettingTab {
 						name: "粘贴连接链接",
 						aliases: ["配对", "导入", "二维码", "pairing", "连接 Obsidian"],
 						desc:
-							"在 LiteSync 网页的仓库卡片上点「连接 Obsidian」，或在已接入的设备上点「添加新设备」，会得到一个 5 分钟内有效的链接/二维码。" +
+							"在 LiteSync 网页的仓库卡片上点「连接 Obsidian」，或在已接入的设备上点「连接新设备」，会得到一个 5 分钟内有效的链接/二维码。" +
 							"手机扫码后点「在 Obsidian 中打开」即可；没有反应时复制链接粘贴到这里。",
 						visible: () => !configured(),
 						action: () => plugin.openPasteLinkModal(),
@@ -335,8 +335,8 @@ export class SyncSettingTab extends PluginSettingTab {
 						},
 					},
 					{
-						name: "添加新设备",
-						aliases: ["配对", "二维码", "新设备"],
+						name: "连接新设备",
+						aliases: ["添加新设备", "配对", "二维码", "新设备"],
 						desc: "生成一次性加密连接链接/二维码（只能用一次，很快过期）：新设备导入后先核对仓库，再输入仓库密码。链接里不含仓库密码与长期 Token。",
 						visible: configured,
 						action: () => plugin.openAddDeviceModal(),
@@ -344,7 +344,7 @@ export class SyncSettingTab extends PluginSettingTab {
 					{
 						name: "已连接设备",
 						aliases: ["设备列表", "设备", "撤销", "devices"],
-						desc: "查看连接到这个仓库的设备；撤销设备在网页里做",
+						desc: "查看连接到这个仓库的设备；撤销设备授权在网页里做（被撤销的设备不能再同步，它本机的文件不会被删除）",
 						visible: configured,
 						action: () => plugin.openDeviceList(),
 					},
@@ -464,8 +464,10 @@ export class SyncSettingTab extends PluginSettingTab {
 						control: { type: "text", key: "deviceName", placeholder: "MacBook" },
 					},
 					{
-						name: "忘记此设备",
-						desc: "删除本设备保存的自动解锁材料并立即锁定；下次必须重新输入仓库密码",
+						// 词表（UI 焕新 U5b）：它做的是清除本设备的自动解锁材料并锁定——不是撤销设备授权，也不是断开仓库
+						name: "清除自动解锁材料并锁定",
+						aliases: ["忘记此设备", "自动解锁", "forget device"],
+						desc: "删除本设备保存的自动解锁材料并立即锁定，之后每次都要输入仓库密码。不会撤销本设备的同步授权，也不会删除本机笔记",
 						visible: () => plugin.hasTrustedDevice() && !plugin.trustMigrationPending(),
 						action: () => {
 							void plugin.forgetThisDevice().then(() => this.update());
@@ -738,7 +740,7 @@ export class SyncSettingTab extends PluginSettingTab {
 				this.plugin.settings.syncIntervalSeconds = parseInt(String(value), 10) || 0;
 				break;
 			case "trustDevice":
-				// 自带保存逻辑（写 SecretStorage / 删除信任），并影响「忘记此设备」的可见性
+				// 自带保存逻辑（写 SecretStorage / 删除信任），并影响「清除自动解锁材料并锁定」的可见性
 				await this.plugin.setTrustDevice(value === true);
 				this.update();
 				return;
