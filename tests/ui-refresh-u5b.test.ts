@@ -7,6 +7,8 @@
 //   锁定的提示如实说明：只暂停本设备的同步与解密，本机笔记仍可阅读
 //   「忘记此设备」改名「清除自动解锁材料并锁定」（它不撤销授权、不断开仓库），旧名留作设置搜索别名；
 //     「添加新设备」改名「连接新设备」，旧名同样可搜
+//   冲突窗口：有没保存的段落选择、手工编辑或上次保留下来的手工结果时，关闭（Esc / × / 遮罩 / 取消）先确认；
+//     保存成功、保留两个文件、冲突自动消除之后直接关。逐处视图、手机标签与读屏属性在真实宿主里取证（交付记录 U5b）
 //
 // INV：不涉及同步不变量（只改界面文字与说明）；状态判定仍来自引擎已有的事实（状态、冲突数、凭据被拒）。
 import assert from "node:assert/strict";
@@ -18,6 +20,8 @@ import { test } from "node:test";
 	return node;
 };
 
+import { Modal } from "obsidian";
+import { ResolverModal } from "../src/conflict-ui/conflict-view";
 import { SyncSettingTab } from "../src/settings";
 import { StatusBarInput, statusBarLabel } from "../src/status-summary";
 
@@ -121,4 +125,54 @@ test("词表：连接新设备（旧称添加新设备）；撤销设备授权�
 	assert.ok(add?.aliases?.includes("添加新设备"));
 	const devices = flat().find((d) => d.name === "已连接设备");
 	assert.match(String(devices?.desc), /撤销设备授权在网页里做/);
+});
+
+// ---------- 冲突窗口：关闭前确认（不丢手工结果） ----------
+
+test("冲突窗口：有没保存的选择或手工编辑时关闭先确认，「放弃并关闭」后才真正关；处理完成后直接关", () => {
+	const proto = Modal.prototype as unknown as { close: () => void; open: () => void };
+	const origClose = proto.close;
+	const origOpen = proto.open;
+	const closed: unknown[] = [];
+	const opened: unknown[] = [];
+	proto.close = function (this: unknown) {
+		closed.push(this);
+	};
+	proto.open = function (this: unknown) {
+		opened.push(this);
+	};
+	type Priv = { choices: Record<string, string>; manualEdit: boolean; previousManualText: string | null; resolved: boolean };
+	const make = (over: Partial<Priv> = {}) => {
+		const r = new ResolverModal({ app: {} } as never, "plan.md");
+		Object.assign(r as unknown as Priv, over);
+		return r;
+	};
+	try {
+		const clean = make();
+		clean.close();
+		assert.deepEqual(closed, [clean], "什么都没选：直接关");
+
+		for (const over of [{ choices: { h1: "本机" } }, { manualEdit: true }, { previousManualText: "上次手工结果" }] as Array<Partial<Priv>>) {
+			closed.length = 0;
+			opened.length = 0;
+			const r = make(over);
+			r.close();
+			assert.equal(closed.length, 0, `${JSON.stringify(over)}：不直接关`);
+			assert.equal(opened.length, 1, "弹出确认");
+			const confirm = opened[0] as { onDiscard: () => void };
+			assert.notEqual(confirm, r);
+			confirm.onDiscard(); // 用户点「放弃并关闭」
+			assert.deepEqual(closed, [r], "确认之后才关");
+		}
+
+		closed.length = 0;
+		opened.length = 0;
+		const done = make({ choices: { h1: "本机" }, resolved: true });
+		done.close();
+		assert.deepEqual(closed, [done], "已保存 / 已保留两个文件：直接关");
+		assert.equal(opened.length, 0);
+	} finally {
+		proto.close = origClose;
+		proto.open = origOpen;
+	}
 });

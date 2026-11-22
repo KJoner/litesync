@@ -151,6 +151,7 @@
 .litesync-hunk-buttons {
 	display: flex;
 	gap: 6px;
+	flex-wrap: wrap; /* 手机竖屏放不下三个按钮时换行，不截掉「依次保留两段」 */
 }
 .litesync-hunk-buttons button.litesync-chosen {
 	background: var(--interactive-accent);
@@ -181,6 +182,57 @@
 	color: var(--text-muted);
 	font-size: var(--font-ui-smaller);
 }
+/* 逐处处理（UI 焕新 U5b）：导航在当前这一处的上方；没显示的几处用 hidden，不进读屏与 Tab 顺序 */
+.litesync-hunk-nav {
+	display: flex;
+	gap: 6px;
+	align-items: center;
+	flex-wrap: wrap;
+}
+.litesync-hunk-position {
+	font-size: var(--font-ui-small);
+	font-weight: var(--font-semibold);
+}
+.litesync-hunk[hidden],
+.litesync-resolver-tabpanel[hidden] {
+	display: none;
+}
+/* 手机：本机 / 云端 / 结果 三个标签（只切换显示，不重建合并结果） */
+.litesync-resolver-tabs {
+	display: flex;
+	gap: 4px;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+.litesync-resolver-tab {
+	flex: 1 1 0;
+	border-radius: var(--radius-s) var(--radius-s) 0 0;
+}
+/* 选中的标签用下划线 + 加粗表示，不改按钮的底色与字色：宿主（尤其手机）的按钮样式会盖掉底色，
+   留下浅底白字（真实宿主截图里实测看不清）；文字颜色保持宿主的正文色，对比度跟随主题 */
+.modal.mod-sync-resolver .litesync-resolver-tabs .litesync-resolver-tab[aria-selected="true"] {
+	box-shadow: inset 0 -3px 0 var(--interactive-accent);
+	font-weight: var(--font-semibold);
+	color: var(--text-normal);
+}
+.litesync-resolver-tabpanels .litesync-resolver-pre {
+	max-height: 40vh;
+}
+/* 保存时远端 / 本机变了：刚才手工编辑的结果原样留着（只读） */
+.litesync-resolver-previous {
+	border: 1px dashed var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	padding: 6px 8px;
+}
+.litesync-resolver-previous h4 {
+	margin: 0 0 4px 0;
+	font-size: 12px;
+}
+.litesync-resolver-previous-text {
+	width: 100%;
+	min-height: 12vh;
+	font-family: var(--font-monospace);
+	font-size: 12px;
+}
 
 /* ---------- 移动端响应式（v6：iPhone 竖屏禁用双栏，纵向堆叠） ---------- */
 @media (max-width: 600px) {
@@ -203,6 +255,11 @@
 	.litesync-hunk-buttons button,
 	.litesync-resolver-footer button {
 		min-height: 36px; /* 触控目标 */
+	}
+	/* 标签与逐处导航：手机上的主要交互，触控目标 44 px（V03） */
+	.litesync-resolver-tab,
+	.litesync-hunk-nav button {
+		min-height: 44px;
 	}
 	.litesync-resolver-footer {
 		flex-wrap: wrap;

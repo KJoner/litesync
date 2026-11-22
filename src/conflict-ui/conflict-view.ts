@@ -1,4 +1,4 @@
-import { Modal, Notice } from "obsidian";
+import { App, Modal, Notice, Platform } from "obsidian";
 import { ConflictError } from "../api/client";
 import { assembleResolution } from "../merge/three-way";
 import { SyncContext } from "../sync/context";
@@ -58,6 +58,24 @@ export class ResolverModal extends Modal {
 	private mergedTextarea: HTMLTextAreaElement | null = null;
 	private hunkEls: HTMLElement[] = [];
 	private currentHunk = 0;
+	/**
+	 * 逐处处理（UI 焕新 U5b，UX-08）：多于一处冲突时一次只显示一处，用「上一处 / 下一处」切换；
+	 * 「显示全部冲突」回到上下堆叠的视图。只换显示方式，选择与合并结果不受影响。
+	 */
+	private focusMode = true;
+	private positionEl: HTMLElement | null = null;
+	private prevBtn: HTMLButtonElement | null = null;
+	private nextBtn: HTMLButtonElement | null = null;
+	private modeBtn: HTMLButtonElement | null = null;
+	/** 已保存 / 已保留两个文件 / 冲突已自动消除：关闭时不再确认。 */
+	private resolved = false;
+	/** 用户在确认框里选了「放弃并关闭」。 */
+	private discardConfirmed = false;
+	/**
+	 * 保存时远端或本机又变了（重新加载后对比换成最新内容）：用户刚才手工编辑的合并结果留在这里，
+	 * 让他对照后决定是否沿用——绝不静默套用到新的对比上，也不随重新加载丢掉。
+	 */
+	private previousManualText: string | null = null;
 
 	constructor(
 		private ctx: SyncContext,
@@ -98,6 +116,7 @@ export class ResolverModal extends Modal {
 				);
 				new Notice(`冲突已自动消除：${this.path}`);
 				this.ctx.onConflictsChanged();
+				this.resolved = true;
 				this.close();
 				return;
 			} catch {
@@ -120,8 +139,12 @@ export class ResolverModal extends Modal {
 			});
 		}
 
-		// LOCAL / REMOTE 双栏
-		const panes = contentEl.createDiv({ cls: "litesync-resolver-panes" });
+		// 手机（或很窄的窗口）：全文对照改成「本机 / 云端 / 结果」三个标签，冲突段放在最上面先处理
+		const phone = Platform.isPhone || (contentEl.ownerDocument.defaultView?.matchMedia?.("(max-width: 600px)").matches ?? false);
+		const conflicts = loaded.merge.conflicts;
+
+		// 本机 / 云端全文（桌面双栏）
+		const panes = createDiv({ cls: "litesync-resolver-panes" });
 		const localPane = panes.createDiv({ cls: "litesync-resolver-pane" });
 		localPane.createEl("h4", { text: "本机（此设备）" });
 		localPane.createEl("pre", { cls: "litesync-resolver-pre", text: loaded.localText });
@@ -129,17 +152,28 @@ export class ResolverModal extends Modal {
 		remotePane.createEl("h4", { text: `云端（版本 ${loaded.remoteRevision}）` });
 		remotePane.createEl("pre", { cls: "litesync-resolver-pre", text: loaded.remoteText });
 
-		// 冲突段列表
-		const hunksBox = contentEl.createDiv();
-		const conflicts = loaded.merge.conflicts;
-		const nav = contentEl.createDiv({ cls: "litesync-hunk-buttons" });
-		nav.createEl("button", { text: "上一个冲突" }).onclick = () => this.gotoHunk(this.currentHunk - 1);
-		nav.createEl("button", { text: "下一个冲突" }).onclick = () => this.gotoHunk(this.currentHunk + 1);
+		// 冲突段：导航在上（第 i / N 处 · 已处理 X / N），下面是当前这一处
+		const nav = createDiv({ cls: "litesync-hunk-nav" });
+		const hunksBox = createDiv({ cls: "litesync-hunks" });
+		this.prevBtn = nav.createEl("button", { text: "上一处" });
+		this.prevBtn.onclick = () => this.gotoHunk(this.currentHunk - 1);
+		this.nextBtn = nav.createEl("button", { text: "下一处" });
+		this.nextBtn.onclick = () => this.gotoHunk(this.currentHunk + 1);
+		this.positionEl = nav.createSpan({ cls: "litesync-hunk-position" });
 		this.progressEl = nav.createSpan({ cls: "litesync-hunk-progress" });
 		this.progressEl.setAttr("role", "status");
 		this.progressTotal = conflicts.length;
 		const autoResolved = loaded.merge.stats?.autoResolved ?? 0;
 		if (autoResolved > 0) nav.createSpan({ cls: "litesync-history-meta", text: `另有 ${autoResolved} 处已自动合并` });
+		this.focusMode = conflicts.length > 1;
+		this.modeBtn = null;
+		if (conflicts.length > 1) {
+			this.modeBtn = nav.createEl("button", { cls: "litesync-hunk-mode" });
+			this.modeBtn.onclick = () => {
+				this.focusMode = !this.focusMode;
+				this.applyHunkVisibility();
+			};
+		}
 		// 「采用全部建议」：一次性接受引擎给出的全部建议（仍需「保存合并」才生效）
 		const suggestionAppliers: Array<() => void> = [];
 		const suggestedCount = conflicts.filter((c) => c.suggestedText !== undefined).length;
@@ -216,7 +250,7 @@ export class ResolverModal extends Modal {
 		});
 
 		// 合并结果（可编辑）
-		const mergedBox = contentEl.createDiv({ cls: "litesync-resolver-merged" });
+		const mergedBox = createDiv({ cls: "litesync-resolver-merged" });
 		mergedBox.createEl("h4", { text: "合并结果（可以直接编辑）" });
 		this.mergedTextarea = mergedBox.createEl("textarea");
 		this.mergedTextarea.placeholder = "为每处冲突选择「保留本机段落 / 保留云端段落 / 依次保留两段」，或者直接在这里编辑最终内容";
@@ -224,8 +258,30 @@ export class ResolverModal extends Modal {
 			this.manualEdit = true;
 			this.updateSaveState();
 		});
+
+		// 保存时远端 / 本机又变了：刚才手工编辑的结果保留在这里，由用户决定是否沿用
+		const previousBox = this.previousManualText !== null ? this.renderPreviousManual() : null;
+
+		if (phone) {
+			// 手机：先逐处处理，再在「本机 / 云端 / 结果」之间切换着看全文
+			if (previousBox) contentEl.appendChild(previousBox);
+			contentEl.appendChild(nav);
+			contentEl.appendChild(hunksBox);
+			this.renderTabs(contentEl, [
+				{ label: "本机", panel: localPane },
+				{ label: "云端", panel: remotePane },
+				{ label: "结果", panel: mergedBox },
+			]);
+		} else {
+			contentEl.appendChild(panes);
+			if (previousBox) contentEl.appendChild(previousBox);
+			contentEl.appendChild(nav);
+			contentEl.appendChild(hunksBox);
+			contentEl.appendChild(mergedBox);
+		}
 		this.refreshMerged();
 		this.refreshProgress();
+		this.applyHunkVisibility();
 
 		// 底部操作
 		const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
@@ -243,7 +299,105 @@ export class ResolverModal extends Modal {
 	private gotoHunk(idx: number): void {
 		if (this.hunkEls.length === 0) return;
 		this.currentHunk = Math.max(0, Math.min(idx, this.hunkEls.length - 1));
-		this.hunkEls[this.currentHunk].scrollIntoView({ behavior: "smooth", block: "center" });
+		this.applyHunkVisibility();
+		if (!this.focusMode) this.hunkEls[this.currentHunk].scrollIntoView({ behavior: "smooth", block: "center" });
+	}
+
+	/** 逐处：只显示当前这一处（hidden 让其余几处也不进读屏与 Tab 顺序）；全部：都显示。 */
+	private applyHunkVisibility(): void {
+		const n = this.hunkEls.length;
+		this.hunkEls.forEach((el, i) => {
+			el.hidden = this.focusMode && i !== this.currentHunk;
+		});
+		if (this.positionEl) this.positionEl.setText(n > 1 ? `第 ${this.currentHunk + 1} / ${n} 处` : "");
+		if (this.prevBtn) this.prevBtn.disabled = n <= 1 || this.currentHunk === 0;
+		if (this.nextBtn) this.nextBtn.disabled = n <= 1 || this.currentHunk === n - 1;
+		if (this.modeBtn) {
+			this.modeBtn.setText(this.focusMode ? "显示全部冲突" : "逐处查看");
+			this.modeBtn.setAttr("aria-pressed", this.focusMode ? "false" : "true");
+		}
+	}
+
+	/**
+	 * 手机上的「本机 / 云端 / 结果」标签：只切换显示，不重建内容——合并结果里的手工编辑、
+	 * 光标与撤销历史都留在同一个 textarea 里。左右方向键在标签之间移动（WAI-ARIA 标签页模式）。
+	 */
+	private renderTabs(parent: HTMLElement, tabs: Array<{ label: string; panel: HTMLElement }>): void {
+		const id = `litesync-resolver-${++tabSeq}`;
+		const bar = parent.createDiv({ cls: "litesync-resolver-tabs", attr: { role: "tablist", "aria-label": "对照" } });
+		const panels = parent.createDiv({ cls: "litesync-resolver-tabpanels" });
+		const buttons: HTMLButtonElement[] = [];
+		const select = (i: number, focus: boolean): void => {
+			tabs.forEach((t, k) => {
+				const on = k === i;
+				buttons[k].setAttr("aria-selected", on ? "true" : "false");
+				buttons[k].tabIndex = on ? 0 : -1;
+				buttons[k].toggleClass("is-active", on);
+				t.panel.hidden = !on;
+			});
+			if (focus) buttons[i].focus();
+		};
+		tabs.forEach((t, i) => {
+			const btn = bar.createEl("button", {
+				text: t.label,
+				cls: "litesync-resolver-tab",
+				attr: { role: "tab", id: `${id}-tab-${i}`, "aria-controls": `${id}-panel-${i}` },
+			});
+			btn.onclick = () => select(i, false);
+			btn.addEventListener("keydown", (e) => {
+				if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+					e.preventDefault();
+					select((i + (e.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length, true);
+				}
+			});
+			buttons.push(btn);
+			t.panel.addClass("litesync-resolver-tabpanel");
+			t.panel.setAttrs({ role: "tabpanel", id: `${id}-panel-${i}`, "aria-labelledby": `${id}-tab-${i}` });
+			panels.appendChild(t.panel);
+		});
+		// 默认看「结果」：选完每一处之后要保存的就是它
+		select(tabs.length - 1, false);
+	}
+
+	/** 上一次保存时远端 / 本机变了：把用户刚才手工编辑的合并结果原样留给他（只读），可以一键沿用。 */
+	private renderPreviousManual(): HTMLElement {
+		const box = createDiv({ cls: "litesync-resolver-previous" });
+		box.createEl("h4", { text: "你刚才编辑的合并结果" });
+		box.createDiv({
+			cls: "litesync-history-meta",
+			text: "保存前远端或本机又有了变化，上面的对比已经换成最新内容。你刚才的编辑保留在这里：可以对照后直接沿用，或者只复制需要的部分。",
+		});
+		const prev = box.createEl("textarea", { cls: "litesync-resolver-previous-text" });
+		prev.value = this.previousManualText ?? "";
+		prev.readOnly = true;
+		const btn = box.createEl("button", { text: "用它作为合并结果" });
+		btn.onclick = () => {
+			if (!this.mergedTextarea || this.previousManualText === null) return;
+			this.mergedTextarea.value = this.previousManualText;
+			this.manualEdit = true;
+			this.updateSaveState();
+		};
+		return box;
+	}
+
+	/** 有没有关掉就会丢的东西：段落选择、手工编辑，或上一次保留下来的手工结果。 */
+	private hasUnsavedWork(): boolean {
+		return Object.keys(this.choices).length > 0 || this.manualEdit || this.previousManualText !== null;
+	}
+
+	/**
+	 * 关闭（Esc、右上角 ×、点遮罩、「取消」都走这里）：有没保存的选择或手工编辑时先确认，
+	 * 默认按钮是「继续处理」。冲突本身无论如何都保留，之后可以再处理。
+	 */
+	close(): void {
+		if (this.resolved || this.discardConfirmed || !this.hasUnsavedWork()) {
+			super.close();
+			return;
+		}
+		new DiscardChoicesModal(this.app, () => {
+			this.discardConfirmed = true;
+			this.close();
+		}).open();
 	}
 
 	private refreshProgress(): void {
@@ -301,8 +455,14 @@ export class ResolverModal extends Modal {
 			);
 			new Notice(`已保存合并：${this.path}（版本 ${rev}）`);
 			this.ctx.onConflictsChanged();
+			this.previousManualText = null;
+			this.resolved = true;
 			this.close();
 		} catch (e) {
+			if (e instanceof ConflictError || e instanceof LocalChangedError) {
+				// 重新加载会换成最新的对比、清空选择；手工编辑的结果先留下来（见 renderPreviousManual），不丢
+				if (this.manualEdit && this.mergedTextarea) this.previousManualText = this.mergedTextarea.value;
+			}
 			if (e instanceof ConflictError) {
 				// Race Protection：远端在处理期间又变化 → 重新加载最新内容重新 merge
 				new Notice("远端在处理期间又发生了变化，已重新加载最新版本，请重新确认合并");
@@ -326,9 +486,41 @@ export class ResolverModal extends Modal {
 		try {
 			await keepBothForConflict(this.ctx, this.path);
 			this.ctx.onConflictsChanged();
+			this.resolved = true;
 			this.close();
 		} catch (e) {
 			new Notice(`操作失败：${e instanceof Error ? e.message : String(e)}`);
 		}
+	}
+}
+
+let tabSeq = 0;
+
+/** 关闭冲突窗口前的确认：默认「继续处理」；「放弃并关闭」只丢这次的选择，冲突本身保留。 */
+class DiscardChoicesModal extends Modal {
+	constructor(
+		app: App,
+		private onDiscard: () => void,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.titleEl.setText("放弃这次的处理？");
+		this.contentEl.createEl("p", {
+			text: "关闭后，这次做的选择和对合并结果的编辑都会丢失。冲突本身会保留，之后可以再处理。",
+		});
+		const footer = this.contentEl.createDiv({ cls: "litesync-resolver-footer" });
+		const keep = footer.createEl("button", { text: "继续处理", cls: "mod-cta" });
+		keep.onclick = () => this.close();
+		footer.createEl("button", { text: "放弃并关闭", cls: "mod-warning" }).onclick = () => {
+			this.close();
+			this.onDiscard();
+		};
+		window.setTimeout(() => keep.focus(), 0);
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
 	}
 }
