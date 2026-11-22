@@ -519,7 +519,8 @@ export default class PrivateSyncPlugin extends Plugin {
 		return this.store?.bootstrapReady ?? false;
 	}
 
-	openBootstrapWizard(): void {
+	/** opts.linkVaultId：刚兑换的连接链接指定并核对过的仓库（向导据此跳过选库页，见 linkedVaultToSkip）。 */
+	openBootstrapWizard(opts: { linkVaultId?: string } = {}): void {
 		if (this.wizardOpen || !this.ctx) return;
 		if (!this.isConfigured()) {
 			new Notice("请先在设置中填写 Server URL 和 API Token");
@@ -529,6 +530,7 @@ export default class PrivateSyncPlugin extends Plugin {
 		new BootstrapWizardModal(this.app, this.ctx, {
 			setVaultChoice: (id) => this.setVaultChoice(id),
 			vaultChoice: () => this.settings.vaultChoice,
+			linkVaultId: opts.linkVaultId,
 			keyNote: () => this.unlockNote(),
 			replaceRemoteEnabled: () => this.settings.replaceRemoteEnabled,
 			repairPairing: () => this.openPasteLinkModal(),
@@ -1380,9 +1382,23 @@ export default class PrivateSyncPlugin extends Plugin {
 		else if (this.ctx) new ConflictListModal(this.ctx).open();
 	}
 
-	/** 打开冲突列表（设置页「同步」节）。 */
+	/** 打开冲突列表（设置页「同步选项」）。 */
 	openConflicts(): void {
 		if (this.ctx) new ConflictListModal(this.ctx).open();
+	}
+
+	/** 当前笔记的版本历史（设置页「恢复与帮助」；与命令「文件版本历史」相同）。 */
+	openActiveFileHistory(): void {
+		if (!this.ctx) {
+			new Notice("请先连接仓库");
+			return;
+		}
+		const file = this.app.workspace.getActiveFile();
+		if (!file) {
+			new Notice("先打开一个笔记，再查看它的版本历史（也可以在文件菜单里选「LiteSync: 版本历史」）");
+			return;
+		}
+		new HistoryModal(this.ctx, file.path).open();
 	}
 
 	/** 设备列表（设置页「连接与仓库」节）。 */

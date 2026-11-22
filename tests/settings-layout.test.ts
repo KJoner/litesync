@@ -2,8 +2,9 @@
 //
 // 覆盖：
 //   首屏状态卡：「设备授权」与「仓库解锁」分两行；主按钮只有一个，按最先挡住同步的事决定
-//   四节结构：连接与仓库 / 同步 / 加密与设备 / 高级（子页面）
-//   新手入口：未连接时显示「粘贴连接链接」「打开网页注册或登录」；手工 Server URL / API Token 只在高级里
+//   概览 + 任务子页（UI 焕新 U5b）：状态卡 /（未连接时）开始使用 / 连接与设备、同步选项、仓库密码与锁定、
+//     恢复与帮助、高级与诊断五个原生子页；未连接时只显示用得上的子页
+//   新手入口：未连接时首页显示「粘贴连接链接」「打开网页注册或登录」；手工 Server URL / API Token 只在高级与诊断里
 //   密钥持久化开关只在高级里；实验功能折叠为高级下的子页面
 //   0.20.1 阶段保护：「用本地完整替换远端」执行入口默认关闭（高级区显式开关、注明验收阶段）；
 //     关闭时只读预览与未完成作业的诊断 / 放弃 / 回滚入口照常可见，不是静默失效
@@ -116,6 +117,16 @@ function visible(d: Def): boolean {
 	return typeof d.visible === "function" ? d.visible() : d.visible !== false;
 }
 
+/** 递归收集**看得见**的设置项：跳过不可见的分组与子页（及其下的一切）。 */
+function shown(items: Def[], inPage = false, acc: Array<Def & { inPage: boolean }> = []): Array<Def & { inPage: boolean }> {
+	for (const d of items) {
+		if (!visible(d)) continue;
+		if (d.items) shown(d.items, inPage || d.type === "page", acc);
+		else acc.push({ ...d, inPage });
+	}
+	return acc;
+}
+
 /** 递归收集某层级下所有设置项（含子页面）。 */
 function all(items: Def[], inPage = false, acc: Array<Def & { inPage: boolean }> = []): Array<Def & { inPage: boolean }> {
 	for (const d of items) {
@@ -125,12 +136,21 @@ function all(items: Def[], inPage = false, acc: Array<Def & { inPage: boolean }>
 	return acc;
 }
 
-test("四节结构：状态卡在首位，随后 连接与仓库 / 同步 / 加密与设备，最后是「高级」子页面", () => {
+test("首页是概览 + 任务子页：状态卡在首位，未连接时有「开始使用」，随后五个原生子页", () => {
 	const d = defs(true);
 	assert.equal(d[0].cls, "litesync-status-card");
+	assert.equal(d[1].heading, "开始使用");
+	assert.equal(visible(d[1]), false, "已连接时不再显示开始使用");
 	assert.deepEqual(
-		d.slice(1).map((x) => x.heading ?? `${x.type}:${x.name}`),
-		["连接与仓库", "同步", "加密与设备", "page:高级"],
+		(d[2].items ?? []).map((x) => `${x.type}:${x.name}`),
+		["page:连接与设备", "page:同步选项", "page:仓库密码与锁定", "page:恢复与帮助", "page:高级与诊断"],
+	);
+	const fresh = defs(false);
+	assert.equal(visible(fresh[1]), true);
+	assert.deepEqual(
+		(fresh[2].items ?? []).filter(visible).map((x) => x.name),
+		["同步选项", "恢复与帮助", "高级与诊断"],
+		"未连接：没有内容的子页（连接与设备、仓库密码与锁定）不显示",
 	);
 });
 
@@ -147,18 +167,16 @@ test("手工 Server URL / API Token、密钥持久化开关、实验功能都只
 	assert.ok(!items.some((i) => !i.inPage && (i.name === "Server URL" || i.name === "API Token")));
 });
 
-test("新手入口：未连接时首屏显示粘贴连接链接与打开网页；连接后换成日常入口", () => {
-	const fresh = all(defs(false)).filter((i) => !i.inPage && visible(i)).map((i) => i.name);
-	assert.ok(fresh.includes("粘贴连接链接"));
-	assert.ok(fresh.includes("打开网页注册或登录"));
-	assert.ok(!fresh.includes("连接新设备"));
+test("新手入口：未连接时首页显示粘贴连接链接与打开网页；连接后它们收起，日常入口在子页里", () => {
+	const freshTop = shown(defs(false)).filter((i) => !i.inPage).map((i) => i.name);
+	assert.deepEqual(freshTop, ["LiteSync", "粘贴连接链接", "打开网页注册或登录"], "首页只有状态卡与两个入口");
+	assert.ok(!shown(defs(false)).some((i) => i.name === "连接新设备"), "未连接时看不到连接新设备");
 
-	const bound = all(defs(true)).filter((i) => !i.inPage && visible(i)).map((i) => i.name);
-	assert.ok(!bound.includes("粘贴连接链接"));
-	assert.ok(bound.includes("当前仓库"));
-	assert.ok(bound.includes("连接新设备"));
-	assert.ok(bound.includes("密钥保存方式"));
-	assert.ok(bound.includes("本地文件说明"), "如实说明 Obsidian 本地文件仍是明文");
+	const bound = shown(defs(true));
+	assert.deepEqual(bound.filter((i) => !i.inPage).map((i) => i.name), ["LiteSync"], "已连接：首页只剩状态卡与子页入口");
+	const inPages = bound.filter((i) => i.inPage).map((i) => i.name);
+	for (const n of ["当前仓库", "连接新设备", "已连接设备", "密钥保存方式", "检查云端更新"]) assert.ok(inPages.includes(n), n);
+	assert.ok(inPages.includes("本地文件说明"), "如实说明 Obsidian 本地文件仍是明文");
 });
 
 // ---------- 0.20.1 阶段保护：用本地完整替换远端 ----------

@@ -161,6 +161,9 @@ function setup() {
 		metaMigrationActive: () => false,
 		runPrimaryAction: () => {},
 		runSecondaryAction: () => {},
+		// 状态卡会为仓库名查一次（U5b）；这里的仓库名由测试直接设置
+		listRemoteVaults: async () => [],
+		rememberVaultName: () => {},
 	};
 
 	const focusListeners: Array<() => void> = [];

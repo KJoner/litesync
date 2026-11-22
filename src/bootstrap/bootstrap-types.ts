@@ -98,3 +98,21 @@ export function classifyBootstrap(localCount: number, remoteCount: number): Boot
 export function vaultPickerVisible(listSucceeded: boolean, hasSetter: boolean): boolean {
 	return listSucceeded && hasSetter;
 }
+
+/**
+ * 连接链接已经指定、并在兑换前让用户核对过目标仓库时，接入向导跳过选库页（UI 焕新 U5b，P02：
+ * 「目标仓库只核对一次」）。只在三者一致时跳过：链接里的仓库 = 设置里当前选的仓库（applyPairingConfig
+ * 已写入同一个值）= 服务器报告的「当前」仓库。任何一项对不上就照常显示选库页。
+ *
+ * 跳过不调用 setVaultChoice（值本来就相同，调用也是空操作）：绑定指纹、切库锁定、PL-06 的 preflight
+ * 核验都与显示选库页、按「继续」时完全一样。「新建仓库」仍可从向导里的「选择其他仓库…」或
+ * 设置页「重新运行接入向导」进入——vaultPickerVisible 注释里那个缺口不会回来。
+ */
+export function linkedVaultToSkip<V extends { id: string; current?: boolean }>(
+	vaults: V[],
+	linkVaultId: string | undefined,
+	vaultChoice: string | undefined,
+): V | null {
+	if (!linkVaultId || vaultChoice !== linkVaultId) return null;
+	return vaults.find((v) => v.current === true && v.id === linkVaultId) ?? null;
+}

@@ -46,7 +46,7 @@ LITESYNC_INTEROP_SERVER_BIN=<obsync 二进制> node scripts/interop/run.mjs   # 
 ```
 src/
 ├── main.ts              插件入口：命令注册、状态栏、设置装配、生命周期
-├── settings.ts          设置页（Obsidian 1.13 声明式 API）+ PluginSettings；状态卡 + 四节（0.20）
+├── settings.ts          设置页（Obsidian 1.13 声明式 API）+ PluginSettings；状态卡 + 五个原生任务子页（UI 焕新 U5b）
 ├── status-summary.ts    状态卡的纯判定：几行状态 + 唯一主按钮（可测）
 ├── onboarding.ts        新手入口：「打开网页注册或登录」
 ├── api/client.ts        HTTP 客户端、协议常量、错误码 → 类型化异常
@@ -136,7 +136,10 @@ src/
   `client.headers()` 以 `X-Vault-ID` 携带；**绑定指纹含第五字段 vaultChoice**
   （改 `computeBinding`/`isBoundTo` 时两处都要动——v0.19 开发中就漏过一次，
   被 `tests/v19-multivault` 抓住）。切换仓库只能走接入向导；向导的选仓库步
-  **始终显示**（`vaultPickerVisible`，数量不参与判定——「新建」的唯一入口）。
+  **始终显示**（`vaultPickerVisible`，数量不参与判定——「新建」的入口）。唯一例外（UI 焕新 U5b）：刚兑换的
+  连接链接写明了仓库、且「链接的仓库 = vaultChoice = 服务器的当前仓库」时跳过（`linkedVaultToSkip`；用户在兑换前的
+  核对页已经确认过），向导顶部注明目标仓库并给「选择其他仓库…」回到选库步——跳过不调 setVaultChoice（值本来相同），
+  绑定指纹与 PL-06 preflight 都不受影响。
   **空远端初始化强制 E2EE**（0.19.x）：向导与首次配置对话框都没有明文
   初始化按钮；既有明文仓库不受影响。仓库重命名 `PATCH /api/v1/vaults/{id}`
   只动展示名（设置页「当前仓库」条目）。
@@ -188,7 +191,7 @@ src/
 
 ## 7. 测试组织
 
-`tests/` 目录自动发现，当前 458 条（0.20.1 复审修复 + Windows 真机验收回归 + IDENTITY_UNAVAILABLE + iPhone 验收的设置页刷新后；0.20.0 时 361）。分类：
+`tests/` 目录自动发现，当前 474 条（0.20.1 复审修复 + Windows 真机验收回归 + IDENTITY_UNAVAILABLE + iPhone 验收的设置页刷新 + UI 焕新 U5 / U5b 后；0.20.0 时 361）。分类：
 
 - `unit` / `merge` / `smart-merge` / `crypto` / `store` / `device-trust`：基础单元；
 - `crashpoint.test.ts`：**崩溃点注入**（`utils/failpoint.ts` 在关键步骤间强制中断）；
@@ -200,6 +203,10 @@ src/
 - `settings-refresh`：设置页跟随插件状态刷新（iPhone 真机验收）。`plugin.updateStatus` 是状态变化的唯一出口，每次都调
   `SyncSettingTab.stateChanged()`：结构没变只就地重绘状态卡，结构变了（未连接 ↔ 已连接、接入完成、加密状态）整页重绘，
   用户正在设置窗口的输入框里输入时推迟到焦点离开。**新加的流程不要再自己调 refreshSettingsTab 补刷新**——走 updateStatus。
+- `ui-refresh-u5` / `ui-refresh-u5b`：UI 焕新的界面契约——手机只显示真正生效的设置、设备管理去网页、状态栏与词表
+  （已同步 / N 个冲突 / 已锁定 / 需要重新连接；清除自动解锁材料并锁定 ≠ 撤销设备授权）、子页入口的当前值与提醒、
+  安全相关的显式开关只在「高级与诊断」、跳过选库页的三项一致判定、冲突窗口关闭前确认。设置页的子页入口
+  （displayValue / status）依赖的状态要进 `shape()`，否则入口上的值不会随状态变化重绘。
 - `key-session` / `inherited-trust` / `replace-remote-safety` / `review-reproductions` / `restore-meta`：0.20.1 复审修复（PL-01 密钥会话代次、
   PL-06 继承锚核验、PL-02～05 完整替换的许可 / 前置条件 / 子状态机、审查 7 条反例改写为正确行为断言、
   路径加密下显式恢复后的元数据世代与之后的改名 CAS）。

@@ -135,7 +135,8 @@ async function finishRedeem(plugin: PrivateSyncPlugin, outcome: Extract<RedeemOu
 	});
 	clearPendingRedeem(plugin.app.secretStorage);
 	new Notice("设备已连接 ✓ 接下来输入仓库密码并选择首次同步方式");
-	plugin.openBootstrapWizard();
+	// 链接写明了仓库、用户在核对页看过（兑换时也核对了服务器返回的是同一个）：向导不再问一遍选哪个仓库
+	plugin.openBootstrapWizard({ linkVaultId: outcome.config.selectedVault ? outcome.vaultId : undefined });
 }
 
 function minutesLeft(expiresAt: number, now: number): string {

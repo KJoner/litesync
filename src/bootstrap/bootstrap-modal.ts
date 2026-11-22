@@ -13,7 +13,7 @@ import {
 	PreflightResult,
 } from "./bootstrap-manager";
 import { ReplaceRemoteModal } from "./replace-remote-modal";
-import { classifyBootstrap, vaultPickerVisible } from "./bootstrap-types";
+import { classifyBootstrap, linkedVaultToSkip, vaultPickerVisible } from "./bootstrap-types";
 
 export interface BootstrapWizardHooks {
 	/**
@@ -31,6 +31,11 @@ export interface BootstrapWizardHooks {
 	setVaultChoice?: (vaultId: string) => Promise<void>;
 	/** 当前的目标仓库选择（settings.vaultChoice；空 = 默认仓库） */
 	vaultChoice?: () => string;
+	/**
+	 * 刚兑换的连接链接指定、并在兑换前核对过的仓库（UI 焕新 U5b，P02）：与当前选择、服务器的当前仓库
+	 * 一致时跳过选库页（linkedVaultToSkip）。只有兑换后立即打开的这一次向导带它。
+	 */
+	linkVaultId?: string;
 	/** 解锁/启用弹窗里的密钥策略提示（0.20：严格会话解锁 / 显式持久化 / 待迁移） */
 	keyNote?: () => string;
 	/** 「用本地完整替换远端」的正向执行入口是否开启（0.20.1 阶段保护，默认关闭） */
@@ -53,6 +58,8 @@ export interface BootstrapWizardHooks {
  */
 export class BootstrapWizardModal extends Modal {
 	private busy = false;
+	/** 跳过了选库页时，目标仓库（来自连接链接）：向导顶部注明，并给出「选择其他仓库…」。 */
+	private linkVault: { id: string; name: string } | null = null;
 
 	constructor(
 		app: App,
@@ -77,7 +84,7 @@ export class BootstrapWizardModal extends Modal {
 	 * **用户级 Token**（设备凭据绑定单仓库、X-Vault-ID 对它无效——这是刻意的
 	 * 最小权限设计），此时提示先在设置里重新填入 API Token。
 	 */
-	private async runVaultPicker(): Promise<void> {
+	private async runVaultPicker(force = false): Promise<void> {
 		let vaults: Awaited<ReturnType<SyncContext["client"]["listVaults"]>> = [];
 		let listOk = true;
 		try {
@@ -90,6 +97,14 @@ export class BootstrapWizardModal extends Modal {
 			void this.runPreflight();
 			return;
 		}
+		// 连接链接已经指定并核对过仓库：不再问一遍（「选择其他仓库…」回到这里时 force = true）
+		const linked = force ? null : linkedVaultToSkip(vaults, this.hooks.linkVaultId, this.hooks.vaultChoice?.());
+		if (linked) {
+			this.linkVault = { id: linked.id, name: linked.name || linked.id };
+			void this.runPreflight();
+			return;
+		}
+		this.linkVault = null;
 		let tokenType = "root";
 		try {
 			tokenType = (await this.ctx.client.whoami()).tokenType ?? "root";
@@ -407,6 +422,18 @@ export class BootstrapWizardModal extends Modal {
 			this.renderTrustRejected(pre.inheritedTrust.message);
 			return;
 		}
+		if (this.linkVault) {
+			// 选库页跳过了：说清楚目标仓库来自哪里，并留一条改选的路（含新建）
+			const row = contentEl.createDiv({ cls: "litesync-history-meta litesync-wizard-target" });
+			row.appendText(`目标仓库：「${this.linkVault.name}」（来自连接链接，连接前已核对）`);
+			const other = row.createEl("button", { text: "选择其他仓库…" });
+			other.onclick = () => {
+				if (this.busy) return;
+				contentEl.empty();
+				contentEl.createDiv({ text: "正在读取仓库列表…", cls: "litesync-history-meta" });
+				void this.runVaultPicker(true);
+			};
+		}
 		if (pre.inheritedTrust?.kind === "verified") {
 			contentEl.createDiv({
 				cls: "litesync-history-meta",
@@ -489,11 +516,12 @@ export class BootstrapWizardModal extends Modal {
 					text: `本地是空仓库。将从远端下载全部 ${pre.remoteFiles.length} 个文件。`,
 				});
 				const footer = contentEl.createDiv({ cls: "litesync-resolver-footer" });
-				const btn = footer.createEl("button", { text: "从远端恢复此设备", cls: "mod-cta" });
+				// 词表（01-UX-PLAN §7）：首次空库是「下载到本机」；灾难恢复的入口才叫恢复
+				const btn = footer.createEl("button", { text: "下载到本机", cls: "mod-cta" });
 				btn.onclick = () =>
-					void run(btn, "恢复", async () => {
+					void run(btn, "下载", async () => {
 						await bootstrapRemoteWins(this.ctx, pre, onProgress);
-						new Notice(`已从远端恢复 ${pre.remoteFiles.length} 个文件 ✓`);
+						new Notice(`已下载 ${pre.remoteFiles.length} 个文件到本机 ✓`);
 					});
 				break;
 			}

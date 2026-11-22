@@ -7,6 +7,9 @@
 //   锁定的提示如实说明：只暂停本设备的同步与解密，本机笔记仍可阅读
 //   「忘记此设备」改名「清除自动解锁材料并锁定」（它不撤销授权、不断开仓库），旧名留作设置搜索别名；
 //     「添加新设备」改名「连接新设备」，旧名同样可搜
+//   设置首页 = 概览 + 任务子页（P01）：入口上的当前值与提醒按真实状态（需要重新连接、冲突、已锁定）；
+//     安全相关的显式选择（本设备自动解锁、完整替换远端的执行开关）仍只在「高级与诊断」里，别处只有去向说明
+//   连接链接已指定并核对过仓库时跳过选库页（P02）：链接的仓库 = 当前选择 = 服务器的当前仓库，三者一致才跳过
 //   冲突窗口：有没保存的段落选择、手工编辑或上次保留下来的手工结果时，关闭（Esc / × / 遮罩 / 取消）先确认；
 //     保存成功、保留两个文件、冲突自动消除之后直接关。逐处视图、手机标签与读屏属性在真实宿主里取证（交付记录 U5b）
 //
@@ -22,7 +25,8 @@ import { test } from "node:test";
 
 import { Modal } from "obsidian";
 import { ResolverModal } from "../src/conflict-ui/conflict-view";
-import { SyncSettingTab } from "../src/settings";
+import { linkedVaultToSkip } from "../src/bootstrap/bootstrap-types";
+import { SyncSettingTab, syncSummary } from "../src/settings";
 import { StatusBarInput, statusBarLabel } from "../src/status-summary";
 
 const bar = (over: Partial<StatusBarInput>) =>
@@ -71,20 +75,20 @@ interface Def {
 	items?: Def[];
 }
 
-function fakePlugin() {
+function fakePlugin(over: { credentialRejected?: boolean; e2ee?: string; conflicts?: number } = {}) {
 	return {
 		configured: true,
 		bootstrapReady: true,
-		settings: { syncIntervalSeconds: 30, padObjectSizes: false, experimentalMetaEncryption: false, timingBatchSeconds: 60, mtimeGranularitySeconds: 0, replaceRemoteEnabled: false },
+		settings: { autoSync: true, syncIntervalSeconds: 30, padObjectSizes: false, experimentalMetaEncryption: false, timingBatchSeconds: 60, mtimeGranularitySeconds: 0, replaceRemoteEnabled: false },
 		replaceJobNeedsAttention: () => false,
 		statusInput: () => ({
 			configured: true,
 			bootstrapReady: true,
-			credentialRejected: false,
-			e2ee: "unlocked",
+			credentialRejected: over.credentialRejected ?? false,
+			e2ee: over.e2ee ?? "unlocked",
 			vaultName: "笔记",
 			lastSyncAt: 0,
-			conflicts: 0,
+			conflicts: over.conflicts ?? 0,
 			migrationPending: false,
 			keyPolicyText: "严格会话解锁",
 			syncing: false,
@@ -175,4 +179,74 @@ test("冲突窗口：有没保存的选择或手工编辑时关闭先确认，�
 		proto.close = origClose;
 		proto.open = origOpen;
 	}
+});
+
+// ---------- 概览 + 任务子页（P01） ----------
+
+interface PageDef extends Def {
+	displayValue?: string | (() => string);
+	status?: "warning" | null | (() => "warning" | null);
+	control?: { key: string };
+	searchable?: boolean | (() => boolean);
+}
+
+function pages(over: Parameters<typeof fakePlugin>[0] = {}): PageDef[] {
+	const tab = new SyncSettingTab({} as never, fakePlugin(over) as never);
+	const defs = tab.getSettingDefinitions() as unknown as PageDef[];
+	return (defs[2].items ?? []) as PageDef[];
+}
+const call = <T>(v: T | (() => T)): T => (typeof v === "function" ? (v as () => T)() : v);
+const page = (name: string, over: Parameters<typeof fakePlugin>[0] = {}) => pages(over).find((p) => p.name === name)!;
+
+test("子页入口：当前值与提醒按真实状态——需要重新连接、冲突、已锁定", () => {
+	assert.equal(call(page("连接与设备").displayValue!), "已连接");
+	assert.equal(call(page("连接与设备", { credentialRejected: true }).displayValue!), "需要重新连接");
+	assert.equal(call(page("连接与设备", { credentialRejected: true }).status!), "warning");
+	assert.equal(call(page("同步选项").displayValue!), "自动 · 每 30 秒");
+	assert.equal(call(page("同步选项").status!), null);
+	assert.equal(call(page("同步选项", { conflicts: 2 }).status!), "warning");
+	assert.equal(call(page("仓库密码与锁定", { e2ee: "locked" }).displayValue!), "已锁定");
+	assert.equal(call(page("仓库密码与锁定", { e2ee: "locked" }).status!), "warning");
+	assert.equal(call(page("仓库密码与锁定").displayValue!), "已解锁");
+});
+
+test("同步选项的当前值：只手动 / 自动 · 频率 / 自动但不定时检查", () => {
+	assert.equal(syncSummary(false, 30), "只手动同步");
+	assert.equal(syncSummary(true, 120), "自动 · 每 2 分钟");
+	assert.equal(syncSummary(true, 0), "自动 · 不定时检查云端");
+});
+
+test("安全相关的显式选择仍只在「高级与诊断」：别的子页只有不可搜索的去向说明，没有第二个开关", () => {
+	const where = (key: string): string[] => {
+		const out: string[] = [];
+		const walk = (items: PageDef[], pageName: string) => {
+			for (const d of items) {
+				if (d.items) walk(d.items as PageDef[], d.type === "page" ? (d.name ?? pageName) : pageName);
+				else if (d.control?.key === key) out.push(pageName);
+			}
+		};
+		walk(pages(), "");
+		return out;
+	};
+	assert.deepEqual(where("trustDevice"), ["高级与诊断"]);
+	assert.deepEqual(where("replaceRemoteEnabled"), ["高级与诊断"]);
+	const keyItems = (page("仓库密码与锁定").items ?? []).flatMap((g) => (g.items ?? []) as PageDef[]);
+	const pointer = keyItems.find((d) => d.name === "本设备自动解锁");
+	assert.ok(pointer && !pointer.control, "只是说明");
+	assert.equal(pointer.searchable, false, "不在设置搜索里和真正的开关重名");
+	assert.match(String(pointer.desc), /高级与诊断/);
+});
+
+// ---------- 连接链接指定的仓库只核对一次（P02） ----------
+
+test("跳过选库页：只在链接的仓库 = 当前选择 = 服务器的当前仓库时", () => {
+	const vaults = [
+		{ id: "v-a", current: false },
+		{ id: "v-b", current: true },
+	];
+	assert.equal(linkedVaultToSkip(vaults, "v-b", "v-b")?.id, "v-b", "三者一致：跳过");
+	assert.equal(linkedVaultToSkip(vaults, undefined, "v-b"), null, "不是刚兑换的链接：照常显示");
+	assert.equal(linkedVaultToSkip(vaults, "v-b", ""), null, "当前选择不是链接的仓库：照常显示");
+	assert.equal(linkedVaultToSkip(vaults, "v-a", "v-a"), null, "服务器的当前仓库不是它：照常显示");
+	assert.equal(linkedVaultToSkip([], "v-b", "v-b"), null, "列表里没有：照常显示");
 });
