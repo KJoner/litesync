@@ -36,7 +36,7 @@ import { DeviceListModal } from "./pairing/device-list-modal";
 import { PasteLinkModal, registerImportHandler, resumePendingRedeem } from "./pairing/import-handler";
 import { consumePairing, PairingConfig } from "./pairing/pairing";
 import { PairingTransport } from "./pairing/pairing-v2";
-import { OpenWebsiteModal, websiteUrl } from "./onboarding";
+import { deviceManageUrl, OpenWebsiteModal, websiteUrl } from "./onboarding";
 import { jobUnfinished, REPLACE_LOCK_OWNER } from "./bootstrap/replace-remote";
 import { ReplaceRemoteModal } from "./bootstrap/replace-remote-modal";
 import { AddDeviceModal } from "./pairing/pairing-modal";
@@ -161,9 +161,9 @@ export default class PrivateSyncPlugin extends Plugin {
 		});
 		this.addCommand({
 			id: "list-devices",
-			name: "设备列表 (List devices)",
+			name: "已连接设备 (List devices)",
 			callback: () => {
-				if (this.client) new DeviceListModal(this.app, this.client).open();
+				if (this.client) this.openDeviceList();
 			},
 		});
 		this.addCommand({
@@ -1392,7 +1392,8 @@ export default class PrivateSyncPlugin extends Plugin {
 
 	/** 设备列表（设置页「连接与仓库」节）。 */
 	openDeviceList(): void {
-		if (this.client && this.isConfigured()) new DeviceListModal(this.app, this.client).open();
+		// UI 焕新 U5（UX-06）：撤销在网页的「账号与设备」里做（当前服务器的 /#/me，保留子路径），不需要根 Token。
+		if (this.client && this.isConfigured()) new DeviceListModal(this.app, this.client, deviceManageUrl(this.settings.serverUrl), (u) => window.open(u)).open();
 		else new Notice("请先连接仓库");
 	}
 

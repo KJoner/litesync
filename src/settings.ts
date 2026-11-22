@@ -342,9 +342,9 @@ export class SyncSettingTab extends PluginSettingTab {
 						action: () => plugin.openAddDeviceModal(),
 					},
 					{
-						name: "设备列表",
-						aliases: ["设备", "撤销", "devices"],
-						desc: "查看已接入这个仓库的设备",
+						name: "已连接设备",
+						aliases: ["设备列表", "设备", "撤销", "devices"],
+						desc: "查看连接到这个仓库的设备；撤销设备在网页里做",
 						visible: configured,
 						action: () => plugin.openDeviceList(),
 					},
@@ -369,33 +369,40 @@ export class SyncSettingTab extends PluginSettingTab {
 				items: [
 					{
 						name: "自动同步",
-						desc: "文件变化后自动同步（含定时拉取远端变更）",
+						desc: "本机文件变化后自动上传，并按下面的频率检查云端更新。关闭后只在手动「立即同步」时同步",
 						control: { type: "toggle", key: "autoSync" },
 					},
 					{
-						name: "同步间隔",
+						// UI 焕新 U5（UX-07）：说的是「检查云端更新」——本机的修改随时上传，与这一项无关。
+						// 手机只列真正生效的频率；存着 15 / 30 秒的设备显示实际执行的 60 秒，不改写设置。
+						name: "检查云端更新",
+						aliases: ["同步间隔", "定时同步", "拉取", "interval"],
 						desc: Platform.isMobileApp
-							? "定时拉取仅在 App 前台运行，移动端最低 60 秒（切回 App 时会自动补同步）"
-							: "定时向服务器拉取其他设备产生的变更",
+							? "开启「自动同步」时生效。手机上最少每 60 秒检查一次，而且只在 Obsidian 在前台时；切回 Obsidian 会立即补一次"
+							: "开启「自动同步」时生效：多久检查一次其他设备的修改。本机的修改会自动上传，不受这一项影响",
 						control: {
 							type: "dropdown",
 							key: "syncIntervalSeconds",
-							options: {
-								"15": "15 秒",
-								"30": "30 秒",
-								"60": "60 秒",
-								"120": "2 分钟",
-								"300": "5 分钟",
-								"0": "关闭定时同步",
-							},
+							options: Platform.isMobileApp
+								? { "60": "每 60 秒", "120": "每 2 分钟", "300": "每 5 分钟", "0": "关闭定时检查" }
+								: { "15": "每 15 秒", "30": "每 30 秒", "60": "每 60 秒", "120": "每 2 分钟", "300": "每 5 分钟", "0": "关闭定时检查" },
 						},
 					},
 					{
 						name: "同步 Obsidian 配置目录",
-						desc: Platform.isMobileApp
-							? "移动端始终不同步配置目录（桌面与移动配置差异大，避免互相覆盖）"
-							: "同步 Obsidian 配置目录（workspace 和本插件目录永远不同步）",
+						aliases: ["配置", "配置目录", "config"],
+						desc: "同步 Obsidian 的配置目录（workspace 和本插件目录永远不同步）",
+						visible: !Platform.isMobileApp,
 						control: { type: "toggle", key: "syncObsidian" },
+					},
+					{
+						// The phone never syncs the configuration directory: say so, instead of a switch that does nothing.
+						name: "同步 Obsidian 配置目录",
+						aliases: ["配置", "配置目录", "config"],
+						visible: Platform.isMobileApp,
+						render: (setting) => {
+							setting.setDesc("此设备不支持：手机始终不同步配置目录（桌面与手机的配置差异大，避免互相覆盖）。");
+						},
 					},
 					{
 						name: "忽略规则",
@@ -699,7 +706,11 @@ export class SyncSettingTab extends PluginSettingTab {
 	}
 
 	getControlValue(key: string): unknown {
-		if (key === "syncIntervalSeconds") return String(this.plugin.settings.syncIntervalSeconds);
+		if (key === "syncIntervalSeconds") {
+			const v = this.plugin.settings.syncIntervalSeconds;
+			// The phone runs at least every 60 s: show what actually happens (the stored value stays).
+			return String(Platform.isMobileApp && v > 0 && v < 60 ? 60 : v);
+		}
 		return (this.plugin.settings as unknown as Record<string, unknown>)[key];
 	}
 

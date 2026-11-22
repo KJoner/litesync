@@ -21,6 +21,16 @@ export function websiteUrl(serverUrl: string): string | null {
 	}
 }
 
+/**
+ * 网页里管理本人设备的页面（UI 焕新 U5，审查 UX-06）：LiteSync 网页「账号与设备」（`<网页>/#/me`），
+ * 其中「已授权的设备」用账号会话撤销设备，不需要服务器根 Token。地址由当前服务器地址得出，保留自托管的子路径；
+ * 不能用于网页的地址（非 https、本机调试除外）返回 null。
+ */
+export function deviceManageUrl(serverUrl: string): string | null {
+	const site = websiteUrl(serverUrl);
+	return site ? `${site}#/me` : null;
+}
+
 export class OpenWebsiteModal extends Modal {
 	constructor(
 		app: App,

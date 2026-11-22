@@ -166,6 +166,20 @@
 	display: flex;
 	gap: 8px;
 	justify-content: flex-end;
+	align-items: center;
+	flex-wrap: wrap;
+}
+/* 保存不可用的原因：占满按钮左侧的空间（UI 焕新 U5） */
+.litesync-resolver-hint {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+.litesync-resolver-hint:empty {
+	display: none;
+}
+.litesync-hunk-progress {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
 }
 
 /* ---------- 移动端响应式（v6：iPhone 竖屏禁用双栏，纵向堆叠） ---------- */
@@ -315,4 +329,26 @@
 	border-radius: var(--radius-s);
 	padding: var(--size-4-2);
 	overflow-wrap: anywhere;
+}
+
+/* 已连接设备（UI 焕新 U5）：宿主变量，只管层级与间距。 */
+.litesync-device-item {
+	padding: var(--size-4-2) 0;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+.litesync-device-name {
+	font-weight: var(--font-semibold);
+}
+.litesync-device-tech summary {
+	cursor: pointer;
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+}
+.litesync-device-manage {
+	margin-top: var(--size-4-4);
+}
+.litesync-selectable {
+	user-select: text;
+	-webkit-user-select: text;
+	word-break: break-all;
 }
